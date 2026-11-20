@@ -1536,3 +1536,22 @@ fn diagram_is_painted_in_the_skin_it_is_given() {
     assert!(!ok);
     assert!(err.contains("no `paper`"), "{err}");
 }
+
+#[test]
+fn a_variant_member_exports_its_id_under_a_variant_membership() {
+    let dir = temp_dir("variant-id");
+    let src = write(
+        &dir,
+        "v.sysml",
+        "package P { part def S; variation part def V { variant part <'PC-002'> radar; } }\n",
+    );
+    let out = sysml(&["export", src.to_str().unwrap()]);
+    assert!(out.status.success());
+    let all: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let by_id = |id: &serde_json::Value| all.iter().find(|e| &e["@id"] == id).unwrap();
+    let radar = all.iter().find(|e| e["name"] == "radar").unwrap();
+    assert_eq!(radar["@type"], "PartUsage");
+    assert_eq!(radar["declaredShortName"], "PC-002");
+    let owner = by_id(&radar["owningRelationship"]["@id"]);
+    assert_eq!(owner["@type"], "VariantMembership");
+}

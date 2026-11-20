@@ -609,6 +609,7 @@ impl Parser<'_> {
     /// `subject x : T;`, `return x;`, `variant part v;`, `render asTree;`
     fn kw_usage(&mut self, cp: Checkpoint) {
         self.start_node_at(cp, USAGE);
+        let variant = self.at(VARIANT_KW);
         self.bump();
         // `ActorUsage : PartUsage = 'actor' UsageExtensionKeyword* Usage`,
         // and the same shape for `subject`, `stakeholder`, `objective`,
@@ -616,6 +617,17 @@ impl Parser<'_> {
         // user-defined keywords the model declares come after it, so
         // `actor #safetyEngineer a;` is a member of a requirement.
         self.opt_prefix_metadata();
+        // `VariantUsageElement` is a full usage, so the kind comes before the
+        // name: `variant part <'PC-2'> radar;`
+        if variant {
+            while self.current().is_modifier_kw() {
+                self.bump();
+            }
+            if self.current().is_def_kind_kw() {
+                self.def_kind_keywords();
+                self.opt_prefix_metadata();
+            }
+        }
         self.opt_short_name();
         self.opt_decl_name();
         self.element_tail();

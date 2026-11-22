@@ -38,6 +38,90 @@ pub(crate) enum Library {
     None,
 }
 
+/// The directory the library built in is written out to, with every file
+/// in it saying what the binary holds, or `None` where it cannot be.
+///
+/// Under the OS cache directory, named by the release and by a hash of
+/// what the files say, so that two builds holding different copies never
+/// share one, and a copy found there already is taken as it is only when
+/// it says the same. Each file is written beside its place and renamed
+/// into it, so a server starting while another writes the same copy reads
+/// either the old file whole or the new one whole.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn written_out_library() -> Option<PathBuf> {
+    // FNV-1a over every name and text: cheap enough to do on every open,
+    // and what tells this binary's copy from another's
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, text) in sysml_stdlib::FILES {
+        for byte in name.bytes().chain([0]).chain(text.bytes()).chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let dir = cache_home()?
+        .join("sysml-lsp")
+        .join(format!("library-{}-{hash:016x}", sysml_stdlib::RELEASE));
+    for (name, text) in sysml_stdlib::FILES {
+        let path = dir.join(name);
+        if std::fs::read(&path).is_ok_and(|held| held == text.as_bytes()) {
+            continue;
+        }
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        // a name no other writer uses, the servers of one process too
+        static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let partial = path.with_extension(format!(
+            "partial-{}-{}",
+            std::process::id(),
+            WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&partial, text).ok()?;
+        if std::fs::rename(&partial, &path).is_err() {
+            let _ = std::fs::remove_file(&partial);
+            held_by_another(&path, text).then_some(())?;
+        }
+    }
+    std::fs::canonicalize(&dir).ok()
+}
+
+/// Whether a file the rename could not replace is already what was to be
+/// written there. Windows refuses to replace a file another server holds
+/// open, and that server wrote the same library.
+#[cfg(windows)]
+fn held_by_another(path: &std::path::Path, text: &str) -> bool {
+    std::fs::read(path).is_ok_and(|held| held == text.as_bytes())
+}
+
+/// Elsewhere a rename replaces what is there, open or not, so one that
+/// failed left nothing written.
+#[cfg(not(any(windows, target_family = "wasm")))]
+fn held_by_another(_: &std::path::Path, _: &str) -> bool {
+    false
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn written_out_library() -> Option<PathBuf> {
+    None
+}
+
+/// Where this OS keeps what a program may rebuild: `$XDG_CACHE_HOME` or
+/// `~/.cache`, `~/Library/Caches`, `%LOCALAPPDATA%`, and the temporary
+/// directory where none of those is set.
+#[cfg(not(target_family = "wasm"))]
+fn cache_home() -> Option<PathBuf> {
+    let set = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    #[cfg(windows)]
+    let home = set("LOCALAPPDATA");
+    #[cfg(target_os = "macos")]
+    let home = set("HOME").map(|home| home.join("Library").join("Caches"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let home = set("XDG_CACHE_HOME").or_else(|| set("HOME").map(|home| home.join(".cache")));
+    Some(home.unwrap_or_else(std::env::temp_dir))
+}
+
 impl Server {
     pub(crate) fn new(
         files: Files,
@@ -46,34 +130,50 @@ impl Server {
         excluded: &[PathBuf],
     ) -> Server {
         let mut library = Workspace::new();
-        let library_dir = match &wanted {
+        let mut library_dir = match &wanted {
             Library::At(dir) => Some(dir.clone()),
             _ => None,
         };
         let mut complaints = Vec::new();
-        let built_in = |library: &mut Workspace| {
+        // The copy built in is no file, and a definition inside it has no
+        // URL to jump to: go-to-definition on `Part` would answer null. Where
+        // there is a filesystem it is written out once per release to a
+        // cache directory and read under those paths, which is then the
+        // library's directory as a named one would be. Where there is
+        // none (the browser's worker), or the cache cannot be written, it
+        // keeps the names it was built with and a jump into it still
+        // answers nothing.
+        let mut built_in_dir = None;
+        let mut built_in = |library: &mut Workspace| {
+            let home = match &files {
+                Files::Disk => written_out_library(),
+                Files::Handed(_) => None,
+            };
             for (name, text) in sysml_stdlib::FILES {
-                library.add_file(*name, text);
+                match &home {
+                    Some(dir) => library.add_file(dir.join(name).to_string_lossy(), text),
+                    None => library.add_file(*name, text),
+                };
             }
+            built_in_dir = home;
         };
         match &wanted {
             // A named directory that will not load falls back to the
             // copy built in, and says so where the launcher can read it.
             //
-            // It used to degrade to an *empty* library, silently: one
-            // mistyped `sysml.library.path` and every name in every file
-            // underlined as unresolved, with nothing anywhere saying
-            // why. The command line and the MCP server had both stopped
-            // doing that; this was the one front end left where a wrong
-            // path cost the editor every name in the model rather than
-            // the library the client meant.
+            // Degrading to an *empty* library, silently, would be worse:
+            // one mistyped `sysml.library.path` and every name in every
+            // file underlined as unresolved, with nothing anywhere saying
+            // why. The command line and the MCP server do not do that,
+            // and here a wrong path must not cost the editor every name
+            // in the model rather than the library the client meant.
             Library::At(dir) => {
                 // Read before any of it is declared: half a library is
                 // worse than the copy built in, since the names it does
                 // declare resolve and the ones it does not are reported
                 // as though the model were wrong. The complaint names
                 // the file rather than the directory -- one unreadable
-                // file among a hundred is otherwise a refusal with
+                // file among many is otherwise a refusal with
                 // nothing to act on.
                 //
                 // The walk takes what it can reach, so a path that is
@@ -120,6 +220,13 @@ impl Server {
         // resolve the library once; the caches are cloned into every
         // layer above, so this cost is paid only at startup
         library.resolve_all();
+        // a named directory that falls back to the copy built in is left
+        // out of the project still, and the copy is the library
+        let mut excluded_dirs: Vec<PathBuf> = library_dir.iter().cloned().collect();
+        if let Some(dir) = built_in_dir {
+            excluded_dirs.push(dir.clone());
+            library_dir = Some(dir);
+        }
         // by the path with every link resolved, since what it is
         // compared against is an open document's resolved path
         let resolved_library_dir = library_dir.as_deref().map(|dir| files.resolved(dir));
@@ -131,7 +238,7 @@ impl Server {
             library_dir: resolved_library_dir,
             // the library is already loaded, so its own files are never
             // part of the project even when a workspace folder holds them
-            excluded: library_dir
+            excluded: excluded_dirs
                 .into_iter()
                 .chain(excluded.iter().cloned())
                 .collect(),
@@ -145,6 +252,7 @@ impl Server {
             published: HashMap::new(),
             layout: sysml_syntax::fmt::Layout::default(),
             skin: sysml_diagram::Skin::default(),
+            watch_files: false,
         }
     }
     /// Every model file under the workspace folders.
@@ -228,6 +336,15 @@ impl Server {
         files.sort();
         files
     }
+    /// Whether the files beside a document are read only because it is
+    /// open: it is outside every workspace folder, or in a directory the
+    /// project leaves out. The library is beside nothing, being loaded
+    /// already.
+    pub(crate) fn read_for_being_open(&self, path: &Path) -> bool {
+        let reached = self.roots.iter().any(|root| path.starts_with(root));
+        let left_out = self.excluded.iter().any(|dir| path.starts_with(dir));
+        (!reached || left_out) && !self.is_library_file(path)
+    }
     /// Whether a path is the standard library's own.
     fn is_library_file(&self, path: &Path) -> bool {
         self.library_dir
@@ -259,7 +376,7 @@ impl Server {
     /// editor shows is what resolves -- and so that nothing is declared
     /// twice. A file merely opened is not left out: its buffer and the
     /// disk agree, so the layer below can speak for it, and rebuilding
-    /// this layer on every open and close was the slowest thing this
+    /// this layer on every open and close would be the slowest thing this
     /// server did.
     fn project(&mut self) -> &Workspace {
         if self.project.is_none() {
@@ -320,14 +437,20 @@ impl Server {
                     }
                 };
             }
-            // The project layer leaves out every file whose buffer has
-            // stopped matching what is on disk, so a project file that
-            // names something declared in one of them was resolved
-            // without it. What that file could not find may be in a
-            // buffer that is here now, so anything with a name missing
-            // is resolved again -- normally nothing at all, and never
-            // the whole project.
-            if !self.substituted.is_empty() {
+            // The project layer was resolved without every buffer added
+            // here: one whose file it left out for no longer matching
+            // the disk, and one with no file under it at all -- a new
+            // file not yet saved, an `untitled:` one, a file deleted
+            // while it was open. A project file that names something
+            // declared in one of them could not find it, and what it
+            // could not find may be here now, so anything with a name
+            // missing is resolved again -- normally nothing at all, and
+            // never the whole project. Asked only when this layer added
+            // a buffer of its own, which is the only way a declaration
+            // the layer below lacks can be here. Asked only for the first
+            // kind, `part a : B;` would go on underlining `B` after a new
+            // buffer declared it, until `a` itself was edited.
+            if !open.is_empty() {
                 let mut stale: Vec<usize> = ws
                     .unresolved()
                     .iter()

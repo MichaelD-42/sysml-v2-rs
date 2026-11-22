@@ -26,6 +26,11 @@ fn write(dir: &Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
+/// What a `--format json` run printed.
+fn json_of(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).expect("the output is JSON")
+}
+
 const OK_MODEL: &str = "package P {\n    part def Vehicle;\n    part car : Vehicle;\n}\n";
 
 #[test]
@@ -119,7 +124,7 @@ fn export_resolves_and_marks_the_library() {
     );
     // `--library` here names a library of this test's own making, and
     // what is asserted below is which elements it marked -- so the real
-    // one, which would mark sixty thousand more, stays out
+    // one, which would mark far more, stays out
     let out = sysml(&[
         "--no-library",
         "export",
@@ -200,8 +205,9 @@ fn import_rust_writes_a_package_from_rustdoc_json() {
 
 #[test]
 fn what_a_crate_imported_as_is_counted_off_the_tree() {
-    // the count used to be occurrences of `" def "` in the text it wrote,
-    // so a doc comment saying the words was read as another definition
+    // the count is of the tree, not of occurrences of `" def "` in the text
+    // it wrote, or a doc comment saying the words would be read as another
+    // definition
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../sysml-rust/tests/fixtures/inventory_store.rustdoc.json");
     let dir = temp_dir("import-rust-count");
@@ -298,6 +304,17 @@ fn rustgen_generates_and_says_what_stopped_it() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unresolved `Nowhere`"));
 
+    // and so is one that does not parse, whose names may all resolve:
+    // what it declares is what the parser guessed at
+    let unparsed = write(
+        &dir,
+        "unparsed.sysml",
+        "package P { part def A { attribute y : ScalarValues::Real = ; } part def C;",
+    );
+    let out = sysml(&["rustgen", unparsed.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not parse"));
+
     // unreadable inputs fail like everywhere else
     let out = sysml(&["rustgen", dir.join("absent.sysml").to_str().unwrap()]);
     assert!(!out.status.success());
@@ -346,8 +363,9 @@ fn rustgen_generates_and_says_what_stopped_it() {
 
 /// Re-spacing a file the parser could not follow can move where a quote
 /// ends, and `--write` puts that in the modeller's file. Printing it is
-/// safe -- every character is still there -- so only the rewrite is
-/// refused.
+/// no safer, even with every character still there, for the characters
+/// are not the tokens: `x : ::` came out as `x :::`, which reads as
+/// something else. So it is refused however it is asked for.
 #[test]
 fn fmt_will_not_rewrite_a_file_it_could_not_parse() {
     let dir = temp_dir("fmt-broken");
@@ -364,12 +382,92 @@ fn fmt_will_not_rewrite_a_file_it_could_not_parse() {
         "the file must be as it was"
     );
 
-    // printing it is still allowed, and loses nothing
+    // printing it is refused as well, rather than handed over as if formatted
     let out = sysml(&["fmt", broken.to_str().unwrap()]);
-    assert!(out.status.success());
-    let printed = String::from_utf8_lossy(&out.stdout);
-    let letters = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-    assert_eq!(letters(&printed), letters(text), "{printed}");
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not parse"), "{stderr}");
+
+    // and `--check` counts it as broken, not merely unformatted
+    let out = sysml(&[
+        "--format",
+        "json",
+        "fmt",
+        "--check",
+        broken.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["broken"][0], broken.display().to_string(), "{v}");
+    assert_eq!(v["unformatted"], serde_json::json!([]), "{v}");
+}
+
+/// `--check` writes nothing, so asking for it with `--write` asks for
+/// two things; `--check` must not win without a word.
+#[test]
+fn fmt_will_not_both_check_and_write() {
+    let dir = temp_dir("fmt-check-write");
+    let messy = write(&dir, "messy.sysml", "package   P{part def A;}");
+    let out = sysml(&["fmt", "--check", "--write", messy.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&messy).unwrap(),
+        "package   P{part def A;}"
+    );
+}
+
+/// One file that cannot be read or written must not stop the run there:
+/// the files after it would be left as they were, and `--format json`
+/// would print nothing. Each is said, and the rest are formatted all the same.
+#[cfg(unix)]
+#[test]
+fn fmt_carries_on_past_a_file_it_cannot_read_or_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("fmt-carries-on");
+    let missing = dir.join("missing.sysml");
+    let locked_dir = dir.join("locked");
+    std::fs::create_dir_all(&locked_dir).unwrap();
+    let locked = write(&locked_dir, "locked.sysml", "package   L{part def A;}");
+    let messy = write(&dir, "messy.sysml", "package   P{part def A;}");
+    // the file can be read but not replaced: neither it nor its
+    // directory is writable
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = sysml(&[
+        "--format",
+        "json",
+        "fmt",
+        "--write",
+        missing.to_str().unwrap(),
+        locked.to_str().unwrap(),
+        messy.to_str().unwrap(),
+    ]);
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(
+        v["unreadable"][0]["path"],
+        missing.display().to_string(),
+        "{v}"
+    );
+    assert_eq!(
+        v["unwritten"][0]["path"],
+        locked.display().to_string(),
+        "{v}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot read"), "{stderr}");
+    assert!(stderr.contains("cannot write"), "{stderr}");
+    // and the file after them was formatted
+    assert_eq!(
+        std::fs::read_to_string(&messy).unwrap(),
+        "package P {\n    part def A;\n}\n"
+    );
 }
 
 #[test]
@@ -390,7 +488,7 @@ fn fmt_formats_checks_and_writes() {
     let out = sysml(&["fmt", "--write", messy.to_str().unwrap()]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("formatted"));
-    // now canonical: --check passes and --write is a no-op
+    // canonical from here on: --check passes and --write is a no-op
     assert!(sysml(&["fmt", "--check", messy.to_str().unwrap()])
         .status
         .success());
@@ -499,11 +597,10 @@ fn check_resolves_and_reports_unresolved() {
 /// An export is the model, and the library is what it was resolved
 /// against.
 ///
-/// The two used to be one document. Since the library stopped having to be
-/// named to be loaded, `sysml export model.sysml` wrote a hundred and
-/// twenty-eight thousand elements where the model has three, and `sysml
-/// api push` sent every one -- seven hundred and ninety megabytes nobody
-/// asked for. What the model refers to across that line is written as the
+/// The two are not one document. The library is loaded without being
+/// named, so `sysml export model.sysml` would otherwise write all of its
+/// elements beside the model's few, and `sysml api push` would send every
+/// one -- a great weight nobody asked for. What the model refers to across that line is written as the
 /// `@id` it always was, and those are UUIDv5 over the ownership path: any
 /// holder of the same library computes the same ones.
 #[test]
@@ -558,8 +655,8 @@ fn an_export_is_the_model_and_not_the_library_it_resolved_against() {
 /// what resolves.
 ///
 /// A model whose every name resolves can still be one the standard
-/// rejects, and until this was asked only the MCP server ever asked it:
-/// running `check` called such a model sound.
+/// rejects, and `check` asks it as the MCP server does: otherwise it
+/// would call such a model sound.
 ///
 /// Two things are asked first. Constraints come after names, as names come
 /// after syntax: asked of a model with a dangling reference they answer
@@ -877,13 +974,45 @@ fn diagram_reports_empty_models_and_write_failures() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read"));
 }
 
+/// A model that does not parse, or names what is not there, is still
+/// drawn -- but the drawing leaves those parts out, so it is said, and
+/// the exit code says not to take the drawing as the model. It is not
+/// drawn in silence with a zero exit.
+#[test]
+fn diagram_says_when_the_model_it_draws_is_broken() {
+    let dir = temp_dir("diagram-broken");
+    let broken = write(
+        &dir,
+        "broken.sysml",
+        "package P {\n    part def A;\n    part def B :> A {\n        part x : Nope;\n        part y : A\n        part z : A;\n    }\n}\n",
+    );
+    let out = sysml(&["diagram", broken.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("does not parse"), "{said}");
+    assert!(
+        said.contains("1 name(s) in this model resolve to nothing"),
+        "{said}"
+    );
+    // and it is drawn all the same
+    assert!(String::from_utf8_lossy(&out.stdout).contains("<svg"));
+
+    // the same in every view
+    for view in [&["--browser"][..], &["--internal", "B"]] {
+        let mut args = vec!["diagram", broken.to_str().unwrap()];
+        args.extend_from_slice(view);
+        assert!(!sysml(&args).status.success(), "{view:?}");
+    }
+}
+
 #[test]
 fn corpus_measures_parse_rates() {
     let dir = temp_dir("corpus");
     write(&dir, "ok.sysml", OK_MODEL);
     write(&dir, "bad.sysml", "part def {{{\n");
+    // a file that does not parse fails the run, and the rate says how badly
     let out = sysml(&["corpus", dir.to_str().unwrap()]);
-    assert!(out.status.success());
+    assert!(!out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("1/2 files ok"), "{stdout}");
     assert!(stdout.contains("worst"), "{stdout}");
@@ -895,6 +1024,48 @@ fn corpus_measures_parse_rates() {
     let out = sysml(&["corpus", empty.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no .sysml"));
+
+    // and all of it parsing is a pass
+    let clean = temp_dir("corpus-clean");
+    write(&clean, "ok.sysml", OK_MODEL);
+    assert!(sysml(&["corpus", clean.to_str().unwrap()]).status.success());
+}
+
+/// `--format json` must not be taken and ignored, with the text report
+/// coming out; and a run with files that fail to parse must not exit 0.
+#[test]
+fn corpus_answers_in_json_when_asked_and_fails_with_its_files() {
+    let dir = temp_dir("corpus-json");
+    write(&dir, "ok.sysml", OK_MODEL);
+    let bad = write(&dir, "bad.sysml", "part def {{{\n");
+    let out = sysml(&["--format", "json", "corpus", dir.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["command"], "corpus");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["extensions"]["sysml"]["files"], 2, "{v}");
+    assert_eq!(v["extensions"]["sysml"]["ok"], 1, "{v}");
+    assert_eq!(v["failing"][0]["path"], bad.display().to_string(), "{v}");
+    assert!(v["failing"][0]["errors"].as_u64().unwrap() > 0, "{v}");
+
+    let clean = temp_dir("corpus-json-clean");
+    write(&clean, "ok.sysml", OK_MODEL);
+    let out = sysml(&["--format", "json", "corpus", clean.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert_eq!(json_of(&out)["ok"], true);
+
+    // nothing to measure is said as JSON too, and fails
+    let empty = temp_dir("corpus-json-empty");
+    let out = sysml(&["--format", "json", "corpus", empty.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(json_of(&out)["ok"], false);
+    let missing = empty.join("not-there");
+    let out = sysml(&["--format", "json", "corpus", missing.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(
+        json_of(&out)["unreadable"][0]["path"],
+        missing.display().to_string()
+    );
 }
 
 #[cfg(unix)]
@@ -907,6 +1078,13 @@ fn corpus_warns_on_unreadable_files() {
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
     let out = sysml(&["corpus", dir.to_str().unwrap()]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read"));
+    // a file that could not be looked at is not one that passed
+    assert!(!out.status.success());
+    let out = sysml(&["--format", "json", "corpus", dir.to_str().unwrap()]);
+    assert_eq!(
+        json_of(&out)["unreadable"][0]["path"],
+        hidden.display().to_string()
+    );
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
@@ -928,7 +1106,7 @@ fn check_with_no_references_reports_100_percent() {
     let dir = temp_dir("check-empty");
     let ok = write(&dir, "empty.sysml", "package OnlyAPackage;\n");
     // `--no-library`, because a model read against the copy built in
-    // has seventeen thousand references into it and this is about a
+    // has a great many references into it and this is about a
     // model that has none
     let out = sysml(&["--no-library", "check", ok.to_str().unwrap()]);
     assert!(out.status.success());
@@ -992,8 +1170,8 @@ fn json_reports_what_a_program_works_from() {
     let v = json(&out);
     assert_eq!(v["command"], "check");
     assert_eq!(v["ok"], false);
-    assert_eq!(v["parseErrors"][0]["line"], 4);
-    assert!(v["parseErrors"][0]["message"].is_string());
+    assert_eq!(v["parse_errors"][0]["line"], 4);
+    assert!(v["parse_errors"][0]["message"].is_string());
     assert!(v["unresolved"].is_null(), "syntax first, names after");
 
     // an unresolved reference, by name and place
@@ -1001,7 +1179,7 @@ fn json_reports_what_a_program_works_from() {
     assert!(!out.status.success());
     let v = json(&out);
     assert_eq!(v["command"], "check");
-    assert_eq!(v["parseErrors"].as_array().unwrap().len(), 0);
+    assert_eq!(v["parse_errors"].as_array().unwrap().len(), 0);
     assert_eq!(v["unresolved"][0]["name"], "Missing");
     assert_eq!(v["unresolved"][0]["line"], 3);
     assert_eq!(v["unresolved"][0]["column"], 11);
@@ -1017,11 +1195,12 @@ fn json_reports_what_a_program_works_from() {
     assert!(out.status.success());
     let v = json(&out);
     assert_eq!(v["counts"]["PartDefinition"], 1);
-    assert_eq!(v["parseErrors"], 0);
+    assert_eq!(v["parse_errors"], 0);
 
     // a file that cannot be read is a finding, not a stray line, and
-    // every command says so in the same place
-    for command in ["parse", "check", "stats", "fmt"] {
+    // every command says so in the same place -- `plan` among them, which
+    // printed nothing at all to stdout and left a program with no JSON
+    for command in ["parse", "check", "stats", "fmt", "plan"] {
         let mut args = vec!["--format", "json", command, "no-such-file.sysml"];
         if command == "fmt" {
             args.push("--check");
@@ -1152,9 +1331,9 @@ fn api_talks_to_a_model_server() {
     );
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(said.contains("element(s) as commit c2"), "{said}");
-    // what was sent is the model. It used to be the model and the
-    // standard library behind it -- ninety-six thousand elements to
-    // somebody's server, for a model of three.
+    // what was sent is the model, not the model and the standard
+    // library behind it -- all those elements to somebody's server, for
+    // a model of three.
     assert!(!said.contains("library"), "{said}");
 
     // a model that cannot be read is reported before anything is sent
@@ -1259,7 +1438,7 @@ fn the_caret_lands_under_the_character_it_points_at() {
 }
 
 /// A directory that is not there is unreadable, not empty: the walk
-/// takes what it can reach, so the two used to read the same.
+/// takes what it can reach, so the two would read the same.
 #[test]
 fn corpus_tells_an_unreadable_directory_from_an_empty_one() {
     let out = sysml(&["corpus", "/nowhere/at/all"]);
@@ -1332,7 +1511,6 @@ fn a_program_reads_one_document_and_an_exit_code_that_agrees() {
         "--format",
         "json",
         "fmt",
-        "--check",
         "--write",
         broken.to_str().unwrap(),
     ]);
@@ -1343,9 +1521,9 @@ fn a_program_reads_one_document_and_an_exit_code_that_agrees() {
     assert_eq!(v["unformatted"].as_array().unwrap().len(), 0);
 }
 
-/// A path is bytes, and `check` used to place its findings by re-reading
-/// the file under a lossy rendering of that path -- which named no file
-/// at all, so every finding landed at 1:1.
+/// A path is bytes, and `check` must not place its findings by re-reading
+/// the file under a lossy rendering of that path -- which names no file
+/// at all, so every finding would land at 1:1.
 #[cfg(unix)]
 #[test]
 fn findings_are_placed_in_a_file_whose_name_is_not_utf8() {
@@ -1371,8 +1549,8 @@ fn findings_are_placed_in_a_file_whose_name_is_not_utf8() {
 }
 
 /// Two definitions can share a declared name -- one in the library, one
-/// in the model, or two in the model itself. Taking whichever came
-/// first drew a picture of something the modeller had not asked about.
+/// in the model, or two in the model itself. Taking whichever comes
+/// first would draw a picture of something the modeller did not ask about.
 #[test]
 fn a_name_that_two_definitions_share_is_settled_before_it_is_drawn() {
     let dir = temp_dir("internal-ambiguous");
@@ -1554,4 +1732,250 @@ fn a_variant_member_exports_its_id_under_a_variant_membership() {
     assert_eq!(radar["declaredShortName"], "PC-002");
     let owner = by_id(&radar["owningRelationship"]["@id"]);
     assert_eq!(owner["@type"], "VariantMembership");
+}
+
+/// A directory with no model in it is refused, as `corpus` refuses it: read
+/// as an empty model it passed `check` with the library alone, and a
+/// mistyped path in a CI step could not fail. One file named twice is read
+/// once, or everything in it is declared twice. And a model with a name
+/// missing never reads as 100.0% resolved.
+#[test]
+fn check_reads_what_it_is_given_once_and_refuses_nothing_to_read() {
+    let dir = temp_dir("check-paths");
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = sysml(&["check", empty.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("holds no .sysml or .kerml file"));
+
+    let model = write(&dir, "ok.sysml", OK_MODEL);
+    let twice = dir.join(".").join("ok.sysml");
+    let once = sysml(&["check", "--no-library", model.to_str().unwrap()]);
+    let again = sysml(&[
+        "check",
+        "--no-library",
+        model.to_str().unwrap(),
+        twice.to_str().unwrap(),
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&once.stdout),
+        String::from_utf8_lossy(&again.stdout)
+    );
+
+    let missing = write(&dir, "missing.sysml", "part x : Nope;\n");
+    let out = sysml(&["check", missing.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!said.contains("(100.0%)"), "{said}");
+}
+
+/// `sysml parse --tree big.sysml | head` closes the pipe after a screenful,
+/// and the command panicked on what was left. A reader that stops reading
+/// is not an error.
+#[test]
+fn output_stops_quietly_when_the_reader_does() {
+    use std::io::Read as _;
+    let big = library().join("Domain Libraries/Quantities and Units/ISQAtomicNuclear.sysml");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sysml"))
+        .args(["parse", "--tree", big.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 16];
+    child.stdout.take().unwrap().read_exact(&mut first).unwrap();
+    // the reader is gone now
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+}
+
+/// A name that reaches the wrong kind of thing is said to, in place of
+/// "an import would" -- which is wrong advice for `part b :> A;` naming a
+/// definition, already in scope.
+#[test]
+fn check_says_when_a_name_names_the_wrong_kind_of_thing() {
+    let dir = temp_dir("check-wrong-kind");
+    let model = write(
+        &dir,
+        "k.sysml",
+        "package P {\n    part def A;\n    part b :> A;\n}\n",
+    );
+    let out = sysml(&["check", "--no-library", model.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        said.contains("it names `P::A`, a `PartDefinition`, where only a `Feature` can stand"),
+        "{said}"
+    );
+    assert!(!said.contains("an import would"), "{said}");
+}
+
+/// The text report counts a column in characters, and `--format json`
+/// must count them the same way: counting bytes puts the same finding
+/// at 2:27 in the terminal and at column 33 in the JSON. Both count
+/// characters, a byte-order mark included.
+#[test]
+fn json_and_text_place_a_finding_in_the_same_column() {
+    let dir = temp_dir("columns-agree");
+    let wide = write(
+        &dir,
+        "wide.sysml",
+        "part def A;\npart x : 'é😀名' ; part y : Missing;\n",
+    );
+    let marked = write(&dir, "marked.sysml", "\u{feff}part y : Missing;\n");
+    for (path, line, column) in [(&wide, 2, 27), (&marked, 1, 11)] {
+        let out = sysml(&["--no-library", "check", path.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let place = format!("{}:{line}:{column}", path.display());
+        assert!(stderr.contains(&place), "{place} in {stderr}");
+
+        let out = sysml(&[
+            "--no-library",
+            "--format",
+            "json",
+            "check",
+            path.to_str().unwrap(),
+        ]);
+        let v = json_of(&out);
+        let missing = v["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["name"] == "Missing")
+            .expect("reported")
+            .clone();
+        assert_eq!(missing["line"], line, "{v}");
+        assert_eq!(missing["column"], column, "{v}");
+        assert_eq!(missing["end_column"], column + 7, "{v}");
+    }
+}
+
+/// A violating element is named the way it has to be written, so the
+/// name can be pasted back: `P::é😀::o2` does not parse.
+#[test]
+fn a_violation_names_its_element_as_it_would_be_written() {
+    let dir = temp_dir("violation-quoted");
+    let model = write(
+        &dir,
+        "v.sysml",
+        "package P {\n\tpart 'é😀' { objective o2; }\n}\n",
+    );
+    let out = sysml(&["check", model.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`P::'é😀'::o2`"), "{stderr}");
+    let out = sysml(&["--format", "json", "check", model.to_str().unwrap()]);
+    let v = json_of(&out);
+    assert_eq!(v["violations"][0]["element"], "P::'é😀'::o2", "{v}");
+}
+
+/// A name declared twice is said where it is declared again, with which
+/// name it is and where it was first, rather than of the package around
+/// both in the specification's general words.
+#[test]
+fn a_name_declared_again_is_said_where_it_is_repeated() {
+    let dir = temp_dir("declared-again");
+    let model = write(
+        &dir,
+        "twice.sysml",
+        "package P {\n\tpart def A;\n\tpart def A;\n}\n",
+    );
+    let out = sysml(&["check", model.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("twice.sysml:3:11"), "{stderr}");
+    assert!(stderr.contains("`A` is declared again in `P`"), "{stderr}");
+    assert!(stderr.contains("first declared at"), "{stderr}");
+    assert!(stderr.contains("twice.sysml:2:11"), "{stderr}");
+    let out = sysml(&["--format", "json", "check", model.to_str().unwrap()]);
+    let v = json_of(&out);
+    let violation = &v["violations"][0];
+    assert_eq!(violation["line"], 3, "{v}");
+    assert!(violation["detail"].as_str().unwrap().contains("`A`"), "{v}");
+    assert!(
+        violation["first"]
+            .as_str()
+            .unwrap()
+            .ends_with("twice.sysml:2:11"),
+        "{v}"
+    );
+}
+
+/// A violation inside a redefinition names the redefinition by the name it
+/// borrows: `part :>> engine` declares none, and was `P::Truck::'?'::o2`.
+#[test]
+fn a_violation_inside_a_redefinition_is_named_by_the_borrowed_name() {
+    let dir = temp_dir("violation-borrowed");
+    let model = write(
+        &dir,
+        "v.sysml",
+        "package P {\n\tpart def Car { part engine; }\n\tpart def Truck :> Car {\n\t\tpart :>> engine { objective o2; }\n\t}\n}\n",
+    );
+    let out = sysml(&["check", model.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`P::Truck::engine::o2`"), "{stderr}");
+    assert!(!stderr.contains("'?'"), "{stderr}");
+    let out = sysml(&["--format", "json", "check", model.to_str().unwrap()]);
+    let v = json_of(&out);
+    assert_eq!(v["violations"][0]["element"], "P::Truck::engine::o2", "{v}");
+}
+
+/// A library from `SYSML_LIBRARY_PATH` with a name missing in it is not the
+/// model's problem, and was counted as one: `check` of a file whose every
+/// name resolved failed with "1/2 resolved", an empty list of what did not,
+/// and nothing anywhere to say which reference that was. The counts and the
+/// exit status are about the files asked about, as the list always was, and
+/// the library's own gap is said apart.
+#[test]
+fn a_gap_in_the_library_is_not_the_models_to_answer_for() {
+    let dir = temp_dir("library-gap");
+    let library = dir.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    write(&library, "l.sysml", "package L { part x : Missing; }\n");
+    let ok = write(&dir, "ok.sysml", "part def A;\npart a : A;\n");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sysml"))
+            .env("SYSML_LIBRARY_PATH", &library)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["--format", "json", "check", ok.to_str().unwrap()]);
+    let v = json_of(&out);
+    assert!(out.status.success(), "{v}");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["resolved"], 1);
+    assert_eq!(v["references"], 1);
+    assert_eq!(v["unresolved"].as_array().unwrap().len(), 0);
+    assert_eq!(v["library_unresolved"], 1);
+
+    let out = run(&["check", ok.to_str().unwrap()]);
+    assert!(out.status.success());
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("1/1 reference(s) resolved"), "{said}");
+    let noted = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        noted.contains("1 reference(s) in the library"),
+        "the library's gap is said, not hidden: {noted}"
+    );
+
+    // a model's own missing name still fails it, and is the one counted
+    let bad = write(&dir, "bad.sysml", "part a : Nowhere;\n");
+    let out = run(&["--format", "json", "check", bad.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["references"], 1);
+    assert_eq!(v["unresolved"][0]["name"], "Nowhere");
+
+    // and the library checked as what is asked about lists its own
+    let out = run(&["--format", "json", "check", library.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(json_of(&out)["unresolved"][0]["name"], "Missing");
 }

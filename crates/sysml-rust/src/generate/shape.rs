@@ -46,6 +46,19 @@ impl<'a> Generator<'a> {
                 self.action(def, out);
                 Ok(())
             }
+            Shape::Quantity => {
+                let spelled = self.model.name(def).expect("collected named");
+                writeln!(out, "\n/// SysML: `attribute def {spelled}`").unwrap();
+                if let Some(doc) = documentation(self.model, def) {
+                    doc_comment(&doc, "", out);
+                }
+                if let Some(counted) = crate::quantity::counted(self.model, def) {
+                    writeln!(out, "/// {counted}").unwrap();
+                }
+                let scalar = scalar_type(self.model, def).unwrap_or("f64");
+                writeln!(out, "pub type {} = {scalar};", type_ident(spelled)).unwrap();
+                Ok(())
+            }
             Shape::Flattened => {
                 let name = type_ident(self.model.name(def).expect("collected named"));
                 writeln!(
@@ -60,6 +73,34 @@ impl<'a> Generator<'a> {
     /// The flattened data fields of a struct definition, settled where
     /// they have been and worked out where they have not -- the phases
     /// that run before [`Generator::settle_fields`] ask too.
+    /// A reference chain through the fields of a generated struct, from
+    /// `fields` on: `line.amount` is `self.line.amount` where every step
+    /// holds one value, and nothing Rust can spell where one is an
+    /// `Option` or a `Vec`, which has no `amount` -- or where the chain
+    /// ends on one, which is no value a formula can work with.
+    pub(crate) fn through_fields(&self, fields: &[Field], chain: &str) -> Option<expr::Reference> {
+        let mut names = chain.split('.');
+        let first = names.next()?;
+        let mut field = fields.iter().find(|field| field.name == first)?.clone();
+        let mut rust = format!("self.{}", field.spelled);
+        for name in names {
+            let FieldType::Generated(def) = field.ty else {
+                return None;
+            };
+            if field.container != Container::One {
+                return None;
+            }
+            field = self.fields(def)?.into_iter().find(|it| it.name == name)?;
+            rust = format!("{rust}.{}", field.spelled);
+        }
+        if field.container != Container::One {
+            return None;
+        }
+        Some(match field.ty {
+            FieldType::Scalar(ty) => expr::Reference::typed(rust, ty),
+            _ => rust.into(),
+        })
+    }
     pub(crate) fn fields(&self, def: ElementId) -> Option<Vec<Field>> {
         match self.fields.get(&def) {
             Some(settled) => settled.clone(),
@@ -72,20 +113,54 @@ impl<'a> Generator<'a> {
     ///
     /// `None` marks a specialization cycle, which cannot flatten.
     pub(crate) fn walk_fields(&self, def: ElementId) -> Option<Vec<Field>> {
+        self.walk_fields_and_clashes(def).map(|(fields, _)| fields)
+    }
+    /// The names two generals of `def` both hand down, neither of them
+    /// redefining the other's: only one of them can be the field, and
+    /// the first written is. The model is not well formed -- the names
+    /// of a namespace's members are to be distinguishable -- and a struct
+    /// that quietly lost one says nothing of it.
+    pub(crate) fn clashing_fields(&self, def: ElementId) -> Vec<String> {
+        self.walk_fields_and_clashes(def)
+            .map(|(_, clashes)| clashes)
+            .unwrap_or_default()
+    }
+    fn walk_fields_and_clashes(&self, def: ElementId) -> Option<(Vec<Field>, Vec<String>)> {
         if self.specializes_itself(def, &mut Vec::new(), &mut HashSet::new()) {
             return None;
         }
+        let mut clashes = Vec::new();
+        // which level each name was taken at
+        let mut taken_at: std::collections::HashMap<String, ElementId> = Default::default();
         let mut fields = Vec::new();
         let mut taken: HashSet<String> = HashSet::new();
-        let mut chain = vec![def];
+        // what a redefinition below has replaced, under whatever name: `y
+        // :>> x` stands in the place of `x`, which is no field beside it
+        let mut replaced: HashSet<ElementId> = HashSet::new();
+        // breadth first and in the order the generals are written, so the
+        // nearer and the first-written answer for a name: read as a stack,
+        // the last general written won a name two of them declare
+        let mut chain = std::collections::VecDeque::from([def]);
         let mut visited = HashSet::new();
-        while let Some(level) = chain.pop() {
+        while let Some(level) = chain.pop_front() {
             // diamond inheritance reaches one general along two paths;
             // it hands its fields down once, not twice
             if !visited.insert(level) {
                 continue;
             }
             for &child in self.model.owned(level) {
+                for &relationship in self.model.owned(child) {
+                    if self.model.kind(relationship) == ElementKind::Redefinition {
+                        replaced.extend(
+                            self.model
+                                .maybe(relationship, "redefinedFeature")
+                                .and_then(Value::as_id),
+                        );
+                    }
+                }
+                if replaced.contains(&child) {
+                    continue;
+                }
                 if !matches!(
                     self.model.kind(child),
                     ElementKind::AttributeUsage
@@ -102,12 +177,178 @@ impl<'a> Generator<'a> {
                     continue;
                 };
                 if taken.insert(field.name.clone()) {
+                    taken_at.insert(field.name.clone(), level);
                     fields.push(field);
+                } else if taken_at
+                    .get(&field.name)
+                    .is_some_and(|&nearer| !self.is_below(nearer, level))
+                    && !clashes.contains(&field.name)
+                {
+                    // shadowed by a level that does not specialize this one
+                    clashes.push(field.name.clone());
                 }
             }
             chain.extend(self.generals(level));
         }
-        Some(fields)
+        Some((fields, clashes))
+    }
+    /// The members a struct is made of beyond its data fields -- ports,
+    /// performed actions, calculations, assertions, states and whatever
+    /// is not generated -- its own first, then what its generals hand
+    /// down. Rust has no subtyping, so a `calc` or a `perform` declared on
+    /// a general is a method of every struct below it, as its attributes
+    /// are fields there; a member redefined below, or one whose name a
+    /// nearer member already answers to, is that nearer member's.
+    ///
+    /// The data fields are [`Generator::fields`]'s, and the generals'
+    /// nested definitions are written at the top level, so neither is
+    /// handed down here.
+    pub(crate) fn members(&self, def: ElementId) -> Vec<ElementId> {
+        let model = self.model;
+        let mut members = Vec::new();
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut replaced: HashSet<ElementId> = HashSet::new();
+        let mut chain = std::collections::VecDeque::from([def]);
+        let mut visited = HashSet::new();
+        while let Some(level) = chain.pop_front() {
+            if !visited.insert(level) {
+                continue;
+            }
+            let inherited = level != def;
+            // a name shadows what is further up, not what stands beside
+            // it: `action inner;` and `perform inner;` are two members
+            let mut at_level = Vec::new();
+            for &child in model.owned(level) {
+                let kind = model.kind(child);
+                if kind.is_a(ElementKind::Relationship) || kind == ElementKind::MetadataUsage {
+                    continue;
+                }
+                replaced.extend(
+                    model
+                        .owned(child)
+                        .iter()
+                        .filter(|&&it| model.kind(it) == ElementKind::Redefinition)
+                        .filter_map(|&it| {
+                            model.maybe(it, "redefinedFeature").and_then(Value::as_id)
+                        }),
+                );
+                if replaced.contains(&child) {
+                    continue;
+                }
+                if inherited
+                    && (kind.is_a(ElementKind::Definition)
+                        || matches!(
+                            kind,
+                            ElementKind::AttributeUsage
+                                | ElementKind::PartUsage
+                                | ElementKind::ItemUsage
+                                | ElementKind::ReferenceUsage
+                        ))
+                {
+                    continue;
+                }
+                let name = self.member_name(child);
+                // a nearer member answers to this name
+                if inherited && name.as_ref().is_some_and(|name| taken.contains(name)) {
+                    continue;
+                }
+                at_level.extend(name);
+                members.push(child);
+            }
+            taken.extend(at_level);
+            if self.specializes_itself(level, &mut Vec::new(), &mut HashSet::new()) {
+                break;
+            }
+            chain.extend(self.model_generals(level));
+        }
+        members
+    }
+    /// The generals a definition hands members down from: the ones the
+    /// model wrote, not the library's own -- every `part def` implicitly
+    /// specializes `Parts::Part`, whose `ownedPorts` and
+    /// `performedActions` are what a part is, not members anyone wrote.
+    fn model_generals(&self, def: ElementId) -> Vec<ElementId> {
+        let model = self.model;
+        model
+            .owned(def)
+            .iter()
+            .filter(|&&child| model.kind(child) == ElementKind::Subclassification)
+            .filter(|&&child| !model.flag(child, "isImplied"))
+            .filter_map(|&child| model.maybe(child, "superclassifier").and_then(Value::as_id))
+            .filter(|&general| {
+                let mut at = Some(general);
+                while let Some(here) = at {
+                    if model.is_standard(here) {
+                        return false;
+                    }
+                    at = model.owner(here);
+                }
+                true
+            })
+            .collect()
+    }
+    /// The name a member is generated under: the one it declares, or the
+    /// one it borrows from what it redefines or refers to -- `perform
+    /// inner;` is `inner` -- or, for a performance declaring and
+    /// borrowing none, the name of what it performs, as `perform action :
+    /// Steer;` performs a `Steer` and is nothing else the model calls it.
+    pub(crate) fn member_name(&self, usage: ElementId) -> Option<String> {
+        if let Some(name) = self.model.effective_name(usage) {
+            return Some(name.to_string());
+        }
+        // only a performance is called after what it performs: an
+        // unnamed part or connection is one of several a type may have,
+        // and its type's name would be a name nobody gave it
+        if self.model.kind(usage) != ElementKind::PerformActionUsage {
+            return None;
+        }
+        let ty = self.performed(usage)?;
+        let spelled = self.model.name(ty)?;
+        let mut letters = spelled.chars();
+        let first = letters.next()?;
+        Some(first.to_lowercase().chain(letters).collect())
+    }
+    /// The doc line a member generated under a name the model never
+    /// gave it carries, so that the method's name reads as this
+    /// generator's choice and not as the model's: empty for a member the
+    /// model names, itself or through what it borrows a name from.
+    pub(crate) fn unnamed_note(&self, usage: ElementId) -> String {
+        if self.model.effective_name(usage).is_some() {
+            return String::new();
+        }
+        "    /// Unnamed in the model: called here after its type.\n".to_string()
+    }
+    /// What a `perform` performs: the action it is typed by, or the one
+    /// typing the action usage it refers to -- `perform inner;` performs
+    /// whatever `action inner : Steer;` is.
+    pub(crate) fn performed(&self, usage: ElementId) -> Option<ElementId> {
+        let model = self.model;
+        model.type_of(usage).or_else(|| {
+            let referenced = model.owned(usage).iter().find_map(|&child| {
+                (model.kind(child) == ElementKind::ReferenceSubsetting)
+                    .then(|| {
+                        model
+                            .maybe(child, "referencedFeature")
+                            .and_then(Value::as_id)
+                    })
+                    .flatten()
+            })?;
+            held_type(model, referenced)
+        })
+    }
+    /// Whether `low` specializes `high`, directly or not.
+    fn is_below(&self, low: ElementId, high: ElementId) -> bool {
+        let mut seen = HashSet::new();
+        let mut queue = vec![low];
+        while let Some(at) = queue.pop() {
+            if at == high {
+                return true;
+            }
+            if seen.insert(at) {
+                queue.extend(self.generals(at));
+            }
+        }
+        false
     }
     /// What `def` names as its immediate generals, off the reified
     /// subclassifications.
@@ -172,10 +413,7 @@ impl<'a> Generator<'a> {
         // KerML's rule for that -- which follows references as well as
         // redefinitions, and a chain of either -- is the model's own
         let name = self.model.effective_name(usage)?.to_string();
-        let target = self
-            .model
-            .type_of(usage)
-            .or_else(|| self.model.type_of(redefined(self.model, usage)?))?;
+        let target = held_type(self.model, usage)?;
         let ty = if let Some(bound) = binding(self.model, target) {
             FieldType::External(bound.get(binding::ITEM)?.clone())
         } else if matches!(
@@ -185,7 +423,7 @@ impl<'a> Generator<'a> {
             // a state machine or an abstract definition is not a value type
             FieldType::Generated(target)
         } else {
-            FieldType::Scalar(scalar_of(self.model.name(target)?)?)
+            FieldType::Scalar(scalar_type(self.model, target)?)
         };
         let container = multiplicity(self.model, usage);
         // anything but a Vec keeps the value inline, so a cycle needs a Box
@@ -216,13 +454,32 @@ impl<'a> Generator<'a> {
         let mut notes: Vec<String> = Vec::new();
 
         let mut fields = self.fields(def).expect("settled as buildable");
-        for &child in model.owned(def) {
-            if model.kind(child).is_a(ElementKind::Relationship)
-                || model.kind(child) == ElementKind::MetadataUsage
-            {
-                continue;
-            }
-            let Some(child_name) = model.name(child) else {
+        for name in self.clashing_fields(def) {
+            notes.push(format!(
+                "`{name}` is handed down by two generals that do not redefine one \
+                 another; only the first written is a field"
+            ));
+        }
+        for child in self.members(def) {
+            let Some(child_name) = self.member_name(child) else {
+                // an end name resolution reified stands for what a
+                // connector reaches, and is no member anyone wrote
+                if model.flag(child, "isEnd") {
+                    continue;
+                }
+                // a comment or documentation is about the struct, not part
+                // of it, and needs no name to be that
+                if !model.kind(child).is_a(ElementKind::Usage) {
+                    continue;
+                }
+                // Nothing the model says names it, and nothing it is
+                // typed by does either: there is no Rust name to write
+                // it under, which is said rather than passed over.
+                let note = format!(
+                    "an unnamed {} -- nothing names it, so there is no Rust name for it",
+                    model.kind(child).name()
+                );
+                notes.push(note);
                 continue;
             };
             match model.kind(child) {
@@ -302,11 +559,29 @@ impl<'a> Generator<'a> {
             }
         }
 
+        // Each method names itself after what it stands for, and two of
+        // those may spell alike in Rust -- `calc fooBar` and `calc
+        // foo_bar` are both `foo_bar` -- so the second is numbered, as a
+        // field would be.
+        let mut called = Namespace::default();
+        let methods: Vec<String> = methods
+            .into_iter()
+            .map(|method| named_once(method, &mut called))
+            .collect();
+
         writeln!(out).unwrap();
         if let Some(doc) = documentation(model, def) {
             doc_comment(&doc, "", out);
         }
-        writeln!(out, "/// SysML: `part def {def_name}`").unwrap();
+        // what the model wrote, keyword and name, rather than `part def`
+        // and the Rust name for every definition that becomes a struct
+        writeln!(
+            out,
+            "/// SysML: `{} {}`",
+            declared_as(model.kind(def)),
+            sysml_syntax::quote(model.name(def).expect("collected named"))
+        )
+        .unwrap();
         for note in &notes {
             self.open(OpenKind::Skipped, def_name.clone(), None, note);
             writeln!(out, "// not generated: {note}").unwrap();
@@ -350,6 +625,30 @@ impl<'a> Generator<'a> {
             }
             if let Some(doc) = documentation(model, field.usage) {
                 doc_comment(&doc, "    ", out);
+            }
+            if let Some(counted) = crate::quantity::counted_in(model, field.usage) {
+                writeln!(out, "    /// {counted}").unwrap();
+            }
+            // A value the model declared and this could not write starts
+            // the field at its type's default instead, and saying nothing
+            // made a declared `20 ['°C']` or `y * 2` read as a zero the
+            // model chose.
+            if let (None, Some(ValueClause::Text(declared))) =
+                (&field.default, value_clause(model, field.usage))
+            {
+                let why = format!(
+                    "`{}` starts at its type's default: `= {}` is beyond the simple subset",
+                    field.name,
+                    on_one_line(&declared)
+                );
+                writeln!(out, "    // left open: {why}").unwrap();
+                self.open(OpenKind::Skipped, def_name.clone(), None, why);
+            }
+            // a value written, and a container it cannot be written into
+            // as it stands
+            if let Err(why) = self.declared_start(field) {
+                writeln!(out, "    // left open: {why}").unwrap();
+                self.open(OpenKind::Skipped, def_name.clone(), None, why);
             }
             writeln!(
                 out,
@@ -481,12 +780,49 @@ impl<'a> Generator<'a> {
         }
     }
     fn default_value(&self, field: &Field) -> String {
-        match (&field.default, &field.container) {
-            (Some(rust), Container::One) if !field.boxed => rust.clone(),
+        if let Ok(Some(rust)) = self.declared_start(field) {
+            return rust;
+        }
+        match field.container {
             // `Default` is implemented for arrays only up to a length the
             // standard library stops at; `from_fn` has no such limit
-            (_, Container::Array(_)) => "std::array::from_fn(|_| Default::default())".to_string(),
+            Container::Array(_) => "std::array::from_fn(|_| Default::default())".to_string(),
             _ => "Default::default()".to_string(),
+        }
+    }
+    /// The declared value of a field in the form its container holds
+    /// it, or why that form cannot say what the model says.
+    ///
+    /// A feature value binds the feature to what the expression comes to,
+    /// and every value this generator writes is one value: `opt :
+    /// Integer[0..1] = 3` holds that one value, `Some(3)`, and `many :
+    /// Integer[*] = 3` the sequence of it, `vec![3]`. `three : Real[3] =
+    /// 1.5` is a sequence of one where the multiplicity asks for three,
+    /// which the model does not make well formed by repeating the value:
+    /// `[1.5; 3]` would be a choice the model never made, so the field
+    /// is left open and says so.
+    fn declared_start(&self, field: &Field) -> Result<Option<String>, String> {
+        let Some(rust) = &field.default else {
+            return Ok(None);
+        };
+        let one_too_few = |holds: String| {
+            Err(format!(
+                "`{}` starts at its type's default: its declared value `{rust}` is one \
+                 value, where {holds}",
+                field.name
+            ))
+        };
+        match field.container {
+            Container::One if !field.boxed => Ok(Some(rust.clone())),
+            Container::One => Ok(None),
+            Container::Optional if !field.boxed => Ok(Some(format!("Some({rust})"))),
+            Container::Optional => Ok(Some(format!("Some(Box::new({rust}))"))),
+            Container::Many => match lower_bound(self.model, field.usage) {
+                Some(0 | 1) => Ok(Some(format!("vec![{rust}]"))),
+                Some(lower) => one_too_few(format!("its multiplicity asks for at least {lower}")),
+                None => one_too_few("its multiplicity's lower bound is no number".to_string()),
+            },
+            Container::Array(n) => one_too_few(format!("its multiplicity asks for exactly {n}")),
         }
     }
     /// An `enum def` as an enum, its first value the default.
@@ -603,4 +939,38 @@ impl<'a> Generator<'a> {
         }
         writeln!(out, "}}").unwrap();
     }
+}
+
+/// The keywords a definition of `kind` is declared with: `PartDefinition`
+/// is `part def`. Only the definitions that become structs ask, and each
+/// of those is one word before `Definition`.
+fn declared_as(kind: ElementKind) -> String {
+    let name = kind.name();
+    format!(
+        "{} def",
+        name.strip_suffix("Definition")
+            .unwrap_or(name)
+            .to_lowercase()
+    )
+}
+
+/// `method` with the name it declares taken from `called`: kept where it
+/// is the first to want it, numbered where another method has it.
+fn named_once(method: String, called: &mut Namespace) -> String {
+    let Some((at, length)) = method
+        .find("fn ")
+        .map(|at| at + 3)
+        .and_then(|at| method[at..].find(['(', '<']).map(|length| (at, length)))
+    else {
+        return method;
+    };
+    let name = &method[at..at + length];
+    // `r#type` is the keyword's name, and a number after it makes it one
+    // that needs no `r#`
+    let bare = name.trim_start_matches("r#");
+    let taken = called.take(bare.to_string());
+    if taken == bare {
+        return method;
+    }
+    format!("{}{taken}{}", &method[..at], &method[at + length..])
 }

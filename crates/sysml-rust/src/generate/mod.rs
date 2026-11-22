@@ -190,6 +190,13 @@ enum Shape {
     Action,
     /// Abstract: features flatten into subtypes, no item of its own.
     Flattened,
+    /// A model's own scalar quantity -- `attribute def Payload :>
+    /// MassValue;` -- which is the `f64` any quantity is, under its own
+    /// name; or its own specialization of a primitive, which is that
+    /// primitive under its own name. Written as a struct, it was the library's machinery for a
+    /// quantity value flattened into fields, beside a default that was
+    /// the number.
+    Quantity,
 }
 
 struct Generator<'a> {
@@ -376,6 +383,10 @@ enum ValueClause {
 
 /// One transition, ready to be written into the table.
 struct Transition {
+    usage: ElementId,
+    /// Whether the model named it; an unnamed one is called after its
+    /// two ends.
+    named: bool,
     name: String,
     source: String,
     target: String,
@@ -387,11 +398,48 @@ struct Transition {
     effect: bool,
 }
 
+impl Transition {
+    /// How the transition is referred to in what is written about it.
+    fn shown(&self) -> String {
+        if self.named {
+            format!("`{}`", self.name)
+        } else {
+            format!(
+                "the transition `first {} then {}`",
+                self.source, self.target
+            )
+        }
+    }
+}
+
 /// A compiled action body: the traits its parts demand of whoever
 /// implements it, and the statements that perform them in order.
 struct Body {
     supertraits: Vec<String>,
     lines: Vec<String>,
+}
+
+/// The state a machine starts in. Written `entry; then dark;` -- an
+/// entry action with a succession out of it -- so it is neither the
+/// first state declared nor anything a state says of itself.
+pub(crate) fn initial_state(model: &Model, owned: &[ElementId]) -> Option<ElementId> {
+    let entry = owned
+        .iter()
+        .copied()
+        .find(|&child| model.member_role(child) == Some(Role::Entry))?;
+    owned.iter().copied().find_map(|other| {
+        if !model.kind(other).is_a(ElementKind::SuccessionAsUsage) {
+            return None;
+        }
+        let ends: Vec<ElementId> = model
+            .owned(other)
+            .iter()
+            .filter(|&&end| crate::connector_end(model, end))
+            .filter_map(|&end| sysml_model::end_reaches(model, end).last().copied())
+            .collect();
+        let (from, to) = (*ends.first()?, *ends.get(1)?);
+        (from == entry).then_some(to)
+    })
 }
 
 /// The subactions in an order the successions allow, or nothing where
@@ -467,22 +515,45 @@ fn contained(base: String, container: Container) -> String {
     }
 }
 
+/// The least number of values a usage's multiplicity admits, where it is
+/// a number: `[*]` is `0`, `[2..*]` is `2`, `[n..*]` is no number. A usage
+/// with no declared multiplicity has none to say.
+fn lower_bound(model: &Model, usage: ElementId) -> Option<i64> {
+    use sysml_model::Bound;
+    let declared = sysml_model::declared_multiplicity(model, usage)?;
+    match declared.bound.or(declared.lower) {
+        Some(Bound::Exactly(n)) if n >= 0 => Some(n),
+        // `[*]` alone is `0..*`
+        Some(Bound::Many) if declared.bound.is_some() => Some(0),
+        _ => None,
+    }
+}
+
 /// The declared multiplicity of a usage, as the container it implies.
 fn multiplicity(model: &Model, usage: ElementId) -> Container {
     use sysml_model::Bound;
     let Some(declared) = sysml_model::declared_multiplicity(model, usage) else {
         return Container::One;
     };
-    match (declared.bound, declared.lower, declared.upper) {
-        (Some(Bound::Many), _, _) => Container::Many,
+    // Read as the two numbers the plan reads, so that what is written
+    // two ways is one container: `[1]` and `[1..1]` are both one of the
+    // thing, `[3]` and `[3..3]` both three. Matched on how the bound was
+    // spelled, `[1]` became `[T; 1]` and `[3..3]` a `Vec`.
+    let number = |end: Option<Bound>| match end {
+        Some(Bound::Exactly(n)) if n >= 0 => Some(n),
+        _ => None,
+    };
+    let (lower, upper) = match declared.bound {
+        Some(bound) => (number(Some(bound)), number(Some(bound))),
+        None => (number(declared.lower), number(declared.upper)),
+    };
+    match (lower, upper) {
+        // the multiplicity everything has by default, said out loud
+        (Some(1), Some(1)) => Container::One,
+        (Some(0), Some(1)) => Container::Optional,
         // `[0]` is a multiplicity of nothing, which Rust spells as an
         // array of nothing; a `Vec` would claim it can hold more
-        (Some(Bound::Exactly(n)), _, _) if n >= 0 => Container::Array(n),
-        (None, Some(Bound::Exactly(0)), Some(Bound::Exactly(1))) => Container::Optional,
-        // `[1..1]` is the multiplicity everything has by default, said
-        // out loud -- one of the thing, not a collection of them
-        (None, Some(Bound::Exactly(1)), Some(Bound::Exactly(1))) => Container::One,
-        (None, Some(_), Some(_)) => Container::Many,
+        (Some(lower), Some(upper)) if lower == upper => Container::Array(lower),
         _ => Container::Many,
     }
 }
@@ -493,27 +564,48 @@ fn multiplicity(model: &Model, usage: ElementId) -> Container {
 /// any other expression over other features has no place in
 /// `Default::default()`.
 fn default_of(model: &Model, usage: ElementId) -> Option<String> {
+    // A number, a truth value or a text is a value of a scalar, and a
+    // field the generator gives a type of its own -- a struct, an
+    // enumeration -- holds none of them: `attribute x : String = "a";`
+    // where the package declares a `part def 'String'` of its own.
+    let scalar = held_type(model, usage).is_none_or(|ty| scalar_type(model, ty).is_some());
     match value_clause(model, usage)? {
+        ValueClause::Literal(_) if !scalar => None,
         ValueClause::Literal(rust) => Some(rust),
         ValueClause::Text(text) => match translate_as(
             &text,
-            match wants_float(model, usage) {
-                true => Numbers::AsReals,
-                false => Numbers::AsWritten,
-            },
+            numbers_for(model, usage),
+            &crate::quantity::units_under(model, usage),
             &|_| None,
             &|_| None,
         ) {
+            // A `Natural` is a `u64`, and `3 - 5` is a constant Rust
+            // refuses to compile rather than wrap: what a difference
+            // comes to is left to whoever knows what the model meant
+            Some(translated)
+                if translated.rust.contains('-')
+                    && held_type(model, usage).and_then(|ty| scalar_type(model, ty))
+                        == Some("u64") =>
+            {
+                None
+            }
             Some(translated) => Some(translated.rust),
             // A value that is only a name refers to a feature, and name
             // resolution wrote down which one, so the value to start
-            // from is that feature's own. One step: what the feature it
-            // names starts from has to be a value in itself, or there
-            // is nothing here to write.
-            None => match value_clause(model, referent_of(model, usage)?)? {
-                ValueClause::Literal(rust) => Some(rust),
-                ValueClause::Text(_) => None,
-            },
+            // from is that feature's own -- written for this field, not
+            // for that one. One step: what the feature it names starts
+            // from has to be a value in itself, or there is nothing here
+            // to write.
+            None => {
+                let referent = referent_of(model, usage)?;
+                if let Some(variant) = enum_variant(model, referent, usage) {
+                    return Some(variant);
+                }
+                match value_clause_as(model, referent, usage)? {
+                    ValueClause::Literal(rust) => Some(rust),
+                    ValueClause::Text(_) => None,
+                }
+            }
         },
     }
 }
@@ -532,6 +624,33 @@ fn declared_values(model: &Model, requirement: ElementId) -> Vec<String> {
         .filter(|&&child| model.kind(child) == ElementKind::AttributeUsage)
         .filter_map(|&child| default_of(model, child))
         .collect()
+}
+
+/// `Level::low` as the variant it is, where `usage` holds a value of the
+/// enumeration `value` is one of: what the value is worth -- `low =
+/// 0.25` -- is no `Level`, and a field that started from it did not
+/// compile.
+///
+/// Spelled as the enumeration spells its variants, in the same order.
+fn enum_variant(model: &Model, value: ElementId, usage: ElementId) -> Option<String> {
+    if model.kind(value) != ElementKind::EnumerationUsage {
+        return None;
+    }
+    let def = model.owner(value)?;
+    if model.kind(def) != ElementKind::EnumerationDefinition || held_type(model, usage) != Some(def)
+    {
+        return None;
+    }
+    let mut spelling = Namespace::default();
+    let variant = model
+        .owned(def)
+        .iter()
+        .filter(|&&child| model.kind(child) == ElementKind::EnumerationUsage)
+        .filter_map(|&child| Some((child, model.name(child)?)))
+        .map(|(child, name)| (child, spelling.take(type_ident(&camel(name)))))
+        .find(|(child, _)| *child == value)?
+        .1;
+    Some(format!("{}::{variant}", type_ident(model.name(def)?)))
 }
 
 /// The feature a usage's value refers to, where the whole value is a
@@ -555,8 +674,8 @@ fn result_clause(model: &Model, element: ElementId) -> Option<ValueClause> {
 /// The Rust scalar a SysML type stands for, where it stands for one.
 /// Fields and parameters both ask this, so that one model type cannot
 /// be a `f64` in a struct and something else in a signature.
-fn scalar_of(name: &str) -> Option<&'static str> {
-    Some(match sysml_model::primitive(name)? {
+fn scalar_of(primitive: &'static str) -> Option<&'static str> {
+    Some(match primitive {
         "Real" => "f64",
         "Integer" => "i64",
         // `Positive` is a `Natural` the model has ruled zero out of;
@@ -567,27 +686,61 @@ fn scalar_of(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The type a feature holds values of: its own typing, or -- where it
+/// writes none -- that of what it redefines or subsets, as far up as it
+/// takes. `attribute mass :> ISQ::mass;` declares no type and is a
+/// `MassValue` all the same, since a subset of the masses is masses.
+///
+/// Asked by every reader of what a field or a parameter holds, so that
+/// one feature cannot be a `MassValue` to the struct and nothing to the
+/// plan.
+pub(crate) fn held_type(model: &Model, feature: ElementId) -> Option<ElementId> {
+    let mut seen = HashSet::new();
+    let mut next = Some(feature);
+    // a feature that subsets itself, however far round, holds nothing
+    // anyone wrote down
+    while let Some(at) = next.filter(|&at| seen.insert(at)) {
+        if let Some(ty) = model.type_of(at) {
+            return Some(ty);
+        }
+        next = redefined(model, at).or_else(|| {
+            model.owned(at).iter().find_map(|&child| {
+                (model.kind(child) == ElementKind::Subsetting)
+                    .then(|| model.subsetted_feature(child))
+                    .flatten()
+            })
+        });
+    }
+    None
+}
+
+/// The Rust scalar a type stands for: a primitive by its name, and a
+/// scalar quantity -- `ISQ::MassValue`, or a model's own specialization
+/// of one -- as the `f64` of SI coherent units it holds.
+fn scalar_type(model: &Model, ty: ElementId) -> Option<&'static str> {
+    sysml_model::library_primitive(model, ty)
+        .and_then(scalar_of)
+        .or_else(|| crate::quantity::is_scalar_quantity(model, ty).then_some("f64"))
+}
+
 /// Whether a usage is typed by something Rust spells as a float. SysML
 /// writes `attribute shift : Real = 1670;` and means 1670.0; Rust reads
 /// that literal as an integer and refuses it, so the point has to be
 /// put back.
 fn wants_float(model: &Model, usage: ElementId) -> bool {
-    let Some(target) = model
-        .type_of(usage)
-        .or_else(|| redefined(model, usage).and_then(|it| model.type_of(it)))
-    else {
+    let Some(target) = held_type(model, usage) else {
         return false;
     };
     match binding(model, target).and_then(|bound| bound.get(binding::ITEM).cloned()) {
         Some(path) => path == "f32" || path == "f64",
-        None => model.name(target).and_then(scalar_of) == Some("f64"),
+        None => scalar_type(model, target) == Some("f64"),
     }
 }
 
 /// A real as Rust spells it. `{:?}` writes `inf` and `NaN`, which are
 /// what a model overflowing a `f64` -- `1e999` -- arrives as and which
 /// Rust does not read back as anything.
-fn real_literal(real: f64) -> String {
+pub(crate) fn real_literal(real: f64) -> String {
     match real {
         _ if real.is_nan() => "f64::NAN".to_string(),
         f64::INFINITY => "f64::INFINITY".to_string(),
@@ -599,16 +752,40 @@ fn real_literal(real: f64) -> String {
 /// How a Rust type of `spelled` wants its whole numbers written.
 fn numbers_of(spelled: Option<&str>) -> Numbers {
     match spelled {
-        Some("f32" | "f64") => Numbers::AsReals,
-        _ => Numbers::AsWritten,
+        Some("f32" | "f64") => Numbers::Reals,
+        Some("i64" | "u64" | "i32" | "u32") => Numbers::Integers,
+        _ => Numbers::Written,
     }
+}
+
+/// How the value of `usage` wants its numbers written, by what it holds.
+fn numbers_for(model: &Model, usage: ElementId) -> Numbers {
+    if wants_float(model, usage) {
+        return Numbers::Reals;
+    }
+    numbers_of(held_type(model, usage).and_then(|ty| scalar_type(model, ty)))
 }
 
 /// The `= value` clause of a usage, ready for translation.
 fn value_clause(model: &Model, usage: ElementId) -> Option<ValueClause> {
+    value_clause_as(model, usage, usage)
+}
+
+/// The `= value` clause of `from`, written for a field like `usage`:
+/// `attribute y : Real = c;` starts from what `c` declares, and that is
+/// `2.0` for `y` though it is `2` for `c`.
+fn value_clause_as(model: &Model, from: ElementId, usage: ElementId) -> Option<ValueClause> {
     use sysml_model::{Declared, Literal};
-    let rust = match sysml_model::declared_value(model, usage)? {
+    let rust = match sysml_model::declared_value(model, from)? {
         Declared::Text(text) => return Some(ValueClause::Text(text)),
+        // an `Integer` holds no `1.5`, and written as it is the field
+        // does not compile; what is left over goes where a value Rust
+        // cannot start from goes
+        Declared::Literal(Literal::Real(real))
+            if numbers_for(model, usage) == Numbers::Integers =>
+        {
+            return Some(ValueClause::Text(real_literal(real)))
+        }
         Declared::Literal(Literal::Real(real)) => real_literal(real),
         Declared::Literal(Literal::Int(int)) if wants_float(model, usage) => format!("{int}.0"),
         Declared::Literal(Literal::Int(int)) => format!("{int}"),
@@ -708,6 +885,16 @@ fn documentation(model: &Model, element: ElementId) -> Option<String> {
     })
 }
 
+/// SysML text as it reads on the one line of a comment.
+///
+/// A guard or a value may be written over several lines -- `if s.level >
+/// 3` and `and s.hot` below it -- and a `//` comment ends at the first of
+/// them, leaving the rest to be read as code. Every run of white space,
+/// line breaks included, is one space here.
+pub(crate) fn on_one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Documentation as Rust doc comments, one line of `///` per line of the
 /// original, each behind `indent` so a field's docs sit with the field.
 fn doc_comment(doc: &str, indent: &str, out: &mut String) {
@@ -784,8 +971,19 @@ fn qualified_of(model: &Model, def: ElementId) -> String {
 /// it says yes to `²` and to the Arabic-Indic digits, and `x²` is not a
 /// name Rust can spell. Letters and ASCII digits are the part of XID
 /// this generator needs, and anything else is dropped.
+///
+/// "Letters" is not `is_alphabetic` alone, which also says yes to `🄰`
+/// and a combining mark, neither of which Rust accepts in a name; a letter
+/// here is one XID admits, and only one XID admits at the start is put
+/// at the start (see [`starts_a_name`]).
 fn spellable(ch: char) -> bool {
-    ch.is_alphabetic() || ch.is_ascii_digit()
+    (ch.is_alphabetic() && unicode_ident::is_xid_continue(ch)) || ch.is_ascii_digit()
+}
+
+/// Whether Rust lets a name begin with `ch`: an ASCII digit or a mark that
+/// may only continue a name is put after a `_`.
+fn starts_a_name(ch: char) -> bool {
+    unicode_ident::is_xid_start(ch) || ch == '_'
 }
 
 /// A SysML name as the name of a Rust *type*. An escaped name holds
@@ -813,7 +1011,7 @@ fn type_ident(name: &str) -> String {
         // a name Rust cannot spell one character of -- `'+'`, `''` --
         // still has to be called something, and `_` is not a name
         out.push_str("Unnamed");
-    } else if out.starts_with(|ch: char| ch.is_ascii_digit()) {
+    } else if !out.starts_with(starts_a_name) {
         out.insert(0, '_');
     }
     if TAKEN_TYPES.contains(&out.as_str()) {
@@ -863,7 +1061,7 @@ pub(crate) fn ident(name: &str) -> String {
         .chars()
         .map(|ch| if spellable(ch) || ch == '_' { ch } else { '_' })
         .collect();
-    let name = if name.starts_with(|ch: char| ch.is_ascii_digit()) {
+    let name = if !name.is_empty() && !name.starts_with(starts_a_name) {
         format!("_{name}")
     } else if name.is_empty() || name == "_" {
         // `_` is a pattern, not a name, and a name Rust can spell no

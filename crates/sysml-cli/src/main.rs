@@ -13,7 +13,48 @@ use sysml_cli::report::{self, Said, Severity};
 use sysml_syntax::fmt::Layout;
 use sysml_syntax::{Diagnostic, Dialect};
 
-mod api;
+use sysml_cli::api;
+
+/// `print!` that stops quietly when the reader has gone.
+///
+/// `sysml export f.sysml | head`, `sysml check m/ | true`: the reader
+/// closes the pipe, and `print!` panics on what is left. Every write to
+/// stdout in this file goes through these, so that no command is left
+/// out, as some would be if only [`written`] covered it.
+macro_rules! out {
+    ($($arg:tt)*) => { to_stdout(format_args!($($arg)*)) };
+}
+
+/// `println!` that stops quietly when the reader has gone; see [`out!`].
+macro_rules! outln {
+    () => { to_stdout(format_args!("\n")) };
+    ($($arg:tt)*) => { to_stdout(format_args!("{}\n", format_args!($($arg)*))) };
+}
+
+/// Write to stdout, or end the run if it cannot be written.
+///
+/// A closed pipe ends it quietly and successfully, as [`written`] does:
+/// stopping is what the reader asked for. Any other failure -- a full
+/// disk behind a redirect -- is said, and the run fails.
+fn to_stdout(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let failed = {
+        let mut out = std::io::stdout().lock();
+        out.write_fmt(args).err()
+    };
+    if let Some(err) = failed {
+        stdout_failed(&err);
+    }
+}
+
+/// End the run over a write to stdout that failed; see [`to_stdout`].
+fn stdout_failed(err: &std::io::Error) -> ! {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("error: cannot write to stdout: {err}");
+    std::process::exit(1);
+}
 
 fn parse_file(path: &Path, text: &str) -> sysml_syntax::Parse {
     let dialect = path
@@ -113,8 +154,9 @@ enum Command {
         /// Rewrite the files in place
         #[arg(short, long)]
         write: bool,
-        /// Exit non-zero if any file is not already formatted
-        #[arg(long)]
+        /// Exit non-zero if any file is not already formatted; writes
+        /// nothing, so it cannot be had with `--write`
+        #[arg(long, conflicts_with = "write")]
         check: bool,
         /// Columns a line may reach before it is broken at the readiest
         /// joint of what is on it; 0 leaves every line as long as it comes
@@ -138,8 +180,12 @@ enum Command {
     /// and what they bottom out in, and what happens in it
     Plan {
         /// Files or directories to plan
-        #[arg(required = true)]
+        #[arg(required_unless_present = "schema")]
         paths: Vec<PathBuf>,
+        /// Print the JSON schema of a plan -- what a generator reads --
+        /// and stop
+        #[arg(long)]
+        schema: bool,
     },
     /// Load files (or directories), resolve names and render the definitions
     /// and their specializations as an SVG diagram
@@ -195,6 +241,67 @@ enum Command {
         /// Name of the generated package (default: derived from the crate)
         #[arg(long)]
         package: Option<String>,
+        /// Write the surface the crate is read as -- the JSON
+        /// `import-code` reads, which is what an importer for any other
+        /// language writes -- instead of the SysML
+        #[arg(long)]
+        surface: bool,
+        /// Write to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Import code in any language as a SysML package with `@code`
+    /// binding metadata. Reads a surface -- what `import-rust --surface`
+    /// writes for a crate, as JSON, and what an importer for any other
+    /// language writes the same way -- or runs that importer on source
+    /// files: `sysml-import-<LANG>` from PATH, which may write the JSON
+    /// or the SysML itself. Either way the package is checked before it
+    /// is written
+    ImportCode {
+        /// A surface JSON file, or the source files an importer reads
+        #[arg(required_unless_present = "schema")]
+        inputs: Vec<PathBuf>,
+        /// Which importer reads the inputs: `sysml-import-<LANG>` from
+        /// PATH (default: named after the inputs' extension)
+        #[arg(long, value_name = "LANG")]
+        lang: Option<String>,
+        /// Run this command on the inputs instead, split as a shell
+        /// would split it
+        #[arg(long, value_name = "COMMAND", conflicts_with = "lang")]
+        via: Option<String>,
+        /// Name of the package written (default: what the surface says,
+        /// or derived from its module)
+        #[arg(long)]
+        package: Option<String>,
+        /// Write to this file instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Print the JSON schema of a surface and stop
+        #[arg(long)]
+        schema: bool,
+    },
+    /// Generate code in any language from a resolved model, through the
+    /// generator for that language: `sysml-gen-<LANG>` from PATH, handed
+    /// the plan -- what the model implies for code, in no language in
+    /// particular, as `plan` prints it -- on standard input and writing
+    /// the code on standard output. `--lang rust` is the generator built
+    /// in, which is what `rustgen` runs
+    Codegen {
+        /// Files or directories holding the model to generate for
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Also load these files or directories so names resolve, without
+        /// generating for them (imported API packages, libraries)
+        #[arg(long)]
+        library: Vec<PathBuf>,
+        /// Which generator writes the code: `sysml-gen-<LANG>` from PATH,
+        /// or `rust` for the one built in
+        #[arg(long, value_name = "LANG", required_unless_present = "via")]
+        lang: Option<String>,
+        /// Run this command as the generator instead, split as a shell
+        /// would split it
+        #[arg(long, value_name = "COMMAND", conflicts_with = "lang")]
+        via: Option<String>,
         /// Write to this file instead of stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -384,7 +491,7 @@ fn main() -> ExitCode {
             };
             import(&json, diagram.as_deref(), painted, format)
         }
-        Command::Plan { paths } => plan(&paths, format, bare),
+        Command::Plan { paths, schema } => plan(&paths, format, bare, schema),
         Command::Diagram {
             paths,
             library,
@@ -395,8 +502,8 @@ fn main() -> ExitCode {
             output,
         } => {
             // the flags name one drawing between them; clap allows more
-            // than one to be given and the innermost wins, as it did
-            // when these were three arguments read in this order
+            // than one to be given and the innermost wins, in the order
+            // the arguments are read here
             let view = match (internal.as_deref(), browser, sequence.as_deref()) {
                 (_, true, _) => View::Browser,
                 (_, _, Some(name)) => View::Sequence(name),
@@ -416,8 +523,39 @@ fn main() -> ExitCode {
         Command::ImportRust {
             json,
             package,
+            surface,
             output,
-        } => import_rust(&json, package.as_deref(), output.as_deref()),
+        } => import_rust(&json, package.as_deref(), surface, output.as_deref()),
+        Command::ImportCode {
+            inputs,
+            lang,
+            via,
+            package,
+            output,
+            schema,
+        } => import_code(
+            &inputs,
+            lang.as_deref(),
+            via.as_deref(),
+            package.as_deref(),
+            output.as_deref(),
+            schema,
+            bare,
+        ),
+        Command::Codegen {
+            paths,
+            library,
+            lang,
+            via,
+            output,
+        } => codegen(
+            &paths,
+            &library,
+            lang.as_deref(),
+            via.as_deref(),
+            output.as_deref(),
+            bare,
+        ),
         Command::Rustgen {
             paths,
             library,
@@ -431,6 +569,15 @@ fn main() -> ExitCode {
                 library.or_else(|| std::env::var_os("SYSML_LIBRARY_PATH").map(Into::into));
             let project =
                 project.or_else(|| std::env::var_os("SYSML_PROJECT_PATH").map(Into::into));
+            // A project that is not a directory to read is refused here, at
+            // startup, where the launcher reads stderr and the exit code.
+            // Taken as given, it would start a server with nothing in its
+            // project, and every call after would say to start the server
+            // with `--project` -- the very thing it was started with.
+            if let Some(refused) = project.as_deref().and_then(sysml_cli::mcp::refuse_project) {
+                eprintln!("error: {refused}");
+                return ExitCode::FAILURE;
+            }
             // there is nowhere to report a failure to write: the only
             // way this ends badly is the client going away mid-answer,
             // and the exit code is what its launcher reads
@@ -462,7 +609,7 @@ fn main() -> ExitCode {
             dir,
             worst,
             failures,
-        } => corpus(&dir, worst, failures),
+        } => corpus(&dir, worst, failures, format),
     }
 }
 
@@ -489,16 +636,16 @@ fn stats(files: &[PathBuf], format: Format) -> ExitCode {
             "ok": errors == 0,
             "unreadable": [],
             "elements": total,
-            "parseErrors": errors,
+            "parse_errors": errors,
             "counts": counts,
         }));
     } else {
         let mut rows: Vec<_> = counts.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         for (kind, n) in rows {
-            println!("{n:6}  {kind}");
+            outln!("{n:6}  {kind}");
         }
-        println!("{total:6}  total elements ({errors} parse error(s))");
+        outln!("{total:6}  total elements ({errors} parse error(s))");
     }
     // counting the elements of a file that did not parse is counting
     // what the parser guessed at, and `parse` and `check` already exit
@@ -521,10 +668,10 @@ fn export(
         return ExitCode::FAILURE;
     };
     // Written straight out, an element at a time. A model of the standard
-    // library is 47 MB and the document of it is 754 MB of text; built
-    // whole in between, as a `serde_json::Value`, it is about six
-    // gigabytes. There is nothing to be done about how long the text is,
-    // and nothing that wants the six gigabytes.
+    // library is large and the document of it is far larger as text;
+    // built whole in between, as a `serde_json::Value`, it is larger
+    // still. There is nothing to be done about how long the text is,
+    // and nothing that wants the rest.
     match output {
         Some(path) => {
             // A serde error over a writer carries the writer's own, so
@@ -549,11 +696,22 @@ fn export(
             }
         }
         None => {
+            use std::io::Write as _;
             let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-            sysml_interchange::write_json(ws.model(), &extras, &mut out)
-                .expect("a model serializes");
-            // the line `println!` used to put on the end of it
-            let _ = std::io::Write::write_all(&mut out, b"\n");
+            // what fails here is the writing -- the model is built and
+            // serializes -- and `| head` closes the pipe, so a failure
+            // here is expected and must not panic as though the model
+            // were at fault
+            let failed = sysml_interchange::write_json(ws.model(), &extras, &mut out)
+                .map_err(std::io::Error::from)
+                // the newline `println!` would put on the end of it
+                .and_then(|_| out.write_all(b"\n"))
+                .and_then(|()| out.flush())
+                .err();
+            if let Some(err) = failed {
+                drop(out);
+                stdout_failed(&err);
+            }
         }
     }
     ExitCode::SUCCESS
@@ -610,7 +768,14 @@ fn resolved(
         if !imported.is_empty() {
             extras.imported.insert(id, imported);
         }
-        if let Some(target) = ws.import_of(id) {
+        // and the part of that a specializing type inherits: what the
+        // public and protected imports bring in, and not the private ones
+        let inheritable = ws.inheritable_imported_members(id);
+        if !inheritable.is_empty() {
+            extras.inheritable_imported.insert(id, inheritable);
+        }
+        // an import of an alias imports the alias, not what it stands for
+        if let Some(target) = ws.imported_alias(id).or_else(|| ws.import_of(id)) {
             extras.import_targets.insert(id, target);
         }
     }
@@ -620,9 +785,9 @@ fn resolved(
             extras.library.extend(ws.model().descendants(root));
         }
     }
-    // A model is resolved against a library and is not made of one. Six
-    // elements exported with the standard library beside them wrote
-    // ninety-six thousand, and `sysml api push` sent every one.
+    // A model is resolved against a library and is not made of one. A few
+    // elements exported with the standard library beside them would write
+    // all of it too, and `sysml api push` would send every element.
     //
     // What the model refers to across that line stays the `@id` it always
     // was. Those are UUIDv5 over the ownership path, so anybody holding the
@@ -668,18 +833,37 @@ fn fmt(
     let mut dirty = 0usize;
     let mut unformatted = Vec::new();
     let mut broken = Vec::new();
+    // A file that cannot be read or written stops nothing: the rest are
+    // formatted all the same, and each failure is said. Stopping at the
+    // first would leave the order of the arguments deciding which files
+    // were rewritten, and `--format json` saying nothing at all.
+    let mut unreadable = Vec::new();
+    let mut unwritten = Vec::new();
+    let failed = |path: &Path, verb, err: std::io::Error| {
+        let failed = Unreadable {
+            path: path.display().to_string(),
+            verb,
+            error: err.to_string(),
+        };
+        failed.say();
+        failed.json()
+    };
     for path in files {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(err) => return Unreadable::refuse(path, err, "fmt", format),
+            Err(err) => {
+                unreadable.push(failed(path, "read", err));
+                continue;
+            }
         };
         // Re-spacing a file the parser could not follow can move where a quote or
         // comment ends -- `package Name' {` runs the quote on to the next one --
         // and putting the tokens back differently puts the name somewhere else.
-        // Printing that is harmless; writing it over the modeller's file is not,
-        // so `--write` reports such a file instead.
+        // That is no formatting of the file, whether it is written over the
+        // modeller's, printed for them to paste or checked, so each refuses it
+        // the same way -- as the language server answers nothing for one.
         let parse = parse_file(path, &text);
-        if write && !parse.ok() {
+        if !parse.ok() {
             eprintln!(
                 "error: {} does not parse; `sysml parse` says where",
                 path.display()
@@ -700,29 +884,30 @@ fn fmt(
             }
         } else if write {
             if formatted != text {
-                if let Err(err) = std::fs::write(path, &formatted) {
-                    eprintln!("error: cannot write {}: {err}", path.display());
-                    return ExitCode::FAILURE;
+                match std::fs::write(path, &formatted) {
+                    Ok(()) => eprintln!("formatted {}", path.display()),
+                    Err(err) => unwritten.push(failed(path, "write", err)),
                 }
-                eprintln!("formatted {}", path.display());
             }
         } else {
-            print!("{formatted}");
+            out!("{formatted}");
         }
     }
+    let ok = dirty == 0 && broken.is_empty() && unreadable.is_empty() && unwritten.is_empty();
     // `--write` refuses a file it could not parse and exits non-zero
     // for it, so the JSON has to name it too -- otherwise a program is
     // told nothing is wrong and handed a failure
     if format == Format::Json && (check_only || write) {
         report(serde_json::json!({
             "command": "fmt",
-            "ok": dirty == 0 && broken.is_empty(),
-            "unreadable": [],
+            "ok": ok,
+            "unreadable": unreadable,
+            "unwritten": unwritten,
             "unformatted": unformatted,
             "broken": broken,
         }));
     }
-    if dirty > 0 || !broken.is_empty() {
+    if !ok {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -746,17 +931,24 @@ impl Unreadable {
     /// `unreadable` list, so a program that watches for one watches for
     /// all of them.
     fn refuse(path: &Path, error: std::io::Error, command: &str, format: Format) -> ExitCode {
-        let unreadable = Unreadable {
+        Unreadable {
             path: path.display().to_string(),
             verb: "read",
             error: error.to_string(),
-        };
-        unreadable.say();
+        }
+        .stop(command, format)
+    }
+
+    /// Say this and stop, the way `command` says things: the same
+    /// `unreadable` list [`Unreadable::refuse`] gives, for a path that
+    /// was found unreadable while loading.
+    fn stop(&self, command: &str, format: Format) -> ExitCode {
+        self.say();
         if format == Format::Json {
             report(serde_json::json!({
                 "command": command,
                 "ok": false,
-                "unreadable": [unreadable.json()],
+                "unreadable": [self.json()],
             }));
         }
         ExitCode::FAILURE
@@ -774,18 +966,48 @@ impl Unreadable {
 
 /// Load every path -- file or directory -- into `ws`, stopping at the
 /// first one that cannot be read.
+///
+/// A directory with no model in it is refused rather than read as an empty
+/// model: `sysml check modle/` would pass -- the library alone, resolved, and
+/// "0 violation(s)" -- where `sysml corpus` of the same path fails, and a
+/// mistyped path in a CI step would be a step that could not fail. And one
+/// file named twice, `a.sysml ./a.sysml` or a directory and a file in it,
+/// is read once: read twice, everything in it would be declared twice and
+/// every count doubled, with nothing to say so.
 fn load_paths(ws: &mut sysml_semantics::Workspace, paths: &[PathBuf]) -> Result<(), Unreadable> {
+    let mut loaded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for path in paths {
-        let failed = |verb, error: std::io::Error| Unreadable {
+        let failed = |verb, error: String| Unreadable {
             path: path.display().to_string(),
             verb,
-            error: error.to_string(),
+            error,
         };
-        if path.is_dir() {
-            ws.load_dir(path).map_err(|err| failed("load", err))?;
+        let is_dir = path.is_dir();
+        let files = if is_dir {
+            let found = sysml_semantics::model_files(path);
+            if found.is_empty() {
+                return Err(failed(
+                    "load",
+                    "it holds no .sysml or .kerml file".to_string(),
+                ));
+            }
+            found
         } else {
-            let text = std::fs::read_to_string(path).map_err(|err| failed("read", err))?;
-            ws.add_file(path.to_string_lossy(), &text);
+            vec![path.clone()]
+        };
+        for file in files {
+            let same = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if !loaded.insert(same) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).map_err(|err| match is_dir {
+                // the error names the file, not just the directory asked
+                // about: one unreadable file among hundreds is otherwise a
+                // refusal with nothing to act on
+                true => failed("load", format!("{}: {err}", file.display())),
+                false => failed("read", err.to_string()),
+            })?;
+            ws.add_file(file.to_string_lossy(), &text);
         }
     }
     Ok(())
@@ -856,28 +1078,34 @@ impl Answered {
 /// The library is loaded and resolved behind the model -- what a feature
 /// bottoms out in is a question about it -- but only the model's own
 /// definitions are planned.
-fn plan(paths: &[PathBuf], format: Format, bare: bool) -> ExitCode {
+fn plan(paths: &[PathBuf], format: Format, bare: bool, schema: bool) -> ExitCode {
+    if schema {
+        let schema =
+            serde_json::to_string_pretty(&sysml_rust::plan::schema()).expect("a schema is JSON");
+        outln!("{schema}");
+        return ExitCode::SUCCESS;
+    }
     let mut ws = sysml_semantics::Workspace::new();
+    // Said in JSON as every other command says it: a program asking for
+    // a plan of a path that is not there was handed an empty stdout.
     if let Err(unreadable) = load_paths(&mut ws, paths) {
-        unreadable.say();
-        return ExitCode::FAILURE;
+        return unreadable.stop("plan", format);
     }
     let own: Vec<usize> = (0..ws.file_count()).collect();
     if let Err(unreadable) = ensure_library(&mut ws, bare) {
-        unreadable.say();
-        return ExitCode::FAILURE;
+        return unreadable.stop("plan", format);
     }
     ws.resolve_all();
     let roots: Vec<sysml_model::ElementId> = own
         .iter()
         .flat_map(|&file| ws.file_roots(file).to_vec())
         .collect();
-    let planned = sysml_cli::plan::of(&mut ws, &roots);
+    let planned = sysml_rust::plan::of(&mut ws, &roots);
     match format {
         Format::Json => report(serde_json::to_value(&planned).expect("a built plan serializes")),
         Format::Text => {
             for definition in &planned.definitions {
-                println!(
+                outln!(
                     "{} -- {} ({} feature(s))",
                     definition.of,
                     definition.shape,
@@ -889,7 +1117,7 @@ fn plan(paths: &[PathBuf], format: Format, bare: bool) -> ExitCode {
             // no definition at all -- a package of imports, a model
             // whose declarations are all in the file next to it.
             if planned.definitions.is_empty() {
-                println!("no definitions: nothing here implies any code");
+                outln!("no definitions: nothing here implies any code");
             }
         }
     }
@@ -1039,7 +1267,34 @@ fn diagram(
     // only what is drawn, and what it reaches: a library is loaded so
     // that names resolve, not so that all of it is worked through
     let files: Vec<usize> = (0..drawn).collect();
-    ws.resolve_reached(&files);
+    let stats = ws.resolve_reached(&files);
+    // A drawing of a model that does not parse, or whose names resolve
+    // to nothing, leaves out what the parser guessed past and draws a
+    // feature with no type as one that has none -- and nothing on the
+    // page says so. It is still drawn, as `plan` still plans, since the
+    // person writing the model is entitled to see it so far; what is
+    // wrong is said, and the exit code says not to take it as the model.
+    let mut broken = false;
+    for file in files
+        .iter()
+        .copied()
+        .filter(|&file| !ws.file_parse(file).ok())
+    {
+        eprintln!(
+            "warning: {} does not parse, so what is drawn of it is a guess; `sysml parse` says where",
+            ws.file_name(file)
+        );
+        broken = true;
+    }
+    if stats.unresolved > 0 {
+        eprintln!(
+            "warning: {} name(s) in this model resolve to nothing, so what they type or \
+             relate is missing from the drawing; `sysml check` says where they are",
+            stats.unresolved
+        );
+        broken = true;
+    }
+    let done = |drawn: ExitCode| if broken { ExitCode::FAILURE } else { drawn };
     let roots: Vec<_> = (0..drawn)
         .flat_map(|file| ws.file_roots(file).to_vec())
         .collect();
@@ -1061,7 +1316,7 @@ fn diagram(
                 ..Default::default()
             },
         );
-        return emit(&svg, output, &format!("{} row(s)", view.rows.len()));
+        return done(emit(&svg, output, &format!("{} row(s)", view.rows.len())));
     }
     if let View::Sequence(name) = view {
         let Some(target) = named(&ws, &own, name) else {
@@ -1079,7 +1334,7 @@ fn diagram(
                 ..Default::default()
             },
         );
-        return emit(
+        return done(emit(
             &svg,
             output,
             &format!(
@@ -1087,7 +1342,7 @@ fn diagram(
                 view.lifelines.len(),
                 view.moments.len()
             ),
-        );
+        ));
     }
     let diagram = match view {
         View::Internal(name) => {
@@ -1145,7 +1400,7 @@ fn diagram(
             + count(Relation::Annotation),
         count(Relation::Satisfy),
     );
-    emit(&svg, output, &summary)
+    done(emit(&svg, output, &summary))
 }
 
 /// Write a rendered view to `output`, or to stdout when there is none.
@@ -1167,6 +1422,23 @@ fn rustgen(paths: &[PathBuf], library: &[PathBuf], output: Option<&Path>, bare: 
     // rest of a library is loaded so names resolve, not to be worked
     // through
     let files: Vec<usize> = (0..own).collect();
+    // what a file that does not parse declares is what the parser
+    // guessed at, and the code would be generated from the guess: the
+    // `codegen` of every other language refuses it the same way
+    let broken: Vec<usize> = files
+        .iter()
+        .copied()
+        .filter(|&file| !ws.file_parse(file).ok())
+        .collect();
+    if !broken.is_empty() {
+        for file in broken {
+            eprintln!(
+                "error: {} does not parse; `sysml parse` says where",
+                ws.file_name(file)
+            );
+        }
+        return ExitCode::FAILURE;
+    }
     let stats = ws.resolve_reached(&files);
     if stats.unresolved > 0 {
         // generated code would silently miss whatever did not resolve
@@ -1215,11 +1487,11 @@ fn rustgen(paths: &[PathBuf], library: &[PathBuf], output: Option<&Path>, bare: 
 
 /// Read a standard interchange document back into a model.
 ///
-/// `export` writes one and `sysml api` fetches one, and until now
-/// nothing here could read either back: `sysml_interchange::from_json`
-/// was written, round-trip tested over the whole standard library, and
-/// reachable from no front end at all. A document that came off a model
-/// server had nowhere to go.
+/// `export` writes one and `sysml api` fetches one, and this reads either
+/// back: `sysml_interchange::from_json` is round-trip tested over the
+/// whole standard library, and without this it would be reachable from no
+/// front end at all. A document that comes off a model server needs
+/// somewhere to go.
 ///
 /// What it can then do with the model is bounded by what a model on its
 /// own is enough for. Counting it is; drawing it is, since a diagram
@@ -1235,8 +1507,8 @@ fn import(
     format: Format,
 ) -> ExitCode {
     // The bytes, and never the whole document as `serde_json::Value`: the
-    // library's is 754 MB of text and about six gigabytes built, for a
-    // model that is 47 MB. `read_json` parses one element at a time.
+    // library's is huge as text and larger built, for a model that is
+    // much smaller. `read_json` parses one element at a time.
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => return Unreadable::refuse(path, err, "import", format),
@@ -1302,12 +1574,12 @@ fn import(
         let mut rows: Vec<_> = counts.into_iter().collect();
         rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         for (kind, n) in rows {
-            println!("{n:6}  {kind}");
+            outln!("{n:6}  {kind}");
         }
         // The document holds more objects than the model holds elements:
         // a membership that only carries ownership is an object there and
         // an edge here, which is what `export` counted on the way out.
-        println!(
+        outln!(
             "{:6}  total elements, {} owned by nothing, from {objects} object(s)",
             model.len(),
             roots.len()
@@ -1331,7 +1603,12 @@ fn refuse_import(path: &Path, why: &str, format: Format) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn import_rust(json: &Path, package: Option<&str>, output: Option<&Path>) -> ExitCode {
+fn import_rust(
+    json: &Path,
+    package: Option<&str>,
+    surface: bool,
+    output: Option<&Path>,
+) -> ExitCode {
     let text = match std::fs::read_to_string(json) {
         Ok(text) => text,
         Err(err) => {
@@ -1339,36 +1616,317 @@ fn import_rust(json: &Path, package: Option<&str>, output: Option<&Path>) -> Exi
             return ExitCode::FAILURE;
         }
     };
-    match sysml_rust::rustdoc_to_sysml(&text, package) {
-        Ok(imported) => {
-            let sysml = imported.sysml;
-            // counted off the tree, not the text: a `doc` that happens to
-            // say "def" between two spaces is not a definition, and this
-            // number is what a person checks the import by
-            let written = sysml_syntax::parse(&sysml);
-            let definitions = written
-                .syntax()
-                .descendants()
-                .filter(|node| node.kind() == sysml_syntax::SyntaxKind::DEFINITION)
-                .count();
-            // and what had no shape is what is left to model by hand
-            let skipped = imported.skipped.len();
-            emit(
-                &sysml,
-                output,
-                &format!("{definitions} definition(s), {skipped} item(s) not imported"),
-            )
-        }
+    let read = match sysml_rust::rustdoc_to_surface(&text) {
+        Ok(read) => read,
         Err(err) => {
             eprintln!("error: {err}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
+        }
+    };
+    if surface {
+        // the JSON `import-code` reads: what an importer for another
+        // language writes, shown for a real crate
+        let json = serde_json::to_string_pretty(&read).expect("a surface is JSON");
+        let skipped = read.skipped.len();
+        return emit(
+            &format!("{json}\n"),
+            output,
+            &format!(
+                "{} item(s), {skipped} not imported",
+                read.items.len() + read.scalars.len()
+            ),
+        );
+    }
+    let imported = sysml_rust::surface::to_sysml(&read, package);
+    emit(&imported.sysml, output, &imported_summary(&imported))
+}
+
+/// What a person checks an import by: how many definitions it wrote,
+/// and how many items it could not.
+fn imported_summary(imported: &sysml_rust::surface::Imported) -> String {
+    // counted off the tree, not the text: a `doc` that happens to say
+    // "def" between two spaces is not a definition
+    let written = sysml_syntax::parse(&imported.sysml);
+    let definitions = written
+        .syntax()
+        .descendants()
+        .filter(|node| node.kind() == sysml_syntax::SyntaxKind::DEFINITION)
+        .count();
+    // and what had no shape is what is left to model by hand
+    let skipped = imported.skipped.len();
+    format!("{definitions} definition(s), {skipped} item(s) not imported")
+}
+
+/// Code in any language, as a package: from a surface, or from the
+/// importer that writes one.
+///
+/// Doxygen reads a language it has never heard of through a filter --
+/// a program that writes what Doxygen already reads -- and this is the
+/// same arrangement. The importer is found the way `cargo` and `git`
+/// find theirs, by name on `PATH`, and it may write the surface JSON or
+/// SysML itself. What comes back is checked before it is written out,
+/// whichever it wrote: a name that resolves to nothing in a package
+/// somebody else's tool wrote is exactly what this toolchain is for
+/// catching, and an importer that gets it wrong is told so here rather
+/// than by the first model that imports the package.
+fn import_code(
+    inputs: &[PathBuf],
+    lang: Option<&str>,
+    via: Option<&str>,
+    package: Option<&str>,
+    output: Option<&Path>,
+    schema: bool,
+    bare: bool,
+) -> ExitCode {
+    if schema {
+        let schema =
+            serde_json::to_string_pretty(&sysml_rust::surface::schema()).expect("a schema is JSON");
+        return emit(&format!("{schema}\n"), output, "the schema of a surface");
+    }
+    let text = match surface_text(inputs, lang, via) {
+        Ok(text) => text,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // JSON is a surface; anything else is taken for the SysML an
+    // importer chose to write itself, and checked the same way
+    let imported = if text.trim_start().starts_with('{') {
+        match sysml_rust::surface::read(&text) {
+            Ok(surface) => sysml_rust::surface::to_sysml(&surface, package),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        if package.is_some() {
+            eprintln!(
+                "error: --package names the package a surface is written as, and this \
+                 importer wrote SysML itself; the name is in what it wrote"
+            );
+            return ExitCode::FAILURE;
+        }
+        sysml_rust::surface::Imported {
+            sysml: text,
+            skipped: Vec::new(),
+        }
+    };
+
+    let mut ws = sysml_semantics::Workspace::new();
+    let file = ws.add_file("imported.sysml", &imported.sysml);
+    if let Err(unreadable) = ensure_library(&mut ws, bare) {
+        unreadable.say();
+        return ExitCode::FAILURE;
+    }
+    let mut wrong = 0;
+    let syntax = ws.findings(&[file]).syntax;
+    for finding in &syntax {
+        let (line, column) = sysml_syntax::line_col(&imported.sysml, finding.range.start().into());
+        eprintln!(
+            "error: {} at {line}:{column} of what was written",
+            finding.what
+        );
+        wrong += 1;
+    }
+    // nothing to resolve in a text that did not parse
+    if syntax.is_empty() {
+        ws.resolve_files(&[file]);
+        for finding in &ws.findings(&[file]).names {
+            let (line, column) =
+                sysml_syntax::line_col(&imported.sysml, finding.range.start().into());
+            eprintln!(
+                "error: `{}` resolves to nothing at {line}:{column} of what was written",
+                finding.what
+            );
+            wrong += 1;
         }
     }
+    // written out regardless, so that what is wrong can be looked at;
+    // the exit code says it is wrong
+    let wrote = emit(&imported.sysml, output, &imported_summary(&imported));
+    if wrong > 0 {
+        eprintln!("error: {wrong} finding(s) in what the importer wrote");
+        return ExitCode::FAILURE;
+    }
+    wrote
+}
+
+/// The text `import-code` reads: a surface file, or what the importer
+/// for the inputs' language writes when run on them.
+fn surface_text(
+    inputs: &[PathBuf],
+    lang: Option<&str>,
+    via: Option<&str>,
+) -> Result<String, String> {
+    let command: Vec<String> = match (via, lang) {
+        (Some(via), _) => shell_words(via)?,
+        (None, Some(lang)) => vec![format!("sysml-import-{lang}")],
+        (None, None) => {
+            // named after the extension, the way Doxygen maps a filter
+            // to one: `sysml-import-py` reads `.py`
+            let extension = |path: &PathBuf| {
+                path.extension()
+                    .and_then(|it| it.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let first = inputs.first().map(extension).unwrap_or_default();
+            if inputs.iter().any(|path| extension(path) != first) {
+                return Err(
+                    "the inputs have different extensions; say which importer reads \
+                            them with --lang or --via"
+                        .to_string(),
+                );
+            }
+            if first == "json" {
+                let [path] = inputs else {
+                    return Err(
+                        "a package is written from one surface; give one JSON file, \
+                                or the source files an importer reads"
+                            .to_string(),
+                    );
+                };
+                return std::fs::read_to_string(path)
+                    .map_err(|err| format!("cannot read {}: {err}", path.display()));
+            }
+            if first.is_empty() {
+                return Err(
+                    "the inputs have no extension to name an importer by; say which \
+                            reads them with --lang or --via"
+                        .to_string(),
+                );
+            }
+            vec![format!("sysml-import-{first}")]
+        }
+    };
+    run_tool(&command, inputs, None)
+}
+
+/// A `--via` command, split the way a shell would split it, so that a
+/// path with a space in it can be quoted.
+fn shell_words(via: &str) -> Result<Vec<String>, String> {
+    shlex::split(via).ok_or_else(|| {
+        format!("--via cannot be read as a command: `{via}` has a quote that never closes")
+    })
+}
+
+/// Run an importer or a generator: the command, then the inputs as its
+/// arguments, with `fed` on its standard input where there is something
+/// to feed it. What it writes is the answer; what it says on standard
+/// error is said here too.
+fn run_tool(command: &[String], inputs: &[PathBuf], fed: Option<String>) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let Some((program, arguments)) = command.split_first() else {
+        return Err("--via names no command".to_string());
+    };
+    let cannot_run = |err: std::io::Error| format!("cannot run `{program}`: {err}");
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .args(inputs)
+        .stdin(if fed.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(cannot_run)?;
+    // Fed from a thread of its own. A generator that starts answering
+    // before it has read the whole plan fills its end of the pipe while
+    // this end is still writing, and the two wait on each other.
+    let feeding = fed.map(|text| {
+        let mut pipe = child.stdin.take().expect("asked for a pipe");
+        std::thread::spawn(move || pipe.write_all(text.as_bytes()))
+    });
+    let ran = child.wait_with_output().map_err(cannot_run)?;
+    // what closed the pipe early was the tool, and its exit says so
+    let _ = feeding.map(|thread| thread.join());
+    eprint!("{}", String::from_utf8_lossy(&ran.stderr));
+    if !ran.status.success() {
+        return Err(format!("`{program}` failed ({})", ran.status));
+    }
+    String::from_utf8(ran.stdout)
+        .map_err(|_| format!("`{program}` wrote something that is not text"))
+}
+
+/// Code in any language, from the generator for it.
+///
+/// What does not resolve is refused before any generator runs, since
+/// code generated from it would quietly leave out whatever the model
+/// misspelt -- the same refusal `rustgen` makes. What the model left
+/// open is the generator's to say, in whatever way its language has.
+fn codegen(
+    paths: &[PathBuf],
+    library: &[PathBuf],
+    lang: Option<&str>,
+    via: Option<&str>,
+    output: Option<&Path>,
+    bare: bool,
+) -> ExitCode {
+    if lang == Some("rust") {
+        return rustgen(paths, library, output, bare);
+    }
+    let mut ws = sysml_semantics::Workspace::new();
+    if let Err(unreadable) = load_paths(&mut ws, paths) {
+        unreadable.say();
+        return ExitCode::FAILURE;
+    }
+    // generation covers what was named; the library only resolves
+    let own = ws.file_count();
+    if let Err(unreadable) =
+        load_paths(&mut ws, library).and_then(|()| ensure_library(&mut ws, bare))
+    {
+        unreadable.say();
+        return ExitCode::FAILURE;
+    }
+    ws.resolve_all();
+    let roots: Vec<sysml_model::ElementId> = (0..own)
+        .flat_map(|file| ws.file_roots(file).to_vec())
+        .collect();
+    let planned = sysml_rust::plan::of(&mut ws, &roots);
+    if !planned.checked.ok {
+        for broken in &planned.checked.syntax {
+            eprintln!("error: does not parse: {broken}");
+        }
+        for name in &planned.checked.unresolved {
+            eprintln!("error: unresolved `{name}`");
+        }
+        eprintln!(
+            "error: the model does not resolve, so code generated from it would quietly leave \
+             things out; `sysml check` says where"
+        );
+        return ExitCode::FAILURE;
+    }
+    let plan = serde_json::to_string(&planned).expect("a built plan serializes");
+    let command = match via {
+        Some(via) => shell_words(via),
+        None => Ok(vec![format!("sysml-gen-{}", lang.unwrap_or_default())]),
+    };
+    let code = match command.and_then(|command| run_tool(&command, &[], Some(plan))) {
+        Ok(code) => code,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    emit(
+        &code,
+        output,
+        &format!(
+            "{} line(s) from {} definition(s)",
+            code.lines().count(),
+            planned.definitions.len()
+        ),
+    )
 }
 
 fn emit(svg: &str, output: Option<&Path>, summary: &str) -> ExitCode {
     let Some(path) = output else {
-        print!("{svg}");
+        written(svg);
         return ExitCode::SUCCESS;
     };
     if let Err(err) = std::fs::write(path, svg) {
@@ -1388,8 +1946,8 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
     // What was asked about is what was handed over; the library that
     // follows is what it is resolved against. The constraints are put to
     // the former alone: the library satisfies them, a test says so every
-    // run, and putting a hundred and thirty of them to its sixty-six
-    // thousand elements again was most of what `check` cost.
+    // run, and putting them to every element of the library again would
+    // be most of what `check` costs.
     let own: Vec<usize> = (0..ws.file_count()).collect();
     let library = match loaded.and_then(|()| ensure_library(&mut ws, bare)) {
         Ok(answered) => answered,
@@ -1406,7 +1964,7 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
         }
     };
     // A file that does not parse has no names to resolve, so resolution
-    // finds nothing wrong with it and this used to answer `ok`. Anyone
+    // finds nothing wrong with it and this would answer `ok`. Anyone
     // running only `check` -- which is most of the reason it exists --
     // would be told a broken model was fine. Syntax comes first, as it
     // does in the MCP server's tool of the same name.
@@ -1441,18 +1999,40 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
                 "ok": false,
                 "unreadable": [],
                 "elements": ws.model().len(),
-                "parseErrors": broken,
+                "parse_errors": broken,
             }));
         }
         return ExitCode::FAILURE;
     }
 
-    let stats = ws.resolve_all();
+    // The library first and the files asked about on it, the way both
+    // servers stand their documents on a library resolved once. Resolving
+    // everything in one pass counted the library's references in with the
+    // model's: a library from `SYSML_LIBRARY_PATH` with one name missing
+    // would fail the check of a file whose every name resolved, with "1/2
+    // resolved", an empty list of what did not, and nothing said about
+    // where the other one was. The counts, the list and the exit status
+    // are all about the same files; what the library lacks is said in
+    // a sentence of its own, and `sysml check` of the library is what
+    // lists it.
+    let beneath: Vec<usize> = (own.len()..ws.file_count()).collect();
+    let underneath = ws.resolve_files(&beneath);
+    let stats = ws.resolve_files(&own);
     let total = stats.resolved + stats.unresolved;
+    if underneath.unresolved > 0 && format == Format::Text {
+        eprintln!(
+            "note: {} reference(s) in the library ({}) resolve to nothing; \
+             they are not counted here, and `sysml check` of the library lists them",
+            underneath.unresolved,
+            library.json().as_str().unwrap_or("none"),
+        );
+    }
+    // rounded down, so that a model with a name missing never reads as
+    // 100.0% -- one in seventeen thousand came out as exactly that
     let rate = if total == 0 {
         100.0
     } else {
-        100.0 * stats.resolved as f64 / total as f64
+        (1000.0 * stats.resolved as f64 / total as f64).floor() / 10.0
     };
     // `--show` trims a list a person reads; a program is given all of
     // them, since it is the list it works from
@@ -1487,7 +2067,12 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
                 text,
                 span: span(u.range),
                 label: None,
-                helps: helps(meant),
+                // a name that reaches the wrong kind of thing is no
+                // missing import and no misspelling
+                helps: match ws.wrong_kind_at(u.file, u.range) {
+                    Some(why) => vec![why],
+                    None => helps(meant),
+                },
             }),
             Format::Json => {
                 let mut entry = sysml_cli::at(
@@ -1496,10 +2081,10 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
                     serde_json::json!({ "path": file, "name": u.what.clone() }),
                 );
                 if !meant.elsewhere.is_empty() {
-                    entry["declaredAs"] = serde_json::json!(meant.elsewhere);
+                    entry["declared_as"] = serde_json::json!(meant.elsewhere);
                 }
                 if !meant.near.is_empty() {
-                    entry["didYouMean"] = serde_json::json!(meant.near);
+                    entry["did_you_mean"] = serde_json::json!(meant.near);
                 }
                 unresolved.push(entry);
             }
@@ -1536,12 +2121,30 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
             )
         })
         .collect();
-    let violated = texts_of(&ws, placed.iter().map(|((file, _), _)| *file));
+    // where the other element a violation is about is declared: the first
+    // of two declarations of one name, said beside the second
+    let also: Vec<Option<(usize, sysml_syntax::TextRange)>> = placed
+        .iter()
+        .map(|(_, violation)| violation.also.and_then(|it| ws.element_place(it)))
+        .collect();
+    let violated = texts_of(
+        &ws,
+        placed
+            .iter()
+            .map(|((file, _), _)| *file)
+            .chain(also.iter().flatten().map(|(file, _)| *file)),
+    );
     let mut violations = Vec::new();
-    for ((file, range), violation) in &placed {
-        let named = ws.qualified_name_of(violation.element);
+    for (((file, range), violation), also) in placed.iter().zip(&also) {
+        let named = ws.qualified_name_written(violation.element);
         let path = ws.file_name(*file);
         let text = &violated[file];
+        // `path:line:column` of the first declaration
+        let first = also.map(|(file, range)| {
+            let (line, column) =
+                sysml_syntax::line_col(&violated[&file], usize::from(range.start()));
+            format!("{}:{line}:{column}", ws.file_name(file))
+        });
         match format {
             Format::Text => say(&Said {
                 severity: Severity::Error,
@@ -1553,19 +2156,32 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
                 path,
                 text,
                 span: span(*range),
-                label: Some(format!("`{named}`")),
-                helps: Vec::new(),
+                label: Some(
+                    violation
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| format!("`{named}`")),
+                ),
+                helps: first
+                    .iter()
+                    .map(|first| format!("first declared at {first}"))
+                    .collect(),
             }),
-            Format::Json => violations.push(sysml_cli::at(
-                text,
-                *range,
-                serde_json::json!({
+            Format::Json => {
+                let mut said = serde_json::json!({
                     "path": path,
                     "rule": violation.rule,
                     "says": violation.says,
                     "element": named,
-                }),
-            )),
+                });
+                if let Some(detail) = &violation.detail {
+                    said["detail"] = serde_json::json!(detail);
+                }
+                if let Some(first) = &first {
+                    said["first"] = serde_json::json!(first);
+                }
+                violations.push(sysml_cli::at(text, *range, said))
+            }
         }
     }
 
@@ -1603,14 +2219,16 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
             "library": library.json(),
             "unreadable": [],
             "elements": ws.model().len(),
-            "parseErrors": [],
+            "parse_errors": [],
             "resolved": stats.resolved,
             "references": total,
             "unresolved": unresolved,
+            "library_unresolved": underneath.unresolved,
             "collisions": collisions,
             "violations": violations,
             "rules": {
                 "held": checked.held.len(),
+                "partly": checked.partly.len(),
                 "unevaluated": checked.unevaluated.len(),
             },
         }));
@@ -1628,13 +2246,20 @@ fn check(paths: &[PathBuf], show: usize, format: Format, bare: bool) -> ExitCode
         ws.model().len(),
         stats.resolved
     );
+    // A constraint some elements could not answer was not checked of
+    // them, and saying "checked" of it would claim a check that was not
+    // made: it is counted apart.
+    let partly = match checked.partly.len() {
+        0 => String::new(),
+        n => format!(" ({n} more only in part)"),
+    };
     match askable {
-        true => println!(
-            "{resolution}, {} constraint(s) checked, {} violation(s)",
+        true => outln!(
+            "{resolution}, {} constraint(s) checked{partly}, {} violation(s)",
             checked.held.len(),
             checked.violations.len()
         ),
-        false => println!("{resolution}"),
+        false => outln!("{resolution}"),
     }
     if sound {
         ExitCode::SUCCESS
@@ -1667,14 +2292,29 @@ fn texts_of(
         .collect()
 }
 
-fn corpus(dir: &Path, worst: usize, list_failures: bool) -> ExitCode {
+/// How much of a directory parses, file by file.
+///
+/// A file that fails to parse, or cannot be read, fails the run: were it
+/// to exit 0 whatever it found, the only way a script could tell would be
+/// to read the rate out of the text -- and `--format json` prints that
+/// text too.
+fn corpus(dir: &Path, worst: usize, list_failures: bool, format: Format) -> ExitCode {
     let files = sysml_semantics::model_files(dir);
     if files.is_empty() {
         // the walk takes what it can reach, so a directory that is not
         // there and one with nothing under it look the same from here
-        match std::fs::read_dir(dir) {
-            Ok(_) => eprintln!("no .sysml/.kerml files found under {}", dir.display()),
-            Err(err) => eprintln!("error: cannot read {}: {err}", dir.display()),
+        if let Err(err) = std::fs::read_dir(dir) {
+            return Unreadable::refuse(dir, err, "corpus", format);
+        }
+        eprintln!("no .sysml/.kerml files found under {}", dir.display());
+        if format == Format::Json {
+            report(serde_json::json!({
+                "command": "corpus",
+                "ok": false,
+                "unreadable": [],
+                "extensions": {},
+                "failing": [],
+            }));
         }
         return ExitCode::FAILURE;
     }
@@ -1686,11 +2326,21 @@ fn corpus(dir: &Path, worst: usize, list_failures: bool) -> ExitCode {
     }
     let mut by_ext: std::collections::BTreeMap<String, Stat> = Default::default();
     let mut failing: Vec<(usize, PathBuf)> = Vec::new();
+    let mut unreadable = Vec::new();
 
     for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            eprintln!("warning: cannot read {}", path.display());
-            continue;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                let failed = Unreadable {
+                    path: path.display().to_string(),
+                    verb: "read",
+                    error: err.to_string(),
+                };
+                failed.say();
+                unreadable.push(failed.json());
+                continue;
+            }
         };
         let parse = parse_file(path, &text);
         let ext = path
@@ -1711,29 +2361,62 @@ fn corpus(dir: &Path, worst: usize, list_failures: bool) -> ExitCode {
             failing.push((parse.errors().len(), path.clone()));
         }
     }
-
-    for (ext, stat) in &by_ext {
-        println!(
-            ".{ext}: {}/{} files ok ({:.1}%), {} total error(s)",
-            stat.ok,
-            stat.total,
-            100.0 * stat.ok as f64 / stat.total as f64,
-            stat.errors
-        );
-    }
-
     failing.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    if list_failures {
-        for (errors, path) in &failing {
-            println!("FAIL {errors:5} {}", path.display());
+    let ok = failing.is_empty() && unreadable.is_empty();
+
+    if format == Format::Json {
+        // every failing file, not the worst few: a program works from the
+        // list, as `check` gives it every unresolved name
+        let extensions: serde_json::Map<String, serde_json::Value> = by_ext
+            .iter()
+            .map(|(ext, stat)| {
+                let counted = serde_json::json!({
+                    "files": stat.total,
+                    "ok": stat.ok,
+                    "errors": stat.errors,
+                });
+                (ext.clone(), counted)
+            })
+            .collect();
+        let failing: Vec<serde_json::Value> = failing
+            .iter()
+            .map(|(errors, path)| {
+                serde_json::json!({ "path": path.display().to_string(), "errors": errors })
+            })
+            .collect();
+        report(serde_json::json!({
+            "command": "corpus",
+            "ok": ok,
+            "unreadable": unreadable,
+            "extensions": extensions,
+            "failing": failing,
+        }));
+    } else {
+        for (ext, stat) in &by_ext {
+            outln!(
+                ".{ext}: {}/{} files ok ({:.1}%), {} total error(s)",
+                stat.ok,
+                stat.total,
+                100.0 * stat.ok as f64 / stat.total as f64,
+                stat.errors
+            );
         }
-    } else if worst > 0 && !failing.is_empty() {
-        println!("\nworst {} file(s):", worst.min(failing.len()));
-        for (errors, path) in failing.iter().take(worst) {
-            println!("  {errors:5} error(s)  {}", path.display());
+        if list_failures {
+            for (errors, path) in &failing {
+                outln!("FAIL {errors:5} {}", path.display());
+            }
+        } else if worst > 0 && !failing.is_empty() {
+            outln!("\nworst {} file(s):", worst.min(failing.len()));
+            for (errors, path) in failing.iter().take(worst) {
+                outln!("  {errors:5} error(s)  {}", path.display());
+            }
         }
     }
-    ExitCode::SUCCESS
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn parse_files(files: &[PathBuf], dump_tree: bool, format: Format) -> ExitCode {
@@ -1761,7 +2444,15 @@ fn parse_files(files: &[PathBuf], dump_tree: bool, format: Format) -> ExitCode {
             // a tree in front of it would spoil that; a person reading
             // the tree can have it either way round
             match format {
-                Format::Text => println!("{:#?}", parse.syntax()),
+                // `sysml parse --tree big.sysml | head` closes the pipe
+                // after a screenful, and `println!` would panic on the rest:
+                // a reader that has stopped reading is not an error, so
+                // the output stops with it
+                Format::Text => {
+                    if !written(&format!("{:#?}\n", parse.syntax())) {
+                        return ExitCode::SUCCESS;
+                    }
+                }
                 Format::Json => eprintln!("{:#?}", parse.syntax()),
             }
         }
@@ -1808,8 +2499,21 @@ fn parse_files(files: &[PathBuf], dump_tree: bool, format: Format) -> ExitCode {
 }
 
 /// One JSON document per run, on stdout.
+/// Write `text` to stdout, saying whether the reader is still there.
+///
+/// A reader that stops early -- `| head` -- closes the pipe, and what
+/// `print!` does then is panic. Stopping is what the reader asked for,
+/// and is no error of this command's.
+fn written(text: &str) -> bool {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .is_ok()
+}
+
 fn report(value: serde_json::Value) {
-    println!(
+    outln!(
         "{}",
         serde_json::to_string_pretty(&value).expect("a built value serializes")
     );
@@ -1952,7 +2656,7 @@ fn api_command(
             match format {
                 Format::Text => {
                     for line in lines {
-                        println!("{line}");
+                        outln!("{line}");
                     }
                 }
                 Format::Json => report(json),

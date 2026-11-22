@@ -1,14 +1,14 @@
 //! What the plan says a model implies, and what it would say wrongly.
 //!
 //! Every assertion here is a thing a code generator would otherwise
-//! guess at, and most of them were guessed at wrongly by the first
-//! version of this: four wheels read as a list, a set read as a list, a
-//! value the model states read as absent because the usage that states
-//! it borrows its name, an integer with a name read as an empty class.
+//! guess at, and most of them are easy to guess at wrongly: four wheels
+//! read as a list, a set read as a list, a value the model states read
+//! as absent because the usage that states it borrows its name, an
+//! integer with a name read as an empty class.
 
 use std::process::Command;
 
-use sysml_cli::plan::{self, Plan};
+use sysml_rust::plan::{self, Plan};
 use sysml_semantics::Workspace;
 
 const MODEL: &str = r#"
@@ -230,7 +230,11 @@ fn a_usage_that_borrows_its_name_is_still_a_feature() {
     let car = about(&plan, "Every::Car");
     let mass = feature(car, "mass");
     assert_eq!(mass.redefines.as_deref(), Some("Every::Vehicle::mass"));
-    assert_eq!(mass.primitive, Some("Real"), "the type comes with the name");
+    assert_eq!(
+        mass.primitive.as_deref(),
+        Some("Real"),
+        "the type comes with the name"
+    );
     assert!(
         matches!(&mass.default, Some(plan::Given::Literal(it)) if it.as_f64() == Some(1200.0)),
         "{:?}",
@@ -244,17 +248,17 @@ fn a_usage_that_borrows_its_name_is_still_a_feature() {
 fn a_type_says_what_it_is_underneath() {
     let plan = planned();
     let car = about(&plan, "Every::Car");
-    assert_eq!(feature(car, "notes").primitive, Some("String"));
-    assert_eq!(feature(car, "mass").primitive, Some("Real"));
+    assert_eq!(feature(car, "notes").primitive.as_deref(), Some("String"));
+    assert_eq!(feature(car, "mass").primitive.as_deref(), Some("Real"));
     // an enumeration is not a primitive, and saying it was would be
     // worse than saying nothing
-    assert_eq!(feature(car, "gear").primitive, None);
+    assert_eq!(feature(car, "gear").primitive.as_deref(), None);
 
     // and a definition that is a primitive under another name is that,
     // rather than a record with nothing in it
     let millis = about(&plan, "Every::Millis");
     assert_eq!(millis.shape, "value");
-    assert_eq!(millis.primitive, Some("Integer"));
+    assert_eq!(millis.primitive.as_deref(), Some("Integer"));
     // and what it specializes is what the model wrote, not the whole way
     // up: `Base::DataValue` is above `ScalarValues::Integer` and is not
     // what this definition says
@@ -299,7 +303,7 @@ fn a_function_says_what_it_takes_and_what_it_gives_back() {
         .iter()
         .all(|it| it.direction.as_deref() == Some("in")));
     let given = braking.returns.as_ref().expect("a declared return");
-    assert_eq!(given.primitive, Some("Real"));
+    assert_eq!(given.primitive.as_deref(), Some("Real"));
 }
 
 /// What order the steps happen in, and what passes between them: two
@@ -362,8 +366,8 @@ fn what_cannot_be_built_says_so() {
 }
 
 /// Only the model's own definitions are planned. Nobody is generating
-/// the standard library, and a plan that carried it would be sixty
-/// thousand entries of which none is the caller's.
+/// the standard library, and a plan that carried it would be
+/// thousands of entries of which none is the caller's.
 #[test]
 fn the_library_is_answered_from_and_not_planned() {
     let plan = planned();
@@ -413,7 +417,7 @@ fn the_command_line_hands_over_the_same_plan() {
     );
 
     // and so is a library that is not there, which is a different path
-    // and used to be a plan answered as if the library had been read
+    // and must not be a plan answered as if the library had been read
     let out = Command::new(env!("CARGO_BIN_EXE_sysml"))
         .args(["plan", at.to_str().unwrap()])
         .env("SYSML_LIBRARY_PATH", "/nowhere/library")
@@ -428,10 +432,10 @@ fn the_command_line_hands_over_the_same_plan() {
 }
 
 /// A requirement arrives with what it demands, not only with what it is
-/// about: it is the one kind of definition whose whole content used to
-/// come through as an English sentence, leaving whoever wrote the check
-/// to invent the logic -- and, in one case, to invent a number that
-/// appeared nowhere in the plan.
+/// about: it is the one kind of definition whose whole content could
+/// otherwise come through as an English sentence, leaving whoever wrote the check
+/// to invent the logic -- and perhaps a number that appears nowhere in
+/// the plan.
 #[test]
 fn a_requirement_says_what_it_demands() {
     let mut ws = Workspace::new();
@@ -479,7 +483,7 @@ fn what_a_package_declares_outright_is_planned() {
         panic!("one constant, {}", plan.constants.len());
     };
     assert_eq!(constant.name, "Every::ledPinNumber", "named from the root");
-    assert_eq!(constant.primitive, Some("Integer"));
+    assert_eq!(constant.primitive.as_deref(), Some("Integer"));
     assert!(matches!(&constant.default, Some(plan::Given::Literal(it)) if it.as_i64() == Some(13)),);
 }
 
@@ -606,7 +610,7 @@ fn a_literal_of_any_kind_arrives_as_a_value() {
 }
 
 /// KerML declares the same things in its own words, and a model written
-/// in it used to plan as nothing at all.
+/// in it must not plan as nothing at all.
 ///
 /// An empty answer reads as "there is nothing here to write", which is
 /// a wrong answer rather than a missing one -- and half the standard
@@ -655,8 +659,8 @@ fn kerml_is_planned_in_the_same_words_as_sysml() {
 }
 
 /// What a definition performs is what makes it something that *does*
-/// anything, and it used to go missing: a part with three performed
-/// actions planned as three fields and no way to use them.
+/// anything, and it must not go missing: a part with three performed
+/// actions would plan as three fields and no way to use them.
 #[test]
 fn what_a_definition_performs_is_said() {
     let at = written(

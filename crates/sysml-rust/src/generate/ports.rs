@@ -19,7 +19,7 @@ impl<'a> Generator<'a> {
             return None;
         }
         let container = multiplicity(self.model, usage);
-        let name = self.model.name(usage)?.to_string();
+        let name = self.member_name(usage)?;
         Some(Field {
             spelled: ident(&name),
             name,
@@ -38,8 +38,7 @@ impl<'a> Generator<'a> {
     /// port definition rather than a bound API. They become fields like
     /// any other, so what is asked of a field is asked of them too.
     pub(crate) fn plain_ports(&self, def: ElementId) -> Vec<Field> {
-        self.model
-            .owned(def)
+        self.members(def)
             .iter()
             .filter(|&&child| self.model.kind(child) == ElementKind::PortUsage)
             .filter_map(|&child| self.plain_port(def, child))
@@ -48,7 +47,7 @@ impl<'a> Generator<'a> {
     /// Does this definition hold ports bound to external APIs -- which
     /// generate as generic parameters, not composable fields?
     pub(crate) fn has_api_ports(&self, def: ElementId) -> bool {
-        self.model.owned(def).iter().any(|&child| {
+        self.members(def).iter().any(|&child| {
             self.model.kind(child) == ElementKind::PortUsage && self.port_of(child).is_some()
         })
     }
@@ -57,7 +56,7 @@ impl<'a> Generator<'a> {
         let bound = binding(self.model, port_def)?;
         let path = bound.get(binding::ITEM)?.clone();
         Some(Port {
-            name: self.model.name(usage)?.to_string(),
+            name: self.member_name(usage)?,
             type_name: self.model.name(port_def)?.to_string(),
             parameter: String::new(),
             trait_path: path,
@@ -72,7 +71,7 @@ impl<'a> Generator<'a> {
         fields: &[Field],
     ) -> Result<String, RustgenError> {
         let model = self.model;
-        let usage_name = model.name(usage).expect("named, or it was skipped");
+        let usage_name = &self.member_name(usage).expect("named, or it was skipped");
         // Every way this method declines says the same two things -- which
         // performed action, and why -- so it says them in one place, to the
         // reader of the file and to whoever has to write what is missing.
@@ -82,7 +81,7 @@ impl<'a> Generator<'a> {
                 "    // not generated: perform `{usage_name}` -- {why}\n"
             ))
         };
-        let Some(action) = model.type_of(usage) else {
+        let Some(action) = self.performed(usage) else {
             return declined("its action did not resolve".to_string());
         };
         let Some(bound) = binding(model, action) else {
@@ -120,12 +119,71 @@ impl<'a> Generator<'a> {
         let provider = ports
             .iter()
             .find(|port| path.starts_with(&format!("{}::", port.trait_path)));
-        let Some(provider) = provider else {
-            return Err(RustgenError::NoPortForAction {
-                part: part_name.to_string(),
-                action: usage_name.to_string(),
-                path,
-            });
+        // What the call is made on: the port that provides the API, or --
+        // for a type's own function, `impl Part { fn total(&self) }`,
+        // which no trait and so no port provides -- a field holding that
+        // type, or the type itself for one that takes no receiver
+        // (`Part::new`). Those were refused as an API no port provides,
+        // though the importer writes them for exactly this.
+        let on = match provider {
+            Some(provider) => {
+                // said outright to take no receiver, it is called on the
+                // type and not on the port, which is a value of it
+                if bound.get(binding::TAKES_SELF).map(String::as_str) == Some("") {
+                    return declined(format!(
+                        "`{path}` takes no receiver, and a port is called through one"
+                    ));
+                }
+                format!("self.{}.", ident(&provider.name))
+            }
+            None => {
+                let owner = path
+                    .rsplit_once("::")
+                    .map(|(owner, _)| owner)
+                    .filter(|owner| self.declares_type(owner));
+                let Some(owner) = owner else {
+                    return Err(RustgenError::NoPortForAction {
+                        part: part_name.to_string(),
+                        action: usage_name.to_string(),
+                        path,
+                    });
+                };
+                if takes_self.is_empty() {
+                    format!("{owner}::")
+                } else {
+                    let held: Vec<&Field> = fields
+                        .iter()
+                        .filter(|field| matches!(&field.ty, FieldType::External(ty) if ty == owner))
+                        .collect();
+                    match held[..] {
+                        [] => {
+                            return declined(format!(
+                                "`{path}` is called on a `{owner}`, and `{part_name}` holds none"
+                            ))
+                        }
+                        [field] if field.container == Container::One => {
+                            format!("self.{}.", field.spelled)
+                        }
+                        [field] => {
+                            return declined(format!(
+                                "`{path}` is called on one `{owner}`, and `{part_name}` holds \
+                                 `{}` as {}",
+                                self.model.name(field.usage).unwrap_or("?"),
+                                match field.container {
+                                    Container::Optional => "perhaps none",
+                                    _ => "several of them",
+                                }
+                            ))
+                        }
+                        _ => {
+                            return declined(format!(
+                                "`{path}` is called on a `{owner}`, and `{part_name}` holds \
+                                 more than one, so which is not said"
+                            ))
+                        }
+                    }
+                }
+            }
         };
         let callee = path.rsplit("::").next().unwrap_or(&path);
 
@@ -183,8 +241,7 @@ impl<'a> Generator<'a> {
         }
 
         let mut call = format!(
-            "self.{}.{callee}({})",
-            ident(&provider.name),
+            "{on}{callee}({})",
             inputs
                 .iter()
                 .map(|(name, _)| name.as_str())
@@ -202,24 +259,65 @@ impl<'a> Generator<'a> {
             model.name(action).unwrap_or("?")
         )
         .unwrap();
+        body.push_str(&self.unnamed_note(usage));
         writeln!(body, "{signature} {{").unwrap();
         writeln!(body, "        {call}").unwrap();
         writeln!(body, "    }}").unwrap();
         Ok(body)
+    }
+    /// Whether a definition in the model is bound to the Rust type at
+    /// `path` -- which is what makes `path::f` a function of that type
+    /// rather than of a module, or of a crate nothing here imported.
+    fn declares_type(&self, path: &str) -> bool {
+        let model = self.model;
+        model.ids().any(|id| {
+            model.kind(id).is_a(ElementKind::Definition)
+                && !model.kind(id).is_a(ElementKind::ActionDefinition)
+                && binding(model, id)
+                    .is_some_and(|bound| bound.get(binding::ITEM).map(String::as_str) == Some(path))
+        })
     }
     /// The Rust type of an action parameter.
     pub(crate) fn parameter_type(&self, usage: ElementId) -> Option<String> {
         let (base, container) = self.parameter_shape(usage)?;
         Some(contained(base, container))
     }
-    /// How Rust spells a call to a named calculation: the function its
-    /// definition generated, where the definition generated one. An
-    /// `abstract` definition became a trait instead, and a trait method
-    /// is not callable out of nowhere.
-    pub(crate) fn callable(&self, name: &str) -> Option<expr::Callee> {
-        let (&target, _) = self.shapes.iter().find(|(&id, &shape)| {
-            shape == Shape::Calculation && self.model.name(id) == Some(name)
-        })?;
+    /// How Rust spells a call to a named calculation written somewhere
+    /// inside `scope`: the function its definition generated, where the
+    /// definition generated one. An `abstract` definition became a trait
+    /// instead, and a trait method is not callable out of nowhere.
+    ///
+    /// What the call names is what the model resolved it to -- the
+    /// invocation's own membership -- and not whichever definition happens
+    /// to share the name: two packages may each have an `F`, and the one
+    /// Rust named `f` need not be the one this call means.
+    pub(crate) fn callable(&self, scope: ElementId, name: &str) -> Option<expr::Callee> {
+        let model = self.model;
+        let mut invoked = model
+            .descendants(scope)
+            .into_iter()
+            .filter(|&id| model.kind(id).is_a(ElementKind::InvocationExpression))
+            .filter_map(|invocation| {
+                model.instantiated_type(invocation).or_else(|| {
+                    model
+                        .owned(invocation)
+                        .iter()
+                        .find(|&&child| model.kind(child) == ElementKind::Membership)
+                        .and_then(|&membership| model.member_element(membership))
+                })
+            })
+            .filter(|&target| model.name(target) == Some(name));
+        let target = invoked.next()?;
+        // one name, two things it was resolved to in the same place: the
+        // text alone cannot say which call is which
+        if invoked.any(|other| other != target) {
+            return None;
+        }
+        // a definition that lost its Rust name to another was never
+        // written, and calling the other would be calling something else
+        if self.shapes.get(&target) != Some(&Shape::Calculation) {
+            return None;
+        }
         if self.model.is_abstract(target) {
             return None;
         }
@@ -244,12 +342,14 @@ impl<'a> Generator<'a> {
     pub(crate) fn parameter_shape(&self, usage: ElementId) -> Option<(String, Container)> {
         // a parameter bound by a usage -- `in previous = stateVector` --
         // declares no type of its own; it keeps the one it redefines
-        let declaring = self
-            .model
-            .type_of(usage)
-            .map(|_| usage)
-            .or_else(|| redefined(self.model, usage))?;
-        let ty = self.model.type_of(declaring)?;
+        //
+        // A subset does not borrow the multiplicity: `in m :> ISQ::mass`
+        // is one mass of the many `ISQ::mass` allows, and says so by
+        // saying nothing.
+        let ty = held_type(self.model, usage)?;
+        let declaring = redefined(self.model, usage)
+            .filter(|_| self.model.type_of(usage).is_none())
+            .unwrap_or(usage);
         // a parameter carries its multiplicity the way a field does: a
         // `[1..*]` of something is a `Vec` of it, not one of it
         let container = multiplicity(self.model, declaring);
@@ -265,6 +365,6 @@ impl<'a> Generator<'a> {
                 .name(ty)
                 .map(|name| (type_ident(name), container));
         }
-        Some((scalar_of(self.model.name(ty)?)?.to_string(), container))
+        Some((scalar_type(self.model, ty)?.to_string(), container))
     }
 }

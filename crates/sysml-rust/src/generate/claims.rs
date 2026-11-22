@@ -16,7 +16,7 @@ impl<'a> Generator<'a> {
     /// that, so what is generated is the means of asking.
     pub(crate) fn assertion(&self, usage: ElementId, fields: &[Field]) -> Result<String, String> {
         let model = self.model;
-        let name = model.name(usage).expect("named, or it was skipped");
+        let name = &self.member_name(usage).expect("named, or it was skipped");
         let Some(def) = model.type_of(usage) else {
             return Err(format!("assert `{name}` -- its constraint did not resolve"));
         };
@@ -108,8 +108,8 @@ impl<'a> Generator<'a> {
         // What satisfies and what verifies is stated anywhere in the
         // model, so it takes a walk of the whole of it -- the loaded
         // standard library included -- to find. One walk answers for
-        // every requirement at once; asking per requirement, as this
-        // did, walked a hundred thousand elements twice over for each.
+        // every requirement at once; asking per requirement would walk
+        // every element of the loaded library twice over for each.
         let claims = self.claims();
         let stubs: Vec<_> = found
             .into_iter()

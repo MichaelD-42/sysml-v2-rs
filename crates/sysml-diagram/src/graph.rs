@@ -78,6 +78,9 @@ pub enum Shape {
     /// The filled circle a state machine or action flow starts from,
     /// carrying no label of its own.
     Initial,
+    /// The ringed circle a flow ends at: `done`, which every action and
+    /// state inherits, drawn the way the notation draws a final node.
+    Final,
     /// The filled circle three or more connection ends meet at
     /// (`n-ary-connection-dot`), named beside it by the connection.
     ConnectionDot,
@@ -134,6 +137,103 @@ pub struct Node {
     /// A view holding the parts but not what wires them together is
     /// half of `interconnection-view`, and the half that says less.
     pub links: Vec<Edge>,
+}
+
+/// The `start` and `done` every action and state inherits, drawn as the
+/// dot a flow starts from and the ringed dot it ends at -- once each,
+/// however many successions run from or to them. They are the library's
+/// features rather than the definition's, so nothing else puts them on
+/// the canvas, and `first start; then a; ... then done;` was drawn as
+/// a flow with neither a beginning nor an end.
+///
+/// And the definition's own ports, which a connection inside it runs to
+/// when it delegates through one: `connect p to a.q;` in `part def Sys {
+/// port p; part a; }`. A port is no box, so the port on the boundary was
+/// on the canvas nowhere, and every such connection would be dropped in
+/// silence.
+#[derive(Default)]
+struct EndsOfFlow {
+    start: Option<usize>,
+    done: Option<usize>,
+    ports: HashMap<ElementId, usize>,
+}
+
+impl EndsOfFlow {
+    /// The node `target` is drawn as, where it is `start`, `done` or one of
+    /// the definition's own ports.
+    fn at(
+        &mut self,
+        model: &Model,
+        members: &[ElementId],
+        target: ElementId,
+        nodes: &mut Vec<Node>,
+    ) -> Option<usize> {
+        if model.kind(target).is_a(ElementKind::PortUsage) && members.contains(&target) {
+            return Some(*self.ports.entry(target).or_insert_with(|| {
+                let name = model.effective_name(target).unwrap_or_default();
+                nodes.push(Node {
+                    id: target,
+                    keyword: box_keyword(model, target),
+                    name: box_label(model, target, name),
+                    compartments: Vec::new(),
+                    is_abstract: is_abstract(model, target),
+                    rounded: true,
+                    shape: Shape::Box,
+                    children: Vec::new(),
+                    links: Vec::new(),
+                });
+                nodes.len() - 1
+            }));
+        }
+        let (slot, shape) = match model.name(target)? {
+            "start" => (&mut self.start, Shape::Initial),
+            "done" => (&mut self.done, Shape::Final),
+            _ => return None,
+        };
+        // only the library's own: a step the model itself calls `done`
+        // is a box like any other
+        if !library_feature(model, target) {
+            return None;
+        }
+        Some(*slot.get_or_insert_with(|| {
+            let mut node = initial_node(target);
+            node.shape = shape;
+            nodes.push(node);
+            nodes.len() - 1
+        }))
+    }
+}
+
+/// Whether `feature` is declared by the standard library rather than by
+/// the model: its outermost owner is one of the library's packages.
+fn library_feature(model: &Model, feature: ElementId) -> bool {
+    std::iter::successors(Some(feature), |&it| model.owner(it))
+        .any(|it| model.kind(it) == ElementKind::LibraryPackage)
+}
+
+/// A step of a flow that is a node of it whether or not it is named:
+/// `decide;`, `fork;`, `then assign x := 1;`, `then send s to p;`,
+/// `accept s : S;`, `then action { ... }`. Each is written without a name
+/// as often as with one, and skipped for having none, every succession
+/// into or out of it went with it.
+///
+/// Only the definition's own: what it inherits nameless is the library's
+/// machinery, not a step anybody wrote. And not what an `entry`, `do` or
+/// `exit` declares, which the machine is drawn starting from or doing.
+fn unnamed_step_of_the_flow(model: &Model, definition: ElementId, step: ElementId) -> bool {
+    let kind = model.kind(step);
+    let of_the_flow = kind.is_a(ElementKind::ControlNode)
+        || kind.is_a(ElementKind::AssignmentActionUsage)
+        || kind.is_a(ElementKind::SendActionUsage)
+        || kind.is_a(ElementKind::AcceptActionUsage)
+        || kind.is_a(ElementKind::TerminateActionUsage)
+        || kind == ElementKind::ActionUsage;
+    of_the_flow
+        && model.owner(step) == Some(definition)
+        && !matches!(
+            model.member_role(step),
+            Some(Role::Entry | Role::Do | Role::Exit)
+        )
 }
 
 /// The filled circle a flow starts from, standing for `element`.
@@ -395,6 +495,11 @@ pub enum Relation {
     /// (`n-ary-dependency-client-link`): dashed, and with no arrowhead,
     /// since the dot is not what the client depends on.
     Client,
+    /// `to` is a definition declared inside the definition `from`
+    /// (`part def A { part def Inner; }`): the `owned-membership` line,
+    /// with the circled plus at the namespace that owns it. Drawn side by
+    /// side with nothing between them, the two read as unrelated.
+    Membership,
 }
 impl Relation {
     /// The word a skin names this relation by: what a reader would call
@@ -426,6 +531,7 @@ impl Relation {
             Relation::Event => "event",
             Relation::Annotation => "annotation",
             Relation::Client => "client",
+            Relation::Membership => "membership",
         }
     }
 
@@ -457,6 +563,7 @@ impl Relation {
         Relation::Event,
         Relation::Annotation,
         Relation::Client,
+        Relation::Membership,
     ];
 }
 
@@ -537,7 +644,14 @@ pub fn definition_diagram(model: &Model, roots: &[ElementId]) -> Diagram {
             if !model.kind(id).is_a(ElementKind::Classifier) {
                 continue;
             }
-            let Some(name) = model.name(id) else {
+            // Every port definition carries the conjugate the language
+            // implies for it, `~PD`, which nobody wrote: a box for it beside
+            // every `port def` is a definition the model never declared. A
+            // port typed by one is joined to the definition it conjugates.
+            if model.kind(id) == ElementKind::ConjugatedPortDefinition {
+                continue;
+            }
+            let Some(name) = called(model, id) else {
                 continue;
             };
             // roots may overlap, and a definition must not be drawn twice
@@ -547,8 +661,8 @@ pub fn definition_diagram(model: &Model, roots: &[ElementId]) -> Diagram {
             index.insert(id, nodes.len());
             nodes.push(Node {
                 id,
-                name: name.to_string(),
-                keyword: keyword(model.kind(id)),
+                name: format!("{name}{}", parallel(model, id)),
+                keyword: box_keyword(model, id),
                 compartments: into_compartments(name, features_of(model, id)),
                 is_abstract: is_abstract(model, id),
                 // only a usage is drawn with rounded corners, and every
@@ -571,16 +685,32 @@ pub fn definition_diagram(model: &Model, roots: &[ElementId]) -> Diagram {
                 continue;
             };
             // `part def C :> C;` parses and resolves, and a line from a
-            // box to itself says nothing a reader can follow
-            if let Some(&to) = index.get(target).filter(|&&to| to != from) {
-                edges.push(Edge {
-                    from,
-                    to,
-                    relation: Relation::Specialization,
-                    ends: (None, None),
-                    label: None,
-                });
+            // box to itself says nothing a reader can follow; nor does a
+            // second arrow for `part def F :> A, A;`, which is one fact
+            let Some(&to) = index.get(target).filter(|&&to| to != from) else {
+                continue;
+            };
+            let edge = Edge {
+                from,
+                to,
+                relation: Relation::Specialization,
+                ends: (None, None),
+                label: None,
+            };
+            if !edges.contains(&edge) {
+                edges.push(edge);
             }
+        }
+        // a definition declared inside another is drawn beside it, and the
+        // `owned-membership` line is what says the one holds the other
+        if let Some(&owner) = model.owner(node.id).and_then(|owner| index.get(&owner)) {
+            edges.push(Edge {
+                from: owner,
+                to: from,
+                relation: Relation::Membership,
+                ends: (None, None),
+                label: None,
+            });
         }
         compositions_of(model, node.id, from, &index, &mut edges);
         annotations_of(model, node.id, from, &index, &mut edges);
@@ -736,8 +866,19 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
     let members = assembled_from(model, definition);
 
     let mut drawn: HashMap<&str, usize> = HashMap::new();
+    // `part k2 :>> k;` redeclares `k` under another name, and the nearer
+    // one comes first: one box stands for both, as it does for a part
+    // redeclared under its own name below
+    let redefiners: HashMap<ElementId, ElementId> = members
+        .iter()
+        .flat_map(|&member| redefined(model, member).map(move |gone| (gone, member)))
+        .collect();
     for &child in &members {
         if !is_box(model, child) {
+            continue;
+        }
+        if let Some(&at) = redefiners.get(&child).and_then(|by| index.get(by)) {
+            index.insert(child, at);
             continue;
         }
         // `if c { ... }` is a node whether or not it was given a name:
@@ -749,7 +890,7 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
             ElementKind::IfActionUsage
                 | ElementKind::WhileLoopActionUsage
                 | ElementKind::ForLoopActionUsage
-        );
+        ) || unnamed_step_of_the_flow(model, definition, child);
         let Some(name) = model.effective_name(child).or(anonymous.then_some("")) else {
             continue;
         };
@@ -773,7 +914,7 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
         // whatever became a box inside is not also a compartment line
         let nested: HashSet<&str> = children
             .iter()
-            .filter_map(|child| model.name(child.id))
+            .filter_map(|child| model.effective_name(child.id))
             .collect();
         features.retain(|(_, feature)| !nested.contains(feature.name.as_str()));
         index.insert(child, nodes.len());
@@ -791,10 +932,11 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
     }
 
     let mut edges = Vec::new();
-    specializations_of(model, definition, &index, &mut edges);
+    specializations_of(model, &members, &index, &mut edges);
     // `action A1; then J;` continues from whatever came before it, so a
     // succession that names only where it goes needs its source remembered
     let mut previous: Option<usize> = None;
+    let mut ends_of_flow = EndsOfFlow::default();
     for &child in &members {
         if let Some(&at) = index.get(&child) {
             previous = Some(at);
@@ -809,8 +951,15 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
         // stands before it, and when nothing does -- `entry; then off;` --
         // it is the filled circle a machine starts at.
         if let [only] = &ends[..] {
-            if model.kind(child) == ElementKind::SuccessionAsUsage {
-                if let Some(&to) = index.get(&only.target) {
+            if matches!(
+                model.kind(child),
+                ElementKind::SuccessionAsUsage | ElementKind::Succession
+            ) {
+                let to = index
+                    .get(&only.target)
+                    .copied()
+                    .or_else(|| ends_of_flow.at(model, &members, only.target, &mut nodes));
+                if let Some(to) = to {
                     let from = previous.unwrap_or(nodes.len());
                     if previous.is_none() {
                         nodes.push(initial_node(child));
@@ -824,8 +973,9 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
                             label: None,
                         });
                     }
-                    // the flow now stands where it just arrived
-                    previous = Some(to);
+                    // `previous` stays where it was: a succession is no
+                    // occurrence, so the next `then` leaves the same
+                    // place this one did (SysML 7.17.4)
                 }
             }
             continue;
@@ -846,8 +996,12 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
         let Some((first, rest)) = ends.split_first() else {
             continue;
         };
-        let from = match index.get(&first.target) {
-            Some(&at) => at,
+        let from = match index
+            .get(&first.target)
+            .copied()
+            .or_else(|| ends_of_flow.at(model, &members, first.target, &mut nodes))
+        {
+            Some(at) => at,
             // `entry; then off;` runs from the empty action an `entry`
             // on its own declares. That action is the filled circle a
             // machine starts at rather than a box of its own.
@@ -858,10 +1012,19 @@ pub fn interconnection_diagram(model: &Model, definition: ElementId) -> Diagram 
             None => continue,
         };
         for second in rest {
-            let Some(&to) = index.get(&second.target) else {
+            let Some(to) = index
+                .get(&second.target)
+                .copied()
+                .or_else(|| ends_of_flow.at(model, &members, second.target, &mut nodes))
+            else {
                 continue;
             };
-            if from == to {
+            // A state that handles an event and stays where it is is the
+            // commonest transition there is, and dropping it said the event
+            // was never handled. Anything else joining a box to itself is
+            // a box standing for two declarations that redefine one
+            // another, which is no line to draw.
+            if from == to && relation != Relation::Transition {
                 continue;
             }
             edges.push(Edge {
@@ -997,7 +1160,10 @@ pub(crate) fn connector_relation(model: &Model, connector: ElementId) -> Relatio
         ElementKind::BindingConnector | ElementKind::BindingConnectorAsUsage => Relation::Binding,
         ElementKind::InterfaceUsage => Relation::Interface,
         ElementKind::AllocationUsage => Relation::Allocation,
-        ElementKind::SuccessionFlowUsage => Relation::SuccessionFlow,
+        // KerML writes the same three without the usage around them --
+        // `succession a then b;` in a `.kerml` file is a `Succession` --
+        // and they mean what the SysML ones do
+        ElementKind::SuccessionFlowUsage | ElementKind::SuccessionFlow => Relation::SuccessionFlow,
         // A message has no metaclass of its own: `Message : FlowUsage =
         // ... { isAbstract = true }` is how the standard writes one, so
         // the flag is what tells it from a flow.
@@ -1005,7 +1171,8 @@ pub(crate) fn connector_relation(model: &Model, connector: ElementId) -> Relatio
             Some(&Value::Bool(true)) => Relation::Message,
             _ => Relation::Flow,
         },
-        ElementKind::SuccessionAsUsage => Relation::Succession,
+        ElementKind::Flow => Relation::Flow,
+        ElementKind::SuccessionAsUsage | ElementKind::Succession => Relation::Succession,
         kind if kind.is_a(ElementKind::TransitionUsage) => Relation::Transition,
         _ => Relation::Connection,
     }
@@ -1088,6 +1255,9 @@ pub(crate) fn connector_label(
         }
         // a flow and a message write what they carry and nothing else
         Relation::Flow | Relation::Message => carries(model, child)?,
+        // `succession S first A1 then A2;` is named so it can be referred
+        // to, and the line is the only place the drawing has to say so
+        Relation::Succession => model.name(child)?.to_string(),
         _ => return None,
     };
     Some(written)
@@ -1143,15 +1313,7 @@ fn transition_label(model: &Model, transition: ElementId) -> Option<String> {
         head.push(name.to_string());
     }
     if let Some(trigger) = first_reference(model, transition, "triggerAction") {
-        // `TriggerAction : AcceptActionUsage = AcceptParameterPart` --
-        // what the transition waits for is the accept action's first
-        // parameter, and the action itself is written with no name
-        let waits = sysml_model::payload_parameter(model, trigger).unwrap_or(trigger);
-        let payload = model.name(waits).unwrap_or_default();
-        let typed = type_name(model, waits)
-            .map(|ty| format!(" : {ty}"))
-            .unwrap_or_default();
-        head.push(format!("accept {payload}{typed}"));
+        head.push(trigger_label(model, trigger));
     }
     if let Some(guard) = guard_text(model, transition) {
         head.push(format!("[{guard}]"));
@@ -1161,6 +1323,74 @@ fn transition_label(model: &Model, transition: ElementId) -> Option<String> {
         (true, effect) => effect,
         (false, Some(effect)) => Some(format!("{} / {effect}", head.join(" "))),
         (false, None) => Some(head.join(" ")),
+    }
+}
+
+/// What a transition waits for, as `accept` writes it.
+///
+/// `TriggerAction : AcceptActionUsage = AcceptParameterPart` -- what the
+/// transition waits for is the accept action's first parameter, and the
+/// action itself is written with no name. It is written as a flow's
+/// payload is: `accept Sig` waits for a `Sig` and names nothing, `accept s
+/// : Sig` names it too. Or the parameter is bound to a time or a change,
+/// `accept after 5 [SI::s]` and `accept when n == 3`, which is all such a
+/// trigger says; and the second parameter is the port it is accepted
+/// `via`. Written as a bare `accept`, a timeout and a message read alike.
+fn trigger_label(model: &Model, trigger: ElementId) -> String {
+    let mut parameters = model
+        .owned(trigger)
+        .iter()
+        .copied()
+        .filter(|&child| model.maybe(child, "direction").is_some());
+    let waits = parameters.next().unwrap_or(trigger);
+    let invoked = bound_value(model, waits).and_then(|bound| {
+        let kind = model.maybe(bound, "kind")?.as_str()?;
+        Some(format!("accept {kind} {}", text_beneath(model, bound)?))
+    });
+    let mut written = invoked.unwrap_or_else(|| match payload_label(model, waits) {
+        Some(payload) => format!("accept {payload}"),
+        None => "accept".to_string(),
+    });
+    if let Some(via) = parameters
+        .next()
+        .and_then(|receiver| bound_value(model, receiver))
+        .and_then(|bound| text_beneath(model, bound))
+    {
+        written.push_str(&format!(" via {via}"));
+    }
+    written
+}
+
+/// The expression a feature is bound to, where it is bound to one.
+fn bound_value(model: &Model, feature: ElementId) -> Option<ElementId> {
+    model
+        .owned(feature)
+        .iter()
+        .find(|&&child| model.kind(child) == ElementKind::FeatureValue)
+        .and_then(|&value| model.maybe(value, "value")?.as_id())
+}
+
+/// The text of the outermost expression under `element` that kept one.
+///
+/// An argument is wrapped in the features and expressions the language
+/// reads it as, and only some of those keep the text they were written
+/// as; the outermost one that did says the whole of it.
+fn text_beneath(model: &Model, element: ElementId) -> Option<String> {
+    let mut queue = std::collections::VecDeque::from([element]);
+    let outermost = std::iter::from_fn(|| {
+        let at = queue.pop_front()?;
+        queue.extend(model.owned(at).iter().copied());
+        Some(at)
+    })
+    .find(|&at| {
+        model.kind(at) == ElementKind::TextualRepresentation
+            || model.kind(at).is_a(ElementKind::LiteralExpression)
+    })?;
+    match model.kind(outermost) {
+        ElementKind::TextualRepresentation => {
+            model.maybe(outermost, "body")?.as_str().map(str::to_string)
+        }
+        _ => Some(expression_text(model, outermost)),
     }
 }
 
@@ -1440,10 +1670,30 @@ fn dependencies_of(
         // it n-ary, and then the links meet at a dot rather than crossing
         // pairwise.
         if clients.len() > 1 || suppliers.len() > 1 {
+            // An end off the canvas is named beside the dot: `dependency
+            // from A, B to ScalarValues::Integer` drawn as a dot joining
+            // `A` and `B` and nothing else reads as a relationship between
+            // the two clients.
+            let off_canvas = |property, word: &str| match model.maybe(child, property) {
+                Some(Value::RefList(ends)) => {
+                    let names: Vec<&str> = ends
+                        .iter()
+                        .filter(|end| !index.contains_key(end))
+                        .filter_map(|&end| called(model, end))
+                        .collect();
+                    (!names.is_empty()).then(|| format!("{word} {}", names.join(", ")))
+                }
+                _ => None,
+            };
+            let said: Vec<String> = named
+                .into_iter()
+                .chain(off_canvas("client", "from"))
+                .chain(off_canvas("supplier", "to"))
+                .collect();
             let dot = nodes.len();
             nodes.push(Node {
                 id: child,
-                name: named.unwrap_or_default(),
+                name: said.join(" "),
                 keyword: String::new(),
                 compartments: Vec::new(),
                 is_abstract: false,
@@ -1614,9 +1864,6 @@ fn compositions_of(
                 _ => continue,
             },
         };
-        let Some(&to) = model.type_of(child).and_then(|ty| index.get(&ty)) else {
-            continue;
-        };
         // naming the end is what puts the line on the port's square
         // rather than on the box's border somewhere else, which would
         // leave the square attached to nothing. A behaviour's parameters
@@ -1627,17 +1874,33 @@ fn compositions_of(
             .then(|| model.name(child))
             .flatten()
             .map(str::to_string);
-        if linked.contains(&(to, relation, end.clone())) {
-            continue;
+        // `part p : B, C;` is made of both, and a line to each says so
+        for ty in model.types_of(child) {
+            let Some(&to) = index.get(&original_port(model, ty)) else {
+                continue;
+            };
+            if linked.contains(&(to, relation, end.clone())) {
+                continue;
+            }
+            linked.push((to, relation, end.clone()));
+            edges.push(Edge {
+                from,
+                to,
+                relation,
+                ends: (end.clone(), None),
+                label: None,
+            });
         }
-        linked.push((to, relation, end.clone()));
-        edges.push(Edge {
-            from,
-            to,
-            relation,
-            ends: (end, None),
-            label: None,
-        });
+    }
+}
+
+/// The port definition `~PD` conjugates, for a type that is one, and the
+/// type itself otherwise. The conjugate has no box of its own, and a port
+/// typed by it is a port of the definition it was implied from.
+fn original_port(model: &Model, ty: ElementId) -> ElementId {
+    match model.kind(ty) {
+        ElementKind::ConjugatedPortDefinition => model.owner(ty).unwrap_or(ty),
+        _ => ty,
     }
 }
 
@@ -1648,13 +1911,19 @@ fn compositions_of(
 /// same thing between two usages is a subsetting, and a redeclaration
 /// of one is a redefinition. All three are type relationships the
 /// standard draws.
+///
+/// Read from everything the boxes were drawn from, inherited members
+/// included: `part def SportsCar :> Car` holds Car's `part big :> eng`
+/// as boxes of its own, and reading only what SportsCar owns drew the
+/// two side by side as if unrelated -- and said nothing in words either,
+/// since both ends were on the canvas.
 fn specializations_of(
     model: &Model,
-    definition: ElementId,
+    members: &[ElementId],
     index: &HashMap<ElementId, usize>,
     edges: &mut Vec<Edge>,
 ) {
-    for &child in model.owned(definition) {
+    for &child in members {
         let Some(&from) = index.get(&child) else {
             continue;
         };
@@ -1670,7 +1939,13 @@ fn specializations_of(
             let Some(&to) = index.get(&target) else {
                 continue;
             };
-            if from == to {
+            // a redeclaration and what it redeclares are one box, and
+            // what both of them say is one line
+            if from == to
+                || edges
+                    .iter()
+                    .any(|edge| (edge.from, edge.to, edge.relation) == (from, to, relation))
+            {
                 continue;
             }
             edges.push(Edge {
@@ -1710,10 +1985,22 @@ fn box_label(model: &Model, usage: ElementId, name: &str) -> String {
         Some(ty) => format!("{name} : {ty}"),
         None => name.to_string(),
     };
-    if let Some(many) = multiplicity_of(model, usage) {
+    if let Some(many) = multiplicity_and_order(model, usage) {
         label.push_str(&many);
     }
+    label.push_str(parallel(model, usage));
     label
+}
+
+/// `«parallel»` after the name of a state that runs its states at once:
+/// `state-name-compartment` ends `('«' 'parallel' '»')?`. Without it a
+/// parallel state reads as one that is in one of its states at a time.
+fn parallel(model: &Model, state: ElementId) -> &'static str {
+    if model.flag(state, "isParallel") {
+        " \u{ab}parallel\u{bb}"
+    } else {
+        ""
+    }
 }
 
 /// A type and everything it specializes, nearest first.
@@ -1747,8 +2034,21 @@ fn itself_and_supertypes(model: &Model, ty: ElementId) -> Vec<ElementId> {
 /// gave it: `entry-action-name-comp = '\u{ab}' 'entry' OccurrenceUsagePrefix
 /// 'action' '\u{bb}'`, so a state's entry action says which of the three it
 /// is rather than reading as any other action.
+///
+/// And with the prefix the declaration was written with, where the name
+/// compartment has room for one: `'«' DefinitionPrefix 'part' 'def' '»'`
+/// and `'«' OccurrenceUsagePrefix 'state' '»'` take `variation` and
+/// `individual`. (`abstract` is the other, and is drawn in italic.) An
+/// enumeration is a variation by definition and is never written as one.
 fn box_keyword(model: &Model, element: ElementId) -> String {
-    let written = keyword(model.kind(element));
+    let kind = model.kind(element);
+    let mut written = keyword(kind);
+    let enumeration = kind == ElementKind::EnumerationDefinition;
+    for (flag, prefix) in [("isIndividual", "individual"), ("isVariation", "variation")] {
+        if model.flag(element, flag) && !(enumeration && prefix == "variation") {
+            written = format!("{prefix} {written}");
+        }
+    }
     match model.member_role(element) {
         Some(Role::Entry) => format!("entry {written}"),
         Some(Role::Do) => format!("do {written}"),
@@ -1786,7 +2086,7 @@ pub(crate) fn keyword(kind: ElementKind) -> String {
         ElementKind::WhileLoopActionUsage | ElementKind::ForLoopActionUsage => Some("loop"),
         // the metaclass is `SuccessionAsUsage`; the notation writes it
         // `succession a then b`
-        ElementKind::SuccessionAsUsage => Some("succession"),
+        ElementKind::SuccessionAsUsage | ElementKind::Succession => Some("succession"),
         // The control nodes and the rest below are spelled by the
         // notation rather than by the metaclass: `fork-node ='fork'`,
         // `ref-prefix ='ref'`, `alias-member ='alias'` and so on through
@@ -1834,14 +2134,49 @@ pub(crate) fn keyword(kind: ElementKind) -> String {
 ///
 /// Read from the same owners `nested_parts` draws from, so a connection a
 /// supertype declared joins the parts a subtype inherited.
+///
+/// And joins them where the subtype redeclared them: `connect a to b` in
+/// `Base` is written in terms of Base's `a`, which `part redefines a` in
+/// `Sub` replaces with a box of its own. Knowing only the boxes drawn, a
+/// `part s : Sub` held both ends and no line between them.
 fn links_between(model: &Model, usage: ElementId, children: &[Node]) -> Vec<Edge> {
-    let at: HashMap<ElementId, usize> = children
+    let owners = nesting_owners(model, usage);
+    let mut at: HashMap<ElementId, usize> = children
         .iter()
         .enumerate()
         .map(|(index, child)| (child.id, index))
         .collect();
+    // what each box redefines, and what that redefined in turn, is the
+    // same box
+    for (index, child) in children.iter().enumerate() {
+        let mut pending: Vec<ElementId> = redefined(model, child.id).collect();
+        while let Some(gone) = pending.pop() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = at.entry(gone) {
+                entry.insert(index);
+                pending.extend(redefined(model, gone));
+            }
+        }
+    }
+    // and a part a nearer owner declared again under its own name stands
+    // for the one further up, as `nested_parts` drew it
+    for &owner in &owners {
+        for &part in model.owned(owner) {
+            if at.contains_key(&part) || !is_structure_box(model.kind(part)) {
+                continue;
+            }
+            let Some(name) = model.effective_name(part) else {
+                continue;
+            };
+            if let Some(index) = children
+                .iter()
+                .position(|child| model.effective_name(child.id) == Some(name))
+            {
+                at.insert(part, index);
+            }
+        }
+    }
     let mut links = Vec::new();
-    for owner in nesting_owners(model, usage) {
+    for owner in owners {
         for &child in model.owned(owner) {
             let ends = connector_ends(model, child);
             let [first, second] = &ends[..] else { continue };
@@ -1876,14 +2211,13 @@ fn links_between(model: &Model, usage: ElementId, children: &[Node]) -> Vec<Edge
 ///
 /// A definition names no type and answers with itself and its supertypes;
 /// a usage answers with the type's.
-fn nesting_owners(model: &Model, usage: ElementId) -> Vec<ElementId> {
+pub(crate) fn nesting_owners(model: &Model, usage: ElementId) -> Vec<ElementId> {
     let mut seen = HashSet::new();
     itself_and_supertypes(model, usage)
         .into_iter()
         .chain(
             model
-                .type_of(usage)
-                .into_iter()
+                .types_of(usage)
                 .flat_map(|ty| itself_and_supertypes(model, ty)),
         )
         // What a structured control node writes in braces is one
@@ -1893,6 +2227,15 @@ fn nesting_owners(model: &Model, usage: ElementId) -> Vec<ElementId> {
         .chain(body_parameters(model, usage))
         .filter(|id| seen.insert(*id))
         .collect()
+}
+
+/// What a feature redefines, as it wrote it or as the language implies.
+fn redefined(model: &Model, feature: ElementId) -> impl Iterator<Item = ElementId> + '_ {
+    model.owned(feature).iter().filter_map(move |&rel| {
+        (model.kind(rel) == ElementKind::Redefinition)
+            .then(|| model.maybe(rel, "redefinedFeature")?.as_id())
+            .flatten()
+    })
 }
 
 /// The bodies a structured control node was handed, which is where the
@@ -1919,8 +2262,15 @@ fn body_parameters(model: &Model, usage: ElementId) -> Vec<ElementId> {
 /// Taken from the usage and then its type, the same way its features are:
 /// `part w : Wheel;` declares nothing itself, so the sub-parts come from
 /// `Wheel`. Nesting stops here -- one level is what a box has room for.
+///
+/// What the nearer owner redeclares stands for what it redeclares, as it
+/// does in the definition's own box: `part :>> x : Y;` is the `x` a
+/// subtype holds, and `part k2 :>> k;` is all that is left of `k`.
 fn nested_parts(model: &Model, usage: ElementId) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::new();
+    let mut drawn: HashSet<&str> = HashSet::new();
+    let mut replaced: HashSet<ElementId> = HashSet::new();
+    let mut otherwise_last: Vec<Node> = Vec::new();
     for owner in nesting_owners(model, usage) {
         for &part in model.owned(owner) {
             // an action's steps and a state's states nest the same way a
@@ -1930,26 +2280,51 @@ fn nested_parts(model: &Model, usage: ElementId) -> Vec<Node> {
             if !is_structure_box(model.kind(part)) {
                 continue;
             }
-            let Some(name) = model.name(part) else {
+            // `else if q { ... }` is the branch an `if` was handed, an `if`
+            // of its own and nameless as every one is. Left out, the steps
+            // it guards were nowhere in the drawing; it is drawn as the
+            // node it is, with the question it asks and what it runs.
+            let otherwise = model.kind(part) == ElementKind::IfActionUsage
+                && model.kind(owner) == ElementKind::IfActionUsage;
+            let Some(name) = model.effective_name(part).or(otherwise.then_some("")) else {
                 continue;
             };
-            let label = box_label(model, part, name);
-            if out.iter().any(|drawn| drawn.name == label) {
+            // what this one redefines is gone too, whether it is drawn or
+            // was itself redefined by something nearer
+            replaced.extend(redefined(model, part));
+            if replaced.contains(&part) || (!otherwise && !drawn.insert(name)) {
                 continue;
             }
-            out.push(Node {
+            let label = box_label(model, part, name);
+            let (compartments, children) = if otherwise {
+                (
+                    into_compartments(&label, features_of(model, part)),
+                    nested_parts(model, part),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let node = Node {
                 id: part,
                 name: label,
                 keyword: box_keyword(model, part),
-                compartments: Vec::new(),
+                compartments,
                 is_abstract: is_abstract(model, part),
                 rounded: model.kind(part).is_a(ElementKind::Usage),
                 shape: shape_of(model.kind(part)),
-                children: Vec::new(),
+                children,
                 links: Vec::new(),
-            });
+            };
+            // the branch taken otherwise is written after the one taken
+            // first, and is read in that order
+            if otherwise {
+                otherwise_last.push(node);
+            } else {
+                out.push(node);
+            }
         }
     }
+    out.extend(otherwise_last);
     out
 }
 
@@ -1959,14 +2334,22 @@ fn nested_parts(model: &Model, usage: ElementId) -> Vec<Node> {
 /// `Wheel` -- so a box listing only what the usage writes would be empty
 /// even where a connection attaches to one of those ports. A feature the
 /// usage redefines keeps the usage's own entry.
+///
+/// And one the usage or a nearer type redefines under another name is
+/// not listed again under its own: `part k2 :>> k;` leaves no `k`.
 fn features_with_type(model: &Model, usage: ElementId) -> Vec<(&'static str, Feature)> {
     let mut out = features_of(model, usage);
-    for ty in model
-        .type_of(usage)
-        .into_iter()
+    let types: Vec<ElementId> = model
+        .types_of(usage)
         .flat_map(|ty| itself_and_supertypes(model, ty))
-    {
-        for (label, inherited) in features_of(model, ty) {
+        .collect();
+    let replaced: HashSet<ElementId> = std::iter::once(usage)
+        .chain(types.iter().copied())
+        .flat_map(|owner| model.owned(owner).iter().copied())
+        .flat_map(|member| redefined(model, member))
+        .collect();
+    for ty in types {
+        for (label, inherited) in features_except(model, ty, &replaced) {
             match out
                 .iter_mut()
                 .map(|(_, own)| own)
@@ -1995,8 +2378,20 @@ fn features_with_type(model: &Model, usage: ElementId) -> Vec<(&'static str, Fea
 /// `step` or `feature` is what a KerML model is written out of, and a box
 /// listing only usages is an empty box on every page of one.
 fn features_of(model: &Model, definition: ElementId) -> Vec<(&'static str, Feature)> {
+    features_except(model, definition, &HashSet::new())
+}
+
+/// [`features_of`], leaving out the members in `replaced`.
+fn features_except(
+    model: &Model,
+    definition: ElementId,
+    replaced: &HashSet<ElementId>,
+) -> Vec<(&'static str, Feature)> {
     let mut out = Vec::new();
     for &child in model.owned(definition) {
+        if replaced.contains(&child) {
+            continue;
+        }
         // A view says what it exposes and what it filters by, and
         // neither is a feature: `exposes-compartment-element =
         // MembershipExpose | NamespaceExpose` and
@@ -2040,7 +2435,7 @@ fn features_of(model: &Model, definition: ElementId) -> Vec<(&'static str, Featu
                 keyword: keyword(model.kind(child)),
                 name: name.to_string(),
                 ty: type_name(model, child),
-                multiplicity: multiplicity_of(model, child),
+                multiplicity: multiplicity_and_order(model, child),
                 value: value_of(model, child),
                 direction: direction_of(model, child),
             },
@@ -2051,17 +2446,44 @@ fn features_of(model: &Model, definition: ElementId) -> Vec<(&'static str, Featu
 
 /// The compartment the condition of an `if` or a loop goes in, named for
 /// the question the node asks: `if-condition ='if condition'`,
-/// `while-condition ='while condition'`, `iteration ='for iterator'`.
+/// `while-condition ='while condition'`, `until-condition ='until
+/// condition'`, `iteration ='for iterator'`.
 fn condition_compartment(model: &Model, member: ElementId) -> Option<&'static str> {
     if !model.kind(member).is_a(ElementKind::Expression) {
         return None;
     }
-    match model.kind(model.owner(member)?) {
+    let owner = model.owner(member)?;
+    match model.kind(owner) {
         ElementKind::IfActionUsage => Some("if condition"),
+        // `loop { ... } until n == 7;` stops once the condition holds,
+        // which is the opposite of what a `while` asks. The standard has
+        // the `untilArgument` be the loop's third parameter -- after the
+        // `while` (or the empty one a bare `loop` is handed) and the body
+        // -- and drawn under `while condition` it said the loop ran for
+        // as long as `n == 7`.
+        ElementKind::WhileLoopActionUsage if is_until_argument(model, owner, member) => {
+            Some("until condition")
+        }
         ElementKind::WhileLoopActionUsage => Some("while condition"),
         ElementKind::ForLoopActionUsage => Some("for iterator"),
         _ => None,
     }
+}
+
+/// Is `member` what a `while` loop asks after each pass, rather than
+/// before it?
+///
+/// `deriveWhileLoopActionUsageUntilArgument` -- the `untilArgument` is the
+/// third input parameter, the first two being what the loop asks before
+/// each pass (empty for a bare `loop`) and the body it repeats.
+fn is_until_argument(model: &Model, owner: ElementId, member: ElementId) -> bool {
+    model
+        .owned(owner)
+        .iter()
+        .copied()
+        .filter(|&child| direction_of(model, child) == Some("in"))
+        .nth(2)
+        == Some(member)
 }
 
 /// The comments written about anything on the canvas, as notes joined to
@@ -2082,17 +2504,23 @@ fn notes_of(
         .iter()
         .filter_map(|&child| Some((child, note_of(model, child)?)));
     for (child, note) in written {
-        let mut about: Vec<usize> = model
+        let named: Vec<ElementId> = model
             .owned(child)
             .iter()
             .filter(|&&rel| model.kind(rel) == ElementKind::Annotation)
             .filter_map(|&rel| model.get(rel, "annotatedElement")?.as_id())
-            .filter_map(|target| index.get(&target).copied())
+            .collect();
+        let mut about: Vec<usize> = named
+            .iter()
+            .filter_map(|target| index.get(target).copied())
             .collect();
         // `#Safety part def Boiler;` -- `PrefixMetadataAnnotation :
         // Annotation = '#' annotatingElement = PrefixMetadataUsage`, so
-        // what a prefix annotates is whatever it stands before
-        if about.is_empty() {
+        // what a prefix annotates is whatever it stands before. Only
+        // where it names nothing, though: `comment about u` inside `A`
+        // is about `u`, and with `u` off the canvas it is about nothing
+        // drawn, not about `A`.
+        if named.is_empty() {
             about.extend(model.owner(child).and_then(|owner| index.get(&owner)));
         }
         if about.is_empty() {
@@ -2217,6 +2645,11 @@ fn performers(model: &Model) -> HashMap<ElementId, Vec<String>> {
                 .then(|| model.get(rel, "referencedFeature")?.as_id())
                 .flatten()
         })?;
+        // `perform flow.step;` performs the step at the end of the chain
+        let performed = match model.maybe(performed, "chainingFeature") {
+            Some(sysml_model::Value::RefList(chain)) => chain.last().copied().unwrap_or(performed),
+            _ => performed,
+        };
         Some((performed, model.effective_name(model.owner(id)?)?))
     });
     for (performed, name) in performances {
@@ -2458,8 +2891,26 @@ fn multiplicity_of(model: &Model, usage: ElementId) -> Option<String> {
     }
 }
 
+/// The multiplicity and what is said after it: `[1..*] ordered nonunique`.
+/// `MultiplicityProperties` belongs to the multiplicity in the grammar, and
+/// a list drawn without them reads as a set.
+fn multiplicity_and_order(model: &Model, usage: ElementId) -> Option<String> {
+    let mut written = multiplicity_of(model, usage).unwrap_or_default();
+    if model.flag(usage, "isOrdered") {
+        written.push_str(" ordered");
+    }
+    if model.maybe(usage, "isUnique") == Some(&Value::Bool(false)) {
+        written.push_str(" nonunique");
+    }
+    (!written.is_empty()).then_some(written)
+}
+
 /// The value a usage was declared with, as the clause that set it:
-/// ` = 1200.0` for a value, ` := x` for an initial one.
+/// ` = 1200.0` for a value, ` := x` for an initial one, and either with
+/// `default` in front where it is only a default.
+///
+/// `attribute x default = 3;` can be overridden where `attribute x = 3;`
+/// cannot, and writing the first as the second said the value was bound.
 fn value_of(model: &Model, usage: ElementId) -> Option<String> {
     let membership = model
         .owned(usage)
@@ -2474,7 +2925,15 @@ fn value_of(model: &Model, usage: ElementId) -> Option<String> {
     } else {
         "="
     };
-    Some(format!(" {wrote} {}", expression_text(model, *expression)))
+    let default = if model.flag(membership, "isDefault") {
+        " default"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{default} {wrote} {}",
+        expression_text(model, *expression)
+    ))
 }
 
 /// An expression the way the source wrote it: a literal renders its value,
@@ -2487,7 +2946,9 @@ fn expression_text(model: &Model, expression: ElementId) -> String {
         Some(Value::Int(int)) => return int.to_string(),
         Some(Value::Real(real)) => return format!("{real:?}"),
         Some(Value::Bool(bool)) => return bool.to_string(),
-        Some(Value::String(string)) => return format!("\"{string}\""),
+        // written back the way SysML quotes it, or `"say \"hi\""` comes
+        // out as `"say "hi""`, which reads as two strings and a name
+        Some(Value::String(string)) => return quoted(string),
         _ => {}
     }
     // a non-literal expression carries the text it was written as
@@ -2502,6 +2963,26 @@ fn expression_text(model: &Model, expression: ElementId) -> String {
         .to_string()
 }
 
+/// A string literal as SysML writes one: in double quotes, with what
+/// KerML's `ESCAPE_SEQUENCE` spells escaped again.
+fn quoted(string: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in string.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The type name of a usage, read off the `FeatureTyping` that name
 /// resolution reified for its `:` clause -- or, where it wrote no `:`
 /// clause, off whatever it subsets or redefines.
@@ -2509,8 +2990,27 @@ fn expression_text(model: &Model, expression: ElementId) -> String {
 /// `part big :> engine;` is a part of the same kind `engine` is; drawing
 /// it bare says less than the model does, and leaves a box that looks
 /// like it stands for nothing in particular.
+///
+/// A feature typed by more than one type names each: `part p : B, C;` is
+/// both, and naming the first said it was a `B` and nothing else.
 fn type_name(model: &Model, usage: ElementId) -> Option<String> {
-    model.name(resolved_type(model, usage)?).map(str::to_string)
+    let declared: Vec<&str> = model
+        .types_of(usage)
+        .filter_map(|ty| called(model, ty))
+        .collect();
+    if !declared.is_empty() {
+        return Some(declared.join(", "));
+    }
+    called(model, resolved_type(model, usage)?).map(str::to_string)
+}
+
+/// What an element is called in a drawing: its name, or the short name
+/// where that is all it declares. `part def <S>;` is called `S`, and
+/// reading only the name left it out of every drawing.
+fn called(model: &Model, element: ElementId) -> Option<&str> {
+    model
+        .effective_name(element)
+        .or_else(|| model.effective_short_name(element))
 }
 
 /// What a feature is typed by, following what it subsets, redefines or
@@ -2579,7 +3079,7 @@ mod tests {
 
     #[test]
     fn a_keyworded_member_is_drawn_as_one_line_not_two() {
-        // each of these is composite as well as keyworded, and used to
+        // each of these is composite as well as keyworded, and must not
         // get a composition diamond beside its own line
         let ws = resolved(
             "action def B;\n\
@@ -2676,7 +3176,7 @@ mod tests {
     #[test]
     fn a_special_kind_of_member_keeps_its_own_heading() {
         // every one of these is a subtype of a kind that has a
-        // compartment of its own, and used to be filed under it
+        // compartment of its own, and must not be filed under it
         let ws = resolved(
             "requirement def R;\n\
              state def S;\n\
@@ -2928,6 +3428,10 @@ mod tests {
                 ("a1 : A", Relation::Subsetting)
             ]
         );
+        // and each line carries the head the standard gives it
+        let svg = crate::render(&diagram, &crate::Style::default());
+        assert!(svg.contains("url(#redefinition)"), "{svg}");
+        assert!(svg.contains("url(#subsetting)"), "{svg}");
     }
 
     #[test]
@@ -3546,7 +4050,7 @@ mod tests {
     fn a_dependency_is_drawn_from_each_client_to_each_supplier() {
         // `Dependency = 'dependency' ( Identification? 'from' )? client
         // += ... 'to' supplier += ...`, drawn as `binary-dependency` --
-        // and until now not drawn, or even built, at all
+        // each client-supplier pair is built and drawn as an edge
         let ws = resolved(
             "package P {\n\
              \tpart def A;\n\
@@ -5048,6 +5552,97 @@ mod interconnection_tests {
     }
 
     #[test]
+    fn a_loop_that_stops_when_asked_says_until_and_not_while() {
+        // `until-condition ='until condition'`: `until n == 7` ends the
+        // loop once it holds, the opposite of what a `while` asks, and
+        // both were drawn as a `while condition`
+        let ws = resolved(
+            "attribute def Integer;\n\
+             action def Step;\n\
+             action def M {\n\
+             \tattribute n : Integer;\n\
+             \tloop { action l : Step; } until n == 7;\n\
+             \twhile n < 10 { action w : Step; } until n == 5;\n\
+             }\n",
+        );
+        let diagram = interconnection_diagram(ws.model(), definition(&ws, "M"));
+        let asked: Vec<Vec<(&str, String)>> = diagram
+            .nodes
+            .iter()
+            .filter(|node| node.keyword == "loop")
+            .map(|node| {
+                node.compartments
+                    .iter()
+                    .flat_map(|compartment| {
+                        compartment
+                            .lines
+                            .iter()
+                            .map(move |line| (compartment.label, line.label()))
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                vec![("until condition", "n == 7".to_string())],
+                vec![
+                    ("while condition", "n < 10".to_string()),
+                    ("until condition", "n == 5".to_string()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_else_if_is_drawn_inside_the_if_it_is_the_otherwise_of() {
+        // `else if q { ... }` hands the first `if` a second one, which
+        // was drawn nowhere -- and with it every step it guards
+        let ws = resolved(
+            "action def Step;\n\
+             action def A {\n\
+             \tin p; in q;\n\
+             \tif p { action x : Step; } else if q { action y : Step; } else { action z : Step; }\n\
+             }\n",
+        );
+        let diagram = interconnection_diagram(ws.model(), definition(&ws, "A"));
+        let first = diagram
+            .nodes
+            .iter()
+            .find(|node| node.keyword == "if")
+            .expect("the first `if` is drawn");
+        let asks = |node: &Node| -> Vec<(&str, String)> {
+            node.compartments
+                .iter()
+                .flat_map(|compartment| {
+                    compartment
+                        .lines
+                        .iter()
+                        .map(move |line| (compartment.label, line.label()))
+                })
+                .collect()
+        };
+        assert_eq!(asks(first), [("if condition", "p".to_string())]);
+        let inside: Vec<&str> = first
+            .children
+            .iter()
+            .map(|it| it.keyword.as_str())
+            .collect();
+        // the branch taken first, then the one taken otherwise
+        assert_eq!(first.children.len(), 2, "{inside:?}");
+        assert!(first.children[0].name.starts_with('x'));
+        let otherwise = &first.children[1];
+        assert_eq!(otherwise.keyword, "if");
+        assert_eq!(asks(otherwise), [("if condition", "q".to_string())]);
+        let steps: Vec<&str> = otherwise
+            .children
+            .iter()
+            .map(|it| it.name.as_str())
+            .collect();
+        assert_eq!(steps, ["y : Step", "z : Step"]);
+    }
+
+    #[test]
     fn a_bare_loop_is_the_same_node_asking_nothing() {
         // `WhileLoopNode : WhileLoopActionUsage = ... ( 'while'
         // ExpressionParameterMember | 'loop' EmptyParameterMember ) ...`
@@ -5253,8 +5848,8 @@ mod behaviour_tests {
 
     #[test]
     fn a_boundary_drawn_on_its_own_still_says_what_it_relates_to() {
-        // the box the whole view is read inside used to be pushed after
-        // the compartments were worked out, so it alone went without them
+        // the box the whole view is read inside is pushed before the
+        // compartments are worked out, or it alone would go without them
         let diagram = internal(
             "part def Whole;\npart def Millis :> Whole { port p; }\n",
             "Millis",
@@ -5269,7 +5864,7 @@ mod behaviour_tests {
 
     #[test]
     fn the_internal_view_of_a_usage_shows_what_its_type_is_made_of() {
-        // `--internal vehicle` on a usage used to draw an empty page:
+        // `--internal vehicle` on a usage must not draw an empty page:
         // the usage owns no parts of its own, and only its type does
         let diagram = internal(
             "part def Wheel;\n\
@@ -5370,16 +5965,18 @@ mod behaviour_tests {
             Some("t1 accept pub : P [pub != null] / send action")
         );
 
-        // an untyped payload still names what the transition waits for
+        // a payload written as its type alone is the type it waits for:
+        // `PayloadFeature = ... | OwnedFeatureTyping OwnedMultiplicity?`
         let untyped = internal(
-            "state def S {\n\
+            "attribute def Pub;\n\
+             state def S {\n\
              \tstate a;\n\
              \tstate b;\n\
-             \ttransition first a accept pub then b;\n\
+             \ttransition first a accept Pub then b;\n\
              }\n",
             "S",
         );
-        assert_eq!(untyped.edges[0].label.as_deref(), Some("accept pub"));
+        assert_eq!(untyped.edges[0].label.as_deref(), Some("accept Pub"));
     }
 
     #[test]
@@ -5394,6 +5991,114 @@ mod behaviour_tests {
         );
         assert_eq!(diagram.edges.len(), 1);
         assert_eq!(diagram.edges[0].label, None);
+    }
+
+    /// What must not drop out of an internal view without a word: a step
+    /// written without a name, with every succession through it; the
+    /// `start` and `done` a flow begins and ends at; a state that handles
+    /// an event and stays; and a connection to the definition's own port.
+    #[test]
+    fn nothing_a_flow_or_a_wiring_runs_through_is_left_out() {
+        let edges = |diagram: &Diagram| {
+            let mut found: Vec<(String, String)> = diagram
+                .edges
+                .iter()
+                .map(|e| {
+                    let at = |n: usize| {
+                        let node = &diagram.nodes[n];
+                        match node.shape {
+                            Shape::Initial => "(start)".to_string(),
+                            Shape::Final => "(done)".to_string(),
+                            Shape::Diamond => "<>".to_string(),
+                            _ if node.name.is_empty() => format!("({})", node.keyword),
+                            _ => node.name.clone(),
+                        }
+                    };
+                    (at(e.from), at(e.to))
+                })
+                .collect();
+            found.sort();
+            found
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+
+        // `start` and `done` are the library's, so this one is read with it
+        let flow = {
+            let mut ws = sysml_semantics::Workspace::new();
+            ws.load_dir(&sysml_corpus::library()).unwrap();
+            ws.add_file(
+                "test.sysml",
+                "action def W {\n\
+             \tin x : ScalarValues::Integer;\n\
+             \tfirst start;\n\
+             \tthen action a;\n\
+             \tthen assign x := 1;\n\
+             \tthen decide;\n\
+             \t\tif x > 1 then b;\n\
+             \t\telse c;\n\
+             \taction b;\n\
+             \tthen done;\n\
+             \taction c;\n\
+             }\n",
+            );
+            ws.resolve_all();
+            let owner = ws
+                .named_elements()
+                .find(|(_, declared)| *declared == "W")
+                .map(|(id, _)| id)
+                .unwrap();
+            interconnection_diagram(ws.model(), owner)
+        };
+        assert_eq!(
+            edges(&flow),
+            [
+                pair("(assign)", "<>"),
+                pair("(start)", "a"),
+                pair("<>", "b"),
+                pair("<>", "c"),
+                pair("a", "(assign)"),
+                pair("b", "(done)"),
+            ]
+        );
+
+        let machine = internal(
+            "attribute def Sig;\n\
+             state def M {\n\
+             \tentry; then off;\n\
+             \tstate off;\n\
+             \ttransition stay first off accept Sig then off;\n\
+             }\n",
+            "M",
+        );
+        assert!(
+            machine
+                .edges
+                .iter()
+                .any(|e| e.from == e.to && e.relation == Relation::Transition),
+            "{:?}",
+            machine.edges
+        );
+
+        let wired = internal(
+            "port def P;\n\
+             part def A { port q : P; }\n\
+             part def Sys {\n\
+             \tport p : P;\n\
+             \tpart a : A;\n\
+             \tconnect p to a.q;\n\
+             }\n",
+            "Sys",
+        );
+        assert_eq!(edges(&wired), [pair("p : P", "a : A")]);
+        // a feature of the model's own called `done` is no end of the flow
+        let own = internal(
+            "action def W {\n\tattribute done;\n\taction a;\n\tthen done;\n}\n",
+            "W",
+        );
+        assert!(own.nodes.iter().all(|n| n.shape != Shape::Final));
+        // and a port nothing inside connects to is not drawn
+        let alone = internal("port def P;\npart def S { port p : P; part a; }\n", "S");
+        assert!(alone.nodes.iter().all(|n| n.name != "p : P"));
     }
 
     #[test]
@@ -5466,6 +6171,41 @@ mod behaviour_tests {
                 .collect::<Vec<_>>(),
             [(0, 1), (1, 2)]
         );
+
+        // the `then`s under a fork all leave the fork, and every branch
+        // under a decide leaves the decision (SysML 7.17.4/7.17.5): a
+        // succession is no occurrence, so the next one does not start
+        // where it arrived
+        let fanned = internal(
+            "action def Flow {\n\
+             \tin x : ScalarValues::Integer;\n\
+             \taction s;\n\
+             \tthen fork f;\n\
+             \t\tthen a;\n\
+             \t\tthen b;\n\
+             \taction a;\n\
+             \taction b;\n\
+             \tdecide d;\n\
+             \t\tif x > 1 then a;\n\
+             \t\tif x < 0 then c;\n\
+             \t\telse b;\n\
+             \taction c;\n\
+             }\n",
+            "Flow",
+        );
+        let at = |name: &str| fanned.nodes.iter().position(|n| n.name == name).unwrap();
+        let mut edges: Vec<(usize, usize)> = fanned.edges.iter().map(|e| (e.from, e.to)).collect();
+        edges.sort();
+        let mut expected = vec![
+            (at("s"), at("f")),
+            (at("f"), at("a")),
+            (at("f"), at("b")),
+            (at("d"), at("a")),
+            (at("d"), at("c")),
+            (at("d"), at("b")),
+        ];
+        expected.sort();
+        assert_eq!(edges, expected);
 
         // a succession into something that is not drawn has nowhere to go
         let nowhere = internal(
@@ -5582,6 +6322,325 @@ mod initial_tests {
         assert_eq!(
             interconnection_diagram(ws.model(), modes),
             Diagram::default()
+        );
+    }
+}
+
+#[cfg(test)]
+mod faithfulness_tests {
+    use super::*;
+    use crate::tests::resolved;
+
+    fn named(ws: &sysml_semantics::Workspace, name: &str) -> ElementId {
+        ws.named_elements()
+            .find(|(_, declared)| *declared == name)
+            .map(|(id, _)| id)
+            .unwrap()
+    }
+
+    fn drawn_lines(diagram: &Diagram, box_name: &str) -> Vec<String> {
+        let node = diagram
+            .nodes
+            .iter()
+            .find(|node| node.name == box_name)
+            .unwrap_or_else(|| panic!("no box `{box_name}` in {:?}", diagram.nodes));
+        lines(node).map(Feature::label).collect()
+    }
+
+    fn whole(source: &str) -> Diagram {
+        let ws = resolved(source);
+        definition_diagram(ws.model(), &[ws.root()])
+    }
+
+    fn internal(source: &str, name: &str) -> Diagram {
+        let ws = resolved(source);
+        interconnection_diagram(ws.model(), named(&ws, name))
+    }
+
+    #[test]
+    fn a_default_is_written_as_one_and_not_as_a_binding() {
+        let diagram = whole(
+            "part def A {\n\tattribute x default = 3;\n\tattribute y = 4;\n\
+             \tattribute z := 5;\n\tattribute w default := 6;\n}\n",
+        );
+        assert_eq!(
+            drawn_lines(&diagram, "A"),
+            [
+                "attribute x default = 3",
+                "attribute y = 4",
+                "attribute z := 5",
+                "attribute w default := 6"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_string_is_written_back_the_way_sysml_quotes_it() {
+        let diagram = whole("part def A {\n\tattribute s = \"s<&>\\\"q\\\"\";\n}\n");
+        assert_eq!(
+            drawn_lines(&diagram, "A"),
+            ["attribute s = \"s<&>\\\"q\\\"\""]
+        );
+        // and every escape KerML spells is spelled again
+        assert_eq!(quoted("\\\n\t\r\u{8}\u{c}x"), "\"\\\\\\n\\t\\r\\b\\fx\"");
+    }
+
+    #[test]
+    fn what_a_multiplicity_says_after_it_is_written_too() {
+        let diagram = whole(
+            "part def B;\npart def A {\n\tpart q : B[1..*] ordered nonunique;\n\tpart r : B ordered;\n}\n",
+        );
+        assert_eq!(
+            drawn_lines(&diagram, "A"),
+            ["part q : B[1..*] ordered nonunique", "part r : B ordered"]
+        );
+    }
+
+    #[test]
+    fn a_definition_keyword_carries_individual_and_variation() {
+        let diagram = whole(
+            "part def A;\nindividual part def Ind :> A;\n\
+             variation part def V { variant part v1 : A; }\nenum def E { red; }\n",
+        );
+        let keywords: Vec<(&str, &str)> = diagram
+            .nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.keyword.as_str()))
+            .collect();
+        assert_eq!(
+            keywords,
+            [
+                ("A", "part def"),
+                ("Ind", "individual part def"),
+                ("V", "variation part def"),
+                // an enumeration is a variation by definition, and is
+                // never written as one
+                ("E", "enum def"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parallel_state_says_it_is_one() {
+        let diagram = internal(
+            "state def M {\n\tstate busy parallel { state s1; state s2; }\n\tstate idle;\n}\n",
+            "M",
+        );
+        let names: Vec<&str> = diagram.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["busy \u{ab}parallel\u{bb}", "idle"]);
+        let diagram = whole("state def M parallel { state a; state b; }\n");
+        assert_eq!(diagram.nodes[0].name, "M \u{ab}parallel\u{bb}");
+    }
+
+    #[test]
+    fn a_supertype_named_twice_is_one_arrow() {
+        let diagram = whole("part def A;\npart def F :> A, A;\n");
+        assert_eq!(edges_of_kind(&diagram, Relation::Specialization), [(1, 0)]);
+    }
+
+    fn edges_of_kind(diagram: &Diagram, relation: Relation) -> Vec<(usize, usize)> {
+        diagram
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == relation)
+            .map(|edge| (edge.from, edge.to))
+            .collect()
+    }
+
+    #[test]
+    fn a_feature_of_several_types_names_and_joins_each() {
+        let diagram = whole("part def A { part p : B, C; }\npart def B;\npart def C;\n");
+        assert_eq!(drawn_lines(&diagram, "A"), ["part p : B, C"]);
+        assert_eq!(
+            edges_of_kind(&diagram, Relation::Composition),
+            [(0, 1), (0, 2)]
+        );
+    }
+
+    #[test]
+    fn a_definition_named_only_by_its_short_name_is_drawn() {
+        let diagram = whole("part def <S>;\npart def A { part s : S; }\n");
+        let names: Vec<&str> = diagram.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["S", "A"]);
+        assert_eq!(drawn_lines(&diagram, "A"), ["part s : S"]);
+    }
+
+    #[test]
+    fn a_port_definition_brings_no_conjugate_box_of_its_own() {
+        let diagram = whole("port def PD;\npart def H { port p : ~PD; }\n");
+        let names: Vec<&str> = diagram.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["PD", "H"]);
+        // a port typed by the conjugate is joined to what it conjugates
+        assert_eq!(edges_of_kind(&diagram, Relation::Reference), [(1, 0)]);
+    }
+
+    #[test]
+    fn a_definition_inside_another_is_joined_to_its_owner() {
+        let diagram = whole("part def A { part def Inner; }\npart def B;\n");
+        assert_eq!(edges_of_kind(&diagram, Relation::Membership), [(0, 1)]);
+        assert_eq!(Relation::Membership.name(), "membership");
+    }
+
+    #[test]
+    fn a_named_succession_writes_its_name_on_the_line() {
+        let diagram = internal(
+            "action def P {\n\taction a1;\n\taction a2;\n\tsuccession s first a1 then a2;\n}\n",
+            "P",
+        );
+        let labels: Vec<Option<&str>> = diagram
+            .edges
+            .iter()
+            .map(|edge| edge.label.as_deref())
+            .collect();
+        assert_eq!(labels, [Some("s")]);
+    }
+
+    #[test]
+    fn an_n_ary_dependency_names_the_ends_that_are_off_the_canvas() {
+        let ws = resolved(
+            "package P {\n\tpart def A;\n\tpart def B;\n\
+             \tdependency d1 from A, B to Q::X;\n\tdependency from Q::X to A, B;\n}\n\
+             package Q { part def X; }\n",
+        );
+        let diagram = definition_diagram(ws.model(), &[named(&ws, "P")]);
+        let dots: Vec<&str> = diagram
+            .nodes
+            .iter()
+            .filter(|node| node.shape == Shape::ConnectionDot)
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(dots, ["d1 to X", "from X"]);
+    }
+
+    #[test]
+    fn a_comment_about_something_off_the_canvas_is_not_put_on_its_owner() {
+        let diagram = whole(
+            "package N { part def A { comment about u /* about u */ comment /* of A */ }\n\
+             part u : A; }\n",
+        );
+        let notes: Vec<&str> = diagram
+            .nodes
+            .iter()
+            .filter(|node| node.shape == Shape::Note)
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(notes, ["of A"]);
+    }
+
+    #[test]
+    fn a_nested_part_is_drawn_as_its_nearest_redefinition_says() {
+        let source = "part def X;\npart def Y :> X;\n\
+             part def Base { part x : X; part k : X; }\n\
+             part def Sub :> Base { part :>> x : Y; part k2 :>> k : Y; }\n\
+             part def Top { part s : Sub; }\n";
+        let diagram = internal(source, "Top");
+        let nested: Vec<&str> = diagram.nodes[0]
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(nested, ["x : Y", "k2 : Y"]);
+        // and the view of the definition itself agrees: `k` is `k2`
+        let diagram = internal(source, "Sub");
+        let names: Vec<&str> = diagram.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["x : Y", "k2 : Y"]);
+    }
+
+    #[test]
+    fn a_subsetting_between_inherited_parts_is_drawn_in_the_subtype_too() {
+        // the subtype draws Car's `eng` and `big` as boxes of its own, and
+        // reading the relationships from what SportsCar owns alone left
+        // the two side by side as if unrelated
+        let source = "part def Car { part eng; part big :> eng; part other; }\n\
+             part def SportsCar :> Car { part more; }\n\
+             part def Tuned :> Car { part big2 :>> big; }\n";
+        for name in ["Car", "SportsCar", "Tuned"] {
+            let diagram = internal(source, name);
+            let drawn: Vec<(&str, &str)> = diagram
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == Relation::Subsetting)
+                .map(|edge| {
+                    (
+                        diagram.nodes[edge.from].name.as_str(),
+                        diagram.nodes[edge.to].name.as_str(),
+                    )
+                })
+                .collect();
+            // a redeclaration of `big` is the box that subsets `eng` now,
+            // and says so once
+            let big = if name == "Tuned" { "big2" } else { "big" };
+            assert_eq!(drawn, [(big, "eng")], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_connection_a_nested_part_inherits_reaches_the_parts_redeclared() {
+        // Base's connections are written in terms of Base's `a` and `c`,
+        // and the boxes drawn for `s : Sub` are Sub's redeclarations of
+        // them: without that, the connections are dropped for want of an end
+        let diagram = internal(
+            "part def Base { part a; part b; part c; connect a to b; connect b to c; }\n\
+             part def Sub :> Base { part redefines a; part c2 :>> c; }\n\
+             part def Top { part s : Sub; part t : Base; }\n",
+            "Top",
+        );
+        for node in &diagram.nodes {
+            let mut joined: Vec<(&str, &str)> = node
+                .links
+                .iter()
+                .map(|link| {
+                    (
+                        node.children[link.from].name.as_str(),
+                        node.children[link.to].name.as_str(),
+                    )
+                })
+                .collect();
+            joined.sort();
+            let expected = match node.name.as_str() {
+                "s : Sub" => [("a", "b"), ("b", "c2")],
+                _ => [("a", "b"), ("b", "c")],
+            };
+            assert_eq!(joined, expected, "{}", node.name);
+        }
+    }
+
+    #[test]
+    fn a_feature_redefined_under_another_name_is_listed_once() {
+        let diagram = internal(
+            "attribute def V;\npart def Base { attribute a : V; }\n\
+             part def Sub :> Base { attribute a2 :>> a; }\n\
+             part def Top { part s : Sub; }\n",
+            "Top",
+        );
+        assert_eq!(drawn_lines(&diagram, "s : Sub"), ["attribute a2 : V"]);
+    }
+
+    #[test]
+    fn a_trigger_says_what_it_waits_for_and_where() {
+        let diagram = internal(
+            "attribute def Go;\npart def Ctl;\n\
+             state def M {\n\tin ctl : Ctl;\n\tattribute n;\n\
+             \tentry; then idle;\n\tstate idle;\n\tstate busy;\n\
+             \ttransition t2 first busy accept after 5 then idle;\n\
+             \ttransition t3 first busy accept when n == 3 then idle;\n\
+             \ttransition t4 first idle accept g : Go via ctl then busy;\n\
+             \ttransition t5 first idle accept then busy;\n}\n",
+            "M",
+        );
+        let labels: Vec<&str> = diagram
+            .edges
+            .iter()
+            .filter_map(|edge| edge.label.as_deref())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "t2 accept after 5",
+                "t3 accept when n == 3",
+                "t4 accept g : Go via ctl",
+                "t5 accept"
+            ]
         );
     }
 }

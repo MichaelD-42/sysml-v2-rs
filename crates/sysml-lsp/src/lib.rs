@@ -37,6 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
@@ -50,10 +51,11 @@ use lsp_types::{
 };
 use sysml_model::ElementKind;
 use sysml_semantics::Workspace;
-use sysml_syntax::{TextRange, TextSize};
+use sysml_syntax::TextRange;
 
 mod files;
 mod line_index;
+pub mod wire;
 pub use files::Files;
 use line_index::LineIndex;
 
@@ -171,9 +173,9 @@ impl Session {
         // `Over`, which is where a failure leaves it anyway.
         let (phase, flow) = match std::mem::replace(&mut self.phase, Phase::Over) {
             Phase::Starting(files) => starting(files, message, out),
-            Phase::Greeting(server) => greeting(server, message),
+            Phase::Greeting(server) => greeting(server, message, out),
             Phase::Open(server) => open(server, message, out),
-            Phase::Closing => (Phase::Over, closing(message)),
+            Phase::Closing => closing(message, out),
             Phase::Over => (Phase::Over, Flow::Over(Ok(()))),
         };
         self.phase = phase;
@@ -245,11 +247,35 @@ fn starting(files: Files, message: Message, out: &mut Vec<Message>) -> (Phase, F
 
 /// Between `initialize` and `initialized`, where the specification lets
 /// nothing else through.
-fn greeting(server: Box<Server>, message: Message) -> (Phase, Flow) {
+fn greeting(server: Box<Server>, message: Message, out: &mut Vec<Message>) -> (Phase, Flow) {
     match message {
         Message::Notification(note)
             if note.method == lsp_types::notification::Initialized::METHOD =>
         {
+            // The project's files that no editor holds open are read from
+            // disk, and only a client watching them can say they changed:
+            // without that, a `git checkout` would leave this server
+            // answering about the files as they were, and a rename would
+            // write its edits at the old offsets into the new text. A client that can be asked
+            // to watch is asked, once it may be spoken to.
+            if server.watch_files {
+                out.push(Message::Request(lsp_server::Request {
+                    id: lsp_server::RequestId::from(WATCH_REGISTRATION.to_string()),
+                    method: lsp_types::request::RegisterCapability::METHOD.into(),
+                    params: serde_json::json!({
+                        "registrations": [{
+                            "id": WATCH_REGISTRATION,
+                            "method": lsp_types::notification::DidChangeWatchedFiles::METHOD,
+                            "registerOptions": {
+                                "watchers": [
+                                    { "globPattern": "**/*.sysml" },
+                                    { "globPattern": "**/*.kerml" },
+                                ],
+                            },
+                        }],
+                    }),
+                }));
+            }
             (Phase::Open(server), Flow::Go)
         }
         // `$/...` is the protocol's own traffic, which the
@@ -274,8 +300,40 @@ fn open(mut server: Box<Server>, message: Message, out: &mut Vec<Message>) -> (P
             out.push(Response::new_ok(req.id, ()).into());
             (Phase::Closing, Flow::Go)
         }
+        // `initialize` is said once a session: a second one is a request
+        // the session is in the wrong state for, not a method this
+        // server does not know, which is what answering it as any other
+        // request said
+        Message::Request(req) if req.method == lsp_types::request::Initialize::METHOD => {
+            out.push(
+                Response::new_err(
+                    req.id,
+                    lsp_server::ErrorCode::InvalidRequest as i32,
+                    "`initialize` was already answered in this session".to_string(),
+                )
+                .into(),
+            );
+            (Phase::Open(server), Flow::Go)
+        }
+        // A panic answering one question is that question's failure, not
+        // the session's: unwound to here, the editor is told this one
+        // went wrong and goes on being served, where a server that died
+        // would take every open document's diagnostics with it -- and a
+        // client stops restarting a server that keeps dying.
         Message::Request(req) => {
-            let response = server.handle_request(&req);
+            let answered = catch_unwind(AssertUnwindSafe(|| server.handle_request(&req)));
+            let response = answered.unwrap_or_else(|payload| {
+                server.forget_what_was_built();
+                Response::new_err(
+                    req.id.clone(),
+                    lsp_server::ErrorCode::InternalError as i32,
+                    format!(
+                        "`{}` failed inside the server: {}",
+                        req.method,
+                        panic_said(&*payload)
+                    ),
+                )
+            });
             out.push(Message::Response(response));
             (Phase::Open(server), Flow::Go)
         }
@@ -283,26 +341,58 @@ fn open(mut server: Box<Server>, message: Message, out: &mut Vec<Message>) -> (P
             Phase::Over,
             Flow::Over(Err("`exit` without a `shutdown` before it".into())),
         ),
+        // A notification has no answer to carry the failure, so it is
+        // logged; whatever it had already published stands.
         Message::Notification(note) => {
-            server.handle_notification(out, note);
+            let method = note.method.clone();
+            let taken = catch_unwind(AssertUnwindSafe(|| server.handle_notification(out, note)));
+            if let Err(payload) = taken {
+                server.forget_what_was_built();
+                log(
+                    out,
+                    &format!(
+                        "`{method}` failed inside the server: {}",
+                        panic_said(&*payload)
+                    ),
+                );
+            }
             (Phase::Open(server), Flow::Go)
         }
-        // this server asks the client nothing, so an answer is nothing
-        // it is waiting for
+        // the one thing this server asks the client is to watch the
+        // project's files, and nothing waits on the answer: a client that
+        // will not is one whose files are read as they were
         Message::Response(_) => (Phase::Open(server), Flow::Go),
     }
 }
 
 /// After `shutdown`, where `exit` is the message the specification names
-/// and no other is.
-fn closing(message: Message) -> Flow {
+/// as the end. Anything else is not a reason to end: the specification
+/// says a request after `shutdown` is answered with `InvalidRequest`, and
+/// a server that exited instead left the client waiting for an answer
+/// that never came, and then saw it fail with nothing said.
+fn closing(message: Message, out: &mut Vec<Message>) -> (Phase, Flow) {
     match message {
         Message::Notification(note) if note.method == lsp_types::notification::Exit::METHOD => {
-            Flow::Over(Ok(()))
+            (Phase::Over, Flow::Over(Ok(())))
         }
-        other => Flow::Over(Err(format!(
-            "expected `exit` after `shutdown`, got {other:?}"
-        ))),
+        Message::Request(req) => {
+            out.push(
+                Response::new_err(
+                    req.id,
+                    lsp_server::ErrorCode::InvalidRequest as i32,
+                    format!(
+                        "`{}` after `shutdown`: only `exit` may follow it",
+                        req.method
+                    ),
+                )
+                .into(),
+            );
+            (Phase::Closing, Flow::Go)
+        }
+        // a notification has no answer to carry a refusal, and one that
+        // was already on its way when the client asked to shut down is
+        // no reason to end any sooner
+        Message::Notification(_) | Message::Response(_) => (Phase::Closing, Flow::Go),
     }
 }
 
@@ -386,18 +476,41 @@ fn begin(mut files: Files, params: serde_json::Value) -> Result<Box<Server>, Str
         .collect();
 
     let mut server = Box::new(Server::new(files, library, &roots, &excluded));
+    // asked for after the handshake, where there are project files on disk
+    // to watch and the client says it can be asked to
+    server.watch_files = !roots.is_empty()
+        && init
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|it| it.did_change_watched_files)
+            .and_then(|it| it.dynamic_registration)
+            .unwrap_or(false);
     // How wide a line may be before formatting breaks it. Read once, as
     // the library path is: a client that changes it restarts the server,
     // which is what changing any of these takes.
-    if let Some(width) = init
+    //
+    // A settings file holds `"40"` as readily as `40`, and the one that
+    // is a string must not be dropped without a word; a width that is neither
+    // is said to be, where the client collects this server's log.
+    if let Some(said) = init
         .initialization_options
         .as_ref()
         .and_then(|o| o.get("formatWidth"))
-        .and_then(serde_json::Value::as_u64)
     {
-        server.layout = sysml_syntax::fmt::Layout {
-            width: width as usize,
-        };
+        let width = said
+            .as_u64()
+            .or_else(|| said.as_str().and_then(|it| it.trim().parse().ok()));
+        match width {
+            Some(width) => {
+                server.layout = sysml_syntax::fmt::Layout {
+                    width: width as usize,
+                }
+            }
+            None => server.complaints.push(format!(
+                "the format width is not read: {said} is not a number of columns"
+            )),
+        }
     }
     // How the preview is painted: the name of a skin, or one written
     // out. A skin that will not read leaves the drawing as it was and
@@ -435,6 +548,15 @@ fn handed_files(said: &serde_json::Value) -> Vec<(PathBuf, String)> {
 /// written there goes nowhere, so a library path that would not open was
 /// a setting that went wrong in silence. VSCode shows this in the
 /// channel it showed standard error in.
+/// What a panic said, where it said it in words.
+fn panic_said(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic that said nothing")
+}
+
 fn log(out: &mut Vec<Message>, said: &str) {
     let params = serde_json::json!({
         "type": lsp_types::MessageType::WARNING,
@@ -494,7 +616,12 @@ pub struct Server {
     layout: sysml_syntax::fmt::Layout,
     /// and what the preview is painted in
     skin: sysml_diagram::Skin,
+    /// whether to ask the client to watch the project's files
+    watch_files: bool,
 }
+
+/// The id the request to watch the project's files is registered under.
+const WATCH_REGISTRATION: &str = "sysml-watched-files";
 
 /// One analysis pass over the library + the project + all open documents.
 struct Analysis {
@@ -578,8 +705,8 @@ impl Server {
                     }
                 }
                 // only the first keystroke costs this: once the layer
-                // has been built without the file, it no longer holds a
-                // copy of it to be contradicted
+                // has been built without the file, it holds no copy of
+                // it to be contradicted
                 if self.contradicted(&uri) {
                     self.project = None;
                 }
@@ -600,14 +727,24 @@ impl Server {
                 let Some(params) = taken::<lsp_types::DidCloseTextDocumentParams>(note, out) else {
                     return;
                 };
+                // A buffer the project layer did not hold -- a new file,
+                // perhaps saved since, that the layer was built before --
+                // leaves a file on disk the layer has never read. Kept,
+                // `part a : B;` went on missing a `B` just saved and
+                // closed, until `a` itself was edited.
+                let unheld = self.outside_the_project(&params.text_document.uri);
                 self.docs.remove(&params.text_document.uri);
                 self.languages.remove(&params.text_document.uri);
                 self.published.remove(&params.text_document.uri);
                 // the buffer that spoke for the file is gone, so the
-                // file on disk speaks for it again
-                if self
-                    .file_of(&params.text_document.uri)
-                    .is_some_and(|path| self.substituted.contains(&path))
+                // file on disk speaks for it again; and a document that
+                // brought the files beside it in takes them away again,
+                // where they would otherwise be kept, and answered for,
+                // until restart
+                if unheld
+                    || self.file_of(&params.text_document.uri).is_some_and(|path| {
+                        self.substituted.contains(&path) || self.read_for_being_open(&path)
+                    })
                 {
                     self.project = None;
                 }
@@ -627,7 +764,7 @@ impl Server {
                 }));
                 // what the closed file said reached the others: a
                 // sibling that imported it was reading the buffer and
-                // now reads the file, and nothing else would tell it so
+                // reads the file instead, and nothing else would tell it so
                 self.publish_diagnostics(out, None);
             }
             // How the set the handshake brought changes afterwards: a
@@ -651,6 +788,8 @@ impl Server {
                     self.publish_diagnostics(out, None);
                 }
             }
+            #[cfg(test)]
+            "test/panic" => panic!("asked to"),
             _ => {}
         }
     }
@@ -659,9 +798,9 @@ impl Server {
     ///
     /// `changed` is the document the client has just told this server about,
     /// which is published either way: a client that waits to hear back about
-    /// the keystroke it sent has to hear something. Every keystroke in one
-    /// file used to republish every open file, and an editor takes each of
-    /// those apart and lays it out again.
+    /// the keystroke it sent has to hear something. Republishing every open
+    /// file on every keystroke in one would make an editor take each of
+    /// those apart and lay it out again.
     fn publish_diagnostics(&mut self, out: &mut Vec<Message>, changed: Option<&Url>) {
         let docs = self.docs.clone();
         let analysis = self.analysis();
@@ -688,9 +827,12 @@ impl Server {
                     DiagnosticSeverity::ERROR,
                     &(|what: &str| what.to_string()) as &dyn Fn(&str) -> String,
                 ),
+                // an error, as `sysml check` counts it: a name that
+                // reaches nothing fails the build there, and shown as a
+                // warning here it let a model look fine until CI said not
                 (
                     &found.names,
-                    DiagnosticSeverity::WARNING,
+                    DiagnosticSeverity::ERROR,
                     &(|what: &str| format!("unresolved reference `{what}`"))
                         as &dyn Fn(&str) -> String,
                 ),
@@ -729,12 +871,47 @@ impl Server {
                     .ws
                     .element_place(violation.element)
                     .unwrap_or_default();
+                // The other declaration a violation is about -- the first
+                // of a name declared twice -- said in the message, since not
+                // every client shows related information, and as that too.
+                // The two are memberships of one namespace, so the first is
+                // in this document as the repeat is.
+                let first = violation
+                    .also
+                    .and_then(|it| analysis.ws.element_place(it))
+                    .filter(|&(at, _)| at == file)
+                    .map(|(_, range)| index.range(text, range));
+                let mut message = violation
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| violation.says.to_string());
+                if let Some(range) = first {
+                    message.push_str(&format!(
+                        " (first declared on line {})",
+                        range.start.line + 1
+                    ));
+                }
                 diagnostics.push(Diagnostic {
                     range: index.range(text, range),
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    // a certain one is an error, as `sysml check` counts
+                    // every one; the rest are warnings while the model they
+                    // are asked of is only as right as this toolchain builds it
+                    severity: Some(match violation.certain() {
+                        true => DiagnosticSeverity::ERROR,
+                        false => DiagnosticSeverity::WARNING,
+                    }),
                     source: Some("sysml".into()),
                     code: Some(NumberOrString::String(violation.rule.into())),
-                    message: violation.says.into(),
+                    message,
+                    related_information: first.map(|range| {
+                        vec![lsp_types::DiagnosticRelatedInformation {
+                            location: lsp_types::Location {
+                                uri: url.clone(),
+                                range,
+                            },
+                            message: "first declared here".into(),
+                        }]
+                    }),
                     ..Default::default()
                 });
             }
@@ -757,6 +934,18 @@ impl Server {
                 params,
             }));
         }
+    }
+
+    /// Drop the layers built from the documents, so that the next
+    /// question builds them again.
+    ///
+    /// After a panic, what was half-way through being built -- a file
+    /// list scanned for a project not yet resolved -- is not something
+    /// to answer from. The documents themselves are what the client
+    /// sent, and stay.
+    fn forget_what_was_built(&mut self) {
+        self.project = None;
+        self.analysis = None;
     }
 
     fn handle_request(&mut self, req: &Request) -> Response {
@@ -842,7 +1031,7 @@ impl Server {
             }
             Formatting::METHOD => {
                 let params = asked!(lsp_types::DocumentFormattingParams);
-                ok_response(id, self.format(&params.text_document.uri))
+                ok_response(id, self.format(&params.text_document.uri, &params.options))
             }
             CodeActionRequest::METHOD => {
                 let params = asked!(lsp_types::CodeActionParams);
@@ -858,6 +1047,10 @@ impl Server {
                 let params = asked!(DiagramParams);
                 ok_response(id, self.diagram(&params))
             }
+            // what the tests below make fail, since nothing real is
+            // known to
+            #[cfg(test)]
+            "test/panic" => panic!("asked to"),
             _ => Response::new_err(
                 id,
                 lsp_server::ErrorCode::MethodNotFound as i32,
@@ -865,22 +1058,6 @@ impl Server {
             ),
         }
     }
-}
-
-/// Where inside a recorded range the name being renamed is written.
-///
-/// What was recorded is not always the name alone. A mention can be a
-/// feature chain -- `system.sub1`, ending on the step that names what is
-/// being renamed -- and a declaration whose tree holds no name node of its
-/// own is recorded as the whole of it: `then fork F { ... }`, which the
-/// new name would replace, body and all.
-fn name_token(ws: &Workspace, file: usize, range: TextRange, name: &str) -> Option<TextRange> {
-    let syntax = ws.file_parse(file).syntax();
-    let first = syntax.token_at_offset(range.start()).right_biased();
-    std::iter::successors(first, sysml_syntax::SyntaxToken::next_token)
-        .take_while(|token| range.contains_range(token.text_range()))
-        .find(|token| sysml_syntax::unquote(token.text()) == name)
-        .map(|token| token.text_range())
 }
 
 /// The element an `internal` view is asked for, by the name a reader
@@ -954,46 +1131,31 @@ struct DiagramResult {
 }
 
 /// Apply one LSP content change (ranged or whole-document) to `text`.
-fn apply_change(text: &mut String, change: lsp_types::TextDocumentContentChangeEvent) {
-    match change.range {
-        Some(range) => {
-            let index = LineIndex::new(text);
-            let (Some(start), Some(end)) = (
-                index.offset(text, range.start),
-                index.offset(text, range.end),
-            ) else {
-                *text = change.text;
-                return;
-            };
-            let (start, end) = (usize::from(start), usize::from(end));
-            if start <= end && end <= text.len() {
-                text.replace_range(start..end, &change.text);
-            } else {
-                *text = change.text;
-            }
-        }
-        None => *text = change.text,
+/// A name as a symbol list shows it: as it is, but `part def '';` as the
+/// `''` it was written as -- a client refuses a symbol named nothing, and
+/// VS Code drops the whole answer over one.
+pub(crate) fn shown_name(name: &str) -> String {
+    if name.is_empty() {
+        sysml_syntax::quote(name)
+    } else {
+        name.to_string()
     }
 }
 
-/// Whether the name written at `at` in `file` is looked up in the scope
-/// that surrounds it.
-///
-/// A segment that follows `::` or `.` is looked up inside whatever the
-/// segment before it named, so nothing about the scope it is written in
-/// decides where it lands.
-fn looked_up_in_place(ws: &Workspace, file: usize, at: TextSize) -> bool {
-    let syntax = ws.file_parse(file).syntax();
-    let mut token = syntax.token_at_offset(at).left_biased();
-    while token.as_ref().is_some_and(|t| t.kind().is_trivia()) {
-        token = token.and_then(|t| t.prev_token());
-    }
-    !token.is_some_and(|t| {
-        matches!(
-            t.kind(),
-            sysml_syntax::SyntaxKind::COLON_COLON | sysml_syntax::SyntaxKind::DOT
-        )
-    })
+fn apply_change(text: &mut String, change: lsp_types::TextDocumentContentChangeEvent) {
+    let Some(range) = change.range else {
+        *text = change.text;
+        return;
+    };
+    // A position past the last line is the end of the document, and a
+    // range written back to front is the same range, as the reference
+    // `TextDocument` reads both. Taken as a whole-document change
+    // instead, one edit that landed past the end left the buffer
+    // holding nothing but the text that edit inserted.
+    let index = LineIndex::new(text);
+    let at = |position| index.offset(text, position).map_or(text.len(), usize::from);
+    let (start, end) = (at(range.start), at(range.end));
+    text.replace_range(start.min(end)..start.max(end), &change.text);
 }
 
 /// How an editor should picture an element, in the two vocabularies it
@@ -1019,19 +1181,64 @@ fn symbol_for(
     text: &str,
     index: &LineIndex,
 ) -> Option<DocumentSymbol> {
+    symbol_within(ws, elem, text, index).map(|(symbol, _)| symbol)
+}
+
+/// [`symbol_for`], with the range it ends up covering.
+///
+/// An element's own range and the ranges of what it owns are each where
+/// the parser saw them, and they need not nest: for `end [1] port a : P;`
+/// the cross feature the end owns was given more of the line than the
+/// end itself. A client draws the outline, and matches the cursor to it,
+/// by containment, so an element's range is widened to cover what is
+/// listed under it -- all of it is written in the one declaration.
+fn symbol_within(
+    ws: &Workspace,
+    elem: sysml_model::ElementId,
+    text: &str,
+    index: &LineIndex,
+) -> Option<(DocumentSymbol, TextRange)> {
     let model = ws.model();
-    let name = model.name(elem)?.to_string();
-    let (full, name_range) = ws.element_ranges(elem)?;
+    let (mut full, name_range) = ws.element_ranges(elem)?;
+    full = full.cover(name_range);
     let children: Vec<DocumentSymbol> = model
         .owned(elem)
         .iter()
-        .filter_map(|c| symbol_for(ws, *c, text, index))
+        .filter_map(|c| symbol_within(ws, *c, text, index))
+        .map(|(child, covered)| {
+            full = full.cover(covered);
+            child
+        })
         .collect();
+    // An element declared without a name is still somewhere a reader
+    // goes: `part :>> wheel { part hub; }`, a `perform action { ... }`,
+    // a transition. Left out, it took every named thing inside it along.
+    // What stands in for its name is the one it goes by -- its short
+    // name, or the one it borrows from what it redefines -- and failing
+    // both, a word saying it has none. What is no declaration of its own
+    // -- an expression, a comment, an import -- stays out unless
+    // something listed is inside it.
+    let kind = model.kind(elem);
+    let name = match model.name(elem) {
+        Some(name) => shown_name(name),
+        None => {
+            let declared = kind.is_a(ElementKind::Usage)
+                || (kind.is_a(ElementKind::Type) && !kind.is_a(ElementKind::Expression));
+            if !declared && children.is_empty() {
+                return None;
+            }
+            match (model.effective_short_name(elem), model.effective_name(elem)) {
+                (Some(short), _) => format!("<{short}>"),
+                (None, Some(borrowed)) => shown_name(borrowed),
+                (None, None) => "(unnamed)".to_string(),
+            }
+        }
+    };
     #[allow(deprecated)]
-    Some(DocumentSymbol {
+    let symbol = DocumentSymbol {
         name,
-        detail: Some(model.kind(elem).name().to_string()),
-        kind: pictured(model.kind(elem)).1,
+        detail: Some(kind.name().to_string()),
+        kind: pictured(kind).1,
         tags: None,
         deprecated: None,
         range: index.range(text, full),
@@ -1041,7 +1248,8 @@ fn symbol_for(
         } else {
             Some(children)
         },
-    })
+    };
+    Some((symbol, full))
 }
 
 fn ok_response<T: serde::Serialize>(id: RequestId, value: Option<T>) -> Response {
@@ -1064,6 +1272,37 @@ fn error_response(id: RequestId, err: impl std::fmt::Display) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_symbol_is_never_named_nothing() {
+        assert_eq!(shown_name(""), "''");
+        assert_eq!(shown_name("Wheel Unit"), "Wheel Unit");
+    }
+
+    #[test]
+    fn an_edit_past_the_end_lands_at_the_end_rather_than_replacing_everything() {
+        let edit = |text: &str, from: (u32, u32), to: (u32, u32), with: &str| {
+            let mut text = text.to_string();
+            apply_change(
+                &mut text,
+                lsp_types::TextDocumentContentChangeEvent {
+                    range: Some(lsp_types::Range::new(
+                        lsp_types::Position::new(from.0, from.1),
+                        lsp_types::Position::new(to.0, to.1),
+                    )),
+                    range_length: None,
+                    text: with.to_string(),
+                },
+            );
+            text
+        };
+        let text = "part a;\npart b;\n";
+        assert_eq!(edit(text, (5, 0), (5, 0), "!!"), "part a;\npart b;\n!!");
+        assert_eq!(edit(text, (1, 0), (9, 0), ""), "part a;\n");
+        // back to front is the same range
+        assert_eq!(edit(text, (0, 6), (0, 5), "X"), "part X;\npart b;\n");
+        assert_eq!(edit(text, (0, 5), (0, 6), "c"), "part c;\npart b;\n");
+    }
 
     /// The sequence the specification describes, and what a message
     /// that does not belong to the phase it arrives in does.
@@ -1106,6 +1345,57 @@ mod tests {
         session.handle(request(1, "initialize", params), out);
         session.handle(notification("initialized"), out);
         out.clear();
+    }
+
+    /// A client that can be asked to watch the project's files is asked,
+    /// once the handshake lets the server speak; one that cannot, or that
+    /// has no folder open, is not. Unwatched, a file changed on disk would be
+    /// answered about as it was before the change, and a rename would write its edits at
+    /// the old offsets.
+    #[test]
+    fn a_client_that_can_watch_files_is_asked_to() {
+        let ask = |capabilities: serde_json::Value, root: Option<&str>| {
+            let (mut session, mut out) = waiting();
+            let mut params = serde_json::json!({
+                "capabilities": capabilities,
+                "initializationOptions": { "noLibrary": true },
+            });
+            if let Some(root) = root {
+                params["rootUri"] = root.into();
+            }
+            session.handle(request(1, "initialize", params), &mut out);
+            out.clear();
+            session.handle(notification("initialized"), &mut out);
+            let asked = said(&out)
+                .into_iter()
+                .filter(|it| it["method"] == "client/registerCapability")
+                .collect::<Vec<_>>();
+            // the client's answer is nothing the session waits on
+            let flow = session.handle(
+                Message::Response(Response::new_ok(
+                    RequestId::from(WATCH_REGISTRATION.to_string()),
+                    serde_json::Value::Null,
+                )),
+                &mut out,
+            );
+            assert!(matches!(flow, Flow::Go), "{flow:?}");
+            asked
+        };
+        let can = serde_json::json!({
+            "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } },
+        });
+        let asked = ask(can.clone(), Some("file:///project"));
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let registration = &asked[0]["params"]["registrations"][0];
+        assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+        assert_eq!(
+            registration["registerOptions"]["watchers"][0]["globPattern"],
+            "**/*.sysml"
+        );
+        // no folder, nothing on disk to watch
+        assert!(ask(can, None).is_empty());
+        // a client that cannot be asked is not
+        assert!(ask(serde_json::json!({}), Some("file:///project")).is_empty());
     }
 
     #[test]
@@ -1183,15 +1473,54 @@ mod tests {
     }
 
     #[test]
-    fn nothing_but_exit_follows_a_shutdown() {
+    fn only_exit_ends_a_session_after_shutdown() {
         let (mut session, mut out) = waiting();
         started(&mut session, &mut out);
         assert!(matches!(
             session.handle(request(2, "shutdown", serde_json::Value::Null), &mut out),
             Flow::Go
         ));
-        let flow = session.handle(notification("initialized"), &mut out);
-        assert!(matches!(flow, Flow::Over(Err(_))), "{flow:?}");
+        // a request after `shutdown` is refused as the specification
+        // says, with `InvalidRequest`, and the session waits on for
+        // `exit`; it must not end there, unanswered and failed
+        out.clear();
+        let flow = session.handle(
+            request(3, "textDocument/hover", serde_json::json!({})),
+            &mut out,
+        );
+        assert!(matches!(flow, Flow::Go), "{flow:?}");
+        let answers = said(&out);
+        assert_eq!(answers[0]["id"], 3, "{answers:?}");
+        assert_eq!(
+            answers[0]["error"]["code"],
+            lsp_server::ErrorCode::InvalidRequest as i32,
+            "{answers:?}"
+        );
+        // a notification is no reason to end either
+        assert!(matches!(
+            session.handle(notification("initialized"), &mut out),
+            Flow::Go
+        ));
+        assert!(!session.over());
+        let flow = session.handle(notification("exit"), &mut out);
+        assert!(matches!(flow, Flow::Over(Ok(()))), "{flow:?}");
+    }
+
+    #[test]
+    fn a_second_initialize_is_an_invalid_request() {
+        let (mut session, mut out) = waiting();
+        started(&mut session, &mut out);
+        out.clear();
+        let params = serde_json::json!({ "capabilities": {} });
+        let flow = session.handle(request(9, "initialize", params), &mut out);
+        assert!(matches!(flow, Flow::Go), "{flow:?}");
+        let answers = said(&out);
+        // it was answered as an unknown method, -32601
+        assert_eq!(
+            answers[0]["error"]["code"],
+            lsp_server::ErrorCode::InvalidRequest as i32,
+            "{answers:?}"
+        );
     }
 
     /// The project is what the client hands over, and it may change
@@ -1306,5 +1635,65 @@ mod tests {
         let flow = session.handle(notification("textDocument/didSave"), &mut out);
         assert!(matches!(flow, Flow::Over(Ok(()))), "{flow:?}");
         assert!(out.is_empty());
+    }
+
+    /// A question the server panics answering is answered with an error,
+    /// and the next one is answered as if nothing had happened.
+    #[test]
+    fn a_panic_answering_a_question_fails_that_question_alone() {
+        let (mut session, mut out) = waiting();
+        started(&mut session, &mut out);
+        let uri = "file:///p/a.sysml";
+        let opened = Message::Notification(Notification {
+            method: "textDocument/didOpen".into(),
+            params: serde_json::json!({ "textDocument": {
+                "uri": uri, "languageId": "sysml", "version": 1,
+                "text": "part def Engine;",
+            }}),
+        });
+        session.handle(opened, &mut out);
+        out.clear();
+
+        let flow = session.handle(request(2, "test/panic", serde_json::Value::Null), &mut out);
+        assert!(matches!(flow, Flow::Go), "{flow:?}");
+        let answer = &said(&out)[0];
+        assert_eq!(answer["id"], 2);
+        assert_eq!(
+            answer["error"]["code"],
+            lsp_server::ErrorCode::InternalError as i32
+        );
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("test/panic") && message.contains("asked to"),
+            "{message}"
+        );
+        out.clear();
+
+        let symbols = serde_json::json!({ "textDocument": { "uri": uri } });
+        session.handle(request(3, "textDocument/documentSymbol", symbols), &mut out);
+        let answer = &said(&out)[0];
+        assert_eq!(answer["id"], 3);
+        assert_eq!(answer["result"][0]["name"], "Engine", "{answer}");
+    }
+
+    /// A notification the server panics taking in has no answer to fail,
+    /// so the client is told in the log, and the session goes on.
+    #[test]
+    fn a_panic_taking_a_notification_in_is_logged_and_survived() {
+        let (mut session, mut out) = waiting();
+        started(&mut session, &mut out);
+        let flow = session.handle(notification("test/panic"), &mut out);
+        assert!(matches!(flow, Flow::Go), "{flow:?}");
+        let logged = &said(&out)[0];
+        assert_eq!(logged["method"], "window/logMessage");
+        let message = logged["params"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("test/panic") && message.contains("asked to"),
+            "{message}"
+        );
+        out.clear();
+
+        session.handle(request(2, "shutdown", serde_json::Value::Null), &mut out);
+        assert_eq!(said(&out)[0]["id"], 2);
     }
 }

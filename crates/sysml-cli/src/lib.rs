@@ -6,10 +6,11 @@
 //! `sysml-semantics`. A library as well as a subcommand, so its tests can
 //! drive it directly.
 
+pub mod api;
 pub mod mcp;
 pub mod notation;
-pub mod plan;
 pub mod report;
+pub mod textual;
 
 /// A finding with its place in the text: where it starts and where it
 /// ends, as the byte offset the model sees and as the line and column an
@@ -35,8 +36,8 @@ pub fn at(
     map.insert("offset".into(), offset.into());
     map.insert("line".into(), line.into());
     map.insert("column".into(), column.into());
-    map.insert("endOffset".into(), end.into());
-    map.insert("endLine".into(), end_line.into());
-    map.insert("endColumn".into(), end_column.into());
+    map.insert("end_offset".into(), end.into());
+    map.insert("end_line".into(), end_line.into());
+    map.insert("end_column".into(), end_column.into());
     value
 }

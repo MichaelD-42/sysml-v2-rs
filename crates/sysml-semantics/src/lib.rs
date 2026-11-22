@@ -38,6 +38,7 @@
 //! | --- | --- |
 //! | `resolve` | What gets resolved, in what order, and what is cleared first |
 //! | `lookup` | Working a written name out to the element it names |
+//! | `navigate` | Where an element is named, and what renaming it rewrites |
 //! | `inherit` | What a type reaches through what it specializes |
 //! | `imports` | What an `import` brings in, and what an `alias` stands for |
 //! | `reify` | Turning a resolved name into the relationship the model keeps |
@@ -55,6 +56,7 @@ mod implied;
 mod imports;
 mod inherit;
 mod lookup;
+mod navigate;
 mod ocl;
 mod reify;
 mod resolve;
@@ -63,6 +65,7 @@ mod resolve;
 pub mod rules;
 mod syntax;
 
+pub use navigate::{is_one_name, refuse_name, RenameEdit, Renaming};
 use syntax::*;
 
 use std::collections::{HashMap, HashSet};
@@ -76,6 +79,13 @@ use sysml_syntax::{parse_dialect, Dialect, Parse, SyntaxKind, SyntaxNode, TextRa
 /// take the stack down with it, so it is told its name resolves to
 /// nothing instead. The parser bounds its own nesting the same way.
 pub(crate) const MAX_INHERITANCE: usize = 512;
+
+/// How many aliases deep one alias is worked out through the aliases it
+/// names before the deepest is set aside and worked out first, on a
+/// stack of its own. A chain written front to back -- `alias A0 for A1;
+/// ... alias A999 for X;` -- otherwise nests a lookup per link, and past
+/// [`MAX_INHERITANCE`] every link but the last few hundred named nothing.
+pub(crate) const MAX_ALIAS_NESTING: usize = 64;
 
 /// Whether a resolution pass replaces what was found about the files it
 /// touches, or adds to it.
@@ -94,6 +104,10 @@ pub struct Unresolved {
     pub range: TextRange,
     /// The name, as it was written.
     pub name: String,
+    /// What the name does reach, and what it had to be: `part def B :>
+    /// a;` reaches the part `a` where a classifier is wanted. Such a name
+    /// is no missing import and no misspelling, and is not said to be.
+    pub wrong_kind: Option<(ElementId, ElementKind)>,
 }
 
 /// A successfully resolved reference (for go-to-definition etc.).
@@ -160,6 +174,50 @@ pub struct Finding {
     pub what: String,
 }
 
+/// The qualifier written straight before `offset` and whatever part of a
+/// name is being typed after it: `P::Inner::` and `P::Inner::De` both
+/// give `[P, Inner]`, and `a.b.` gives `[a, b]` read through a feature.
+/// `None` where the cursor follows no `::` or `.`.
+fn qualifier_before(text: &str, offset: usize) -> Option<(Vec<String>, bool)> {
+    let text = text.get(..offset)?;
+    let named = |c: char| c.is_alphanumeric() || c == '_';
+    // the part of a name already typed
+    let mut end = text.trim_end_matches(named).len();
+    let mut segments = Vec::new();
+    let mut through_a_feature = false;
+    loop {
+        let before = &text[..end];
+        let separator = if before.ends_with("::") {
+            2
+        } else if before.ends_with('.') && !before.ends_with("..") {
+            if segments.is_empty() {
+                through_a_feature = true;
+            }
+            1
+        } else {
+            break;
+        };
+        let before = &before[..before.len() - separator];
+        // `'Wheel Unit'::` names its segment in quotes
+        let (segment, start) = match before.strip_suffix('\'') {
+            Some(inside) => {
+                let opened = inside.rfind('\'')?;
+                (inside[opened + 1..].to_string(), opened)
+            }
+            None => {
+                let start = before.trim_end_matches(named).len();
+                (before[start..].to_string(), start)
+            }
+        };
+        if segment.is_empty() {
+            return None;
+        }
+        segments.insert(0, segment);
+        end = start;
+    }
+    (!segments.is_empty()).then_some((segments, through_a_feature))
+}
+
 /// What a name that resolved to nothing might have meant.
 ///
 /// See [`Workspace::suggestions`], which is where the two halves are
@@ -177,8 +235,9 @@ pub struct Suggestion {
 
 /// How a connector end reached what it relates.
 enum Reached {
-    /// the name the statement wrote
-    Written(Vec<String>, Vec<usize>),
+    /// the name the statement wrote, and the cross multiplicity the
+    /// builder stood up from the `[n]` written before it
+    Written(Vec<String>, Vec<usize>, Option<ElementId>),
     /// the neighbour standing in for an end the statement left unwritten
     Beside(ElementId),
 }
@@ -207,12 +266,12 @@ struct File {
     /// Every element built from the file, in the order the model holds
     /// them. A question about a position is a question about one file,
     /// and answering it by walking the whole model walks the standard
-    /// library -- forty thousand elements -- per keystroke.
+    /// library -- a great many elements -- per keystroke.
     elements: Vec<ElementId>,
 }
 
 /// How a namespace's members are being accessed during lookup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Access {
     /// From inside the namespace (or a nested scope): everything visible.
     Internal,
@@ -336,10 +395,26 @@ pub struct Workspace {
     /// than the truth. The other guards settle for an incomplete answer
     /// and cache it, so what they return is at least the same every time.
     blocked: u64,
+    /// How many aliases are being worked out, one inside the other:
+    /// `alias A0 for A1; alias A1 for A2; ...` resolves `A1` while
+    /// resolving `A0`. See [`MAX_ALIAS_NESTING`].
+    alias_nesting: usize,
+    /// The alias the nesting bound turned away first, for the outermost
+    /// alias to work out on its own before trying again.
+    deferred_alias: Option<ElementId>,
+    /// The aliases that were being worked out when that one was set
+    /// aside, each waiting on the next.
+    deferred_waiting: Vec<ElementId>,
     /// How deep the walk through inherited members is. Nothing else
     /// bounds it: what a namespace specializes is written in the
-    /// model, and the model can say it thousands of times over.
+    /// model, and the model can say it very many times over.
     walking: usize,
+    /// The import filter conditions being evaluated, from the outermost
+    /// in. A condition names something -- `@Safety` -- and finding that
+    /// name can lead back through the very import the condition filters,
+    /// to ask the same condition again. Each lookup starts a cycle guard
+    /// of its own, so nothing else notices.
+    filtering: Vec<SyntaxNode>,
     /// What was worked out while that count moved: an import or an
     /// alias that failed, a supertype list that came out short. The
     /// answer is remembered while the outermost lookup runs -- ten
@@ -362,6 +437,10 @@ pub struct Workspace {
     /// drawn while this moved rests on a name that was not there, and
     /// a file added afterwards may be the file that name lives in.
     misses: u64,
+    /// What the last outermost lookup found and threw away for being the
+    /// wrong kind of thing, with the kind it had to be: handed to the
+    /// miss recorded next, which is that lookup's.
+    wrong_kind: Option<(ElementId, ElementKind)>,
     /// The elements whose cached supertypes or semantic bases were
     /// worked out while a name was missing, and so are only as
     /// complete as the workspace was at the time.
@@ -378,7 +457,7 @@ pub struct Workspace {
     /// Members of a namespace by the names they answer to, in the
     /// order a lookup would have walked them. Searching the list itself
     /// costs a scan of every member of the namespace per lookup, which
-    /// on a package of ten thousand parts is what makes a project take
+    /// on a package of very many parts is what makes a project take
     /// minutes to open rather than seconds.
     members: HashMap<ElementId, HashMap<String, Vec<ElementId>>>,
     /// What the pass under way has already reified, so that a second
@@ -419,11 +498,16 @@ impl Clone for Workspace {
             resolving: Vec::new(),
             blocked: 0,
             walking: 0,
+            alias_nesting: 0,
+            deferred_alias: None,
+            deferred_waiting: Vec::new(),
+            filtering: Vec::new(),
             provisional: HashSet::new(),
             lookups: self.lookups,
             chain: Vec::new(),
             depth: 0,
             misses: self.misses,
+            wrong_kind: None,
             incomplete: self.incomplete.clone(),
             origin: self.root,
             imports: self.imports.clone(),
@@ -465,11 +549,16 @@ impl Workspace {
             resolving: Vec::new(),
             blocked: 0,
             walking: 0,
+            alias_nesting: 0,
+            deferred_alias: None,
+            deferred_waiting: Vec::new(),
+            filtering: Vec::new(),
             provisional: HashSet::new(),
             lookups: 0,
             chain: Vec::new(),
             depth: 0,
             misses: 0,
+            wrong_kind: None,
             incomplete: HashSet::new(),
             origin: root,
             imports: HashMap::new(),
@@ -591,9 +680,9 @@ impl Workspace {
     /// the two kinds a reader wants apart.
     ///
     /// Three front ends ask this -- the command line, the language
-    /// server and the MCP server -- and they used to work it out for
-    /// themselves. One of them forgot the syntax half, so `sysml check`
-    /// reported a file that does not parse as sound. Whether to go on to
+    /// server and the MCP server -- and working it out separately lets one
+    /// forget the syntax half, so `sysml check` would report a file that
+    /// does not parse as sound. Whether to go on to
     /// the names when the syntax is broken is a judgement each of them
     /// makes: an editor shows both while you type, a batch check stops.
     /// What must not differ is what there is to show.
@@ -712,17 +801,23 @@ impl Workspace {
     pub fn named_after(&self, elem: ElementId) -> Vec<ElementId> {
         // Who borrows a name from whom, over the whole model, once.
         //
-        // This used to be asked one step at a time, and each step was a
-        // scan of every element there is: with the standard library
-        // loaded that is a millisecond and a quarter apiece, so a
-        // feature sixty redefinitions deep cost seventy-five
-        // milliseconds -- in the rename an editor is waiting on, and
+        // Asking this one step at a time would make each step a scan of
+        // every element there is: with the standard library loaded that
+        // is costly apiece, so a feature many redefinitions deep would
+        // cost far more -- in the rename an editor is waiting on, and
         // growing with the model rather than with the answer.
         let mut borrowers: HashMap<ElementId, Vec<ElementId>> = HashMap::new();
         for heir in self.model.ids() {
             // one that named itself is its own name from here on
             if self.model.get(heir, "declaredName").is_some() {
                 continue;
+            }
+            // a feature chain answers to the last feature it runs through,
+            // so `perform a.b;` -- which references the chain -- is a `b`
+            if let Some(Value::RefList(chain)) = self.model.maybe(heir, "chainingFeature") {
+                if let Some(&last) = chain.last() {
+                    borrowers.entry(last).or_default().push(heir);
+                }
             }
             // Asked of the redefining side, which owns the relationship:
             // that way there is no side of it to be missing.
@@ -770,18 +865,27 @@ impl Workspace {
         self.references.iter().filter(move |r| r.target == target)
     }
 
-    /// The element whose declared-name range covers `offset` in `file`
-    /// (for rename/find-references started on a declaration).
+    /// The element whose declared name or short name covers `offset` in
+    /// `file` (for rename/find-references started on a declaration).
+    ///
+    /// The short name counts: `part def <W> Wheel;` is asked about at its
+    /// `W` as readily as at its `Wheel`, and answering nothing there left
+    /// find-references and rename with nothing to say.
     pub fn definition_at(&self, file: usize, offset: sysml_syntax::TextSize) -> Option<ElementId> {
         self.elements_of(file)
             .iter()
             .copied()
             .filter_map(|id| {
                 let node = self.source.get(&id)?;
-                let name = node.children().find(|c| c.kind() == SyntaxKind::NAME)?;
-                name.text_range()
-                    .contains_inclusive(offset)
-                    .then_some((id, name.text_range().len()))
+                let name = node
+                    .children()
+                    .find(|c| c.kind() == SyntaxKind::NAME)
+                    .map(|name| name.text_range());
+                [name, self.short_name_range(id)]
+                    .into_iter()
+                    .flatten()
+                    .find(|range| range.contains_inclusive(offset))
+                    .map(|range| (id, range.len()))
             })
             .min_by_key(|(_, len)| u32::from(*len))
             .map(|(id, _)| id)
@@ -902,7 +1006,7 @@ impl Workspace {
     /// with. Names that tie keep the order the model holds them in.
     ///
     /// The language server's symbol search and the MCP server's library search
-    /// are both this; they used to sort differently, and only one put an exact
+    /// are both this, so that they sort alike and put an exact
     /// match first.
     pub fn search_names(&self, query: &str, limit: usize) -> Vec<ElementId> {
         let needle = query.to_lowercase();
@@ -979,14 +1083,24 @@ impl Workspace {
     /// `TemperatureValue` misremembered.
     ///
     /// Asked for several names at once because the walk over every declared
-    /// name is what costs: sixty thousand with the library loaded, once rather
+    /// name is what costs, with the library loaded: once rather
     /// than once per name.
     pub fn suggestions(&self, wanted: &[String]) -> Vec<Suggestion> {
         // the last segment is what a name answers to; `ISQ::Volume`
         // missed because of `Volume`, not because of `ISQ`
+        //
+        // `a.cc` is a feature chain, and what it missed is `cc` among the
+        // features reached through `a`: what is offered for it is written
+        // the same way, `a.c`, since a name spelled from the root put in
+        // its place means another feature altogether. And no import brings
+        // a feature of `a` into scope, so nothing is "declared as" for it.
+        let chained: Vec<Option<&str>> = wanted
+            .iter()
+            .map(|it| it.rfind('.').map(|at| &it[..at]))
+            .collect();
         let asked: Vec<&str> = wanted
             .iter()
-            .map(|it| it.rsplit("::").next().unwrap_or(it))
+            .map(|it| it.rsplit(['.', ':']).next().unwrap_or(it))
             .collect();
         let lowered: Vec<String> = asked.iter().map(|it| it.to_lowercase()).collect();
 
@@ -1003,8 +1117,19 @@ impl Workspace {
         for (id, name) in self.named_elements() {
             let spelled = name.to_lowercase();
             for (at, needle) in lowered.iter().enumerate() {
+                // Names are case-sensitive, so "declared as" -- a claim
+                // that this is the very name, wanting only an import --
+                // holds of the exact spelling alone. `B` is not
+                // "declared as" the `b` being declared on the same line,
+                // or an editor's quick fix would write `part b : b;`. The same
+                // letters in another case are a near miss, and the
+                // nearest there is.
                 if &spelled == needle {
-                    elsewhere[at].push(id);
+                    if name == asked[at] {
+                        elsewhere[at].push(id);
+                    } else {
+                        near[at].push((0, 0, name.len(), id));
+                    }
                     continue;
                 }
                 // A declared name that holds what was asked for -- `TemperatureValue` for
@@ -1044,21 +1169,72 @@ impl Workspace {
         (0..wanted.len())
             .map(|at| {
                 let mut ranked = std::mem::take(&mut near[at]);
+                ranked.retain(|&(_, _, _, id)| self.can_be_named_from_outside(id));
                 ranked.sort_by_key(|&(kind, off, len, id)| (kind, off, len, id));
+                let written = |id: ElementId| match chained[at] {
+                    Some(through) => {
+                        let name = self.model.name(id).unwrap_or_default();
+                        format!("{through}.{}", sysml_syntax::quote(name))
+                    }
+                    None => self.qualified_name_written(id),
+                };
+                let mut near: Vec<String> = Vec::new();
+                for &(_, _, _, id) in &ranked {
+                    let spelled = written(id);
+                    if !near.contains(&spelled) {
+                        near.push(spelled);
+                    }
+                    if near.len() == MOST {
+                        break;
+                    }
+                }
                 Suggestion {
                     elsewhere: elsewhere[at]
                         .iter()
+                        .filter(|_| chained[at].is_none())
+                        .filter(|&&id| self.can_be_named_from_outside(id))
                         .take(MOST)
-                        .map(|&id| self.qualified_name_of(id))
+                        .map(|&id| self.qualified_name_written(id))
                         .collect(),
-                    near: ranked
-                        .iter()
-                        .take(MOST)
-                        .map(|&(_, _, _, id)| self.qualified_name_of(id))
-                        .collect(),
+                    // what an editor puts in place of the misspelt name,
+                    // so spelled the way it has to be written
+                    near,
                 }
             })
             .collect()
+    }
+
+    /// Where the name written at `range` in `file` resolved to nothing
+    /// because what it reaches is the wrong kind of thing: a sentence
+    /// saying so. Such a name is not out of scope -- saying "an import
+    /// would" bring it in is wrong -- and not misspelt; it names something
+    /// that cannot stand there.
+    pub fn wrong_kind_at(&self, file: usize, range: TextRange) -> Option<String> {
+        let (found, wanted) = self
+            .unresolved
+            .iter()
+            .find(|it| it.file == file && it.range == range)?
+            .wrong_kind?;
+        Some(format!(
+            "it names `{}`, a `{}`, where only a `{}` can stand",
+            self.qualified_name_written(found),
+            self.model.kind(found).name(),
+            wanted.name()
+        ))
+    }
+
+    /// Whether a qualified name can reach `id` from outside the namespaces
+    /// it is in: every namespace on the way has a name, and nothing on
+    /// the way is private. What fails this is no answer to "what did you
+    /// mean": `Trade::'?'::'?'::a` cannot be written, and a private
+    /// member is not what an import would bring in.
+    fn can_be_named_from_outside(&self, id: ElementId) -> bool {
+        std::iter::successors(Some(id), |&it| self.model.owner(it))
+            .take_while(|&it| it != self.root)
+            .all(|it| {
+                self.model.name(it).is_some()
+                    && self.model.member_visibility(it) != Some(sysml_model::Vis::Private)
+            })
     }
 
     /// The names that may legally be written at a point in a file: the
@@ -1076,6 +1252,28 @@ impl Workspace {
 
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        // `P::|` asks for what `P` holds and `x.|` for the features of
+        // `x`, not for the names around the cursor: offered those, an
+        // editor completing `import P::` listed `P` and `Q` and none of
+        // what was in `P`. What the qualifier names is looked up the way a
+        // name written there would be, and only what is reachable through
+        // it is offered -- nothing at all where it names nothing.
+        let text = self.files[file].parse.syntax().text().to_string();
+        if let Some((segments, through_a_feature)) = qualifier_before(&text, offset.into()) {
+            let Some(named) = self.resolve_from(scope, &segments) else {
+                return out;
+            };
+            let mut holders = vec![named];
+            if through_a_feature {
+                holders.extend(self.model.types_of(named).collect::<Vec<_>>());
+            }
+            for holder in holders {
+                self.collect_visible(holder, Access::External, &mut out, &mut seen, &[]);
+            }
+            let mut names = HashSet::new();
+            out.retain(|(name, _)| names.insert(name.clone()));
+            return out;
+        }
         loop {
             self.collect_visible(scope, Access::Internal, &mut out, &mut seen, &[]);
             match self.model.owner(scope) {
@@ -1087,6 +1285,13 @@ impl Workspace {
         let mut names = HashSet::new();
         out.retain(|(name, _)| names.insert(name.clone()));
         out
+    }
+
+    /// Whether the cursor is in a name written after `P::` or `x.`, where
+    /// only what the qualifier holds can be written and no keyword can.
+    pub fn follows_qualifier(&self, file: usize, offset: sysml_syntax::TextSize) -> bool {
+        let text = self.files[file].parse.syntax().text().to_string();
+        qualifier_before(&text, offset.into()).is_some()
     }
 
     fn collect_visible(
@@ -1273,17 +1478,42 @@ impl Workspace {
     }
 
     /// Full node range and declared-name range of an element.
+    ///
+    /// One that declares only a short name is named by that: `part def
+    /// <W>;` answered with the whole declaration, and an editor pointing
+    /// at its name selected all of it.
     pub fn element_ranges(&self, elem: ElementId) -> Option<(TextRange, TextRange)> {
         let node = self.source.get(&elem)?;
         let name = node
             .children()
             .find(|c| c.kind() == SyntaxKind::NAME)
             .map(|n| n.text_range())
+            .or_else(|| self.short_name_range(elem))
             .unwrap_or_else(|| node.text_range());
         Some((node.text_range(), name))
     }
 
-    /// Owner-path qualified name of an element (for hovers).
+    /// Where a declaration spells its short name: the `W` of `part def
+    /// <W> Wheel;`, without the brackets around it.
+    pub fn short_name_range(&self, elem: ElementId) -> Option<TextRange> {
+        self.source
+            .get(&elem)?
+            .children()
+            .find(|c| c.kind() == SyntaxKind::SHORT_NAME)?
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|token| {
+                matches!(
+                    token.kind(),
+                    SyntaxKind::IDENT | SyntaxKind::UNRESTRICTED_NAME
+                )
+            })
+            .map(|token| token.text_range())
+    }
+
+    /// Owner-path qualified name of an element (for hovers), by effective
+    /// names: `part :>> engine;` declares none of its own and is `engine`,
+    /// not `?`. Only an element with no name to borrow either is `?`.
     pub fn qualified_name_of(&self, elem: ElementId) -> String {
         let mut segments = Vec::new();
         let mut current = Some(elem);
@@ -1291,11 +1521,31 @@ impl Workspace {
             if e == self.root {
                 break;
             }
-            segments.push(self.model.name(e).unwrap_or("?").to_string());
+            segments.push(self.model.effective_name(e).unwrap_or("?").to_string());
             current = self.model.owner(e);
         }
         segments.reverse();
         segments.join("::")
+    }
+
+    /// The qualified name of `elem` as it would have to be written: each
+    /// segment quoted where it is not a basic name, so `'My Pkg'::'Wheel
+    /// Unit'` rather than [`qualified_name_of`](Self::qualified_name_of)'s
+    /// `My Pkg::Wheel Unit`. What is put back into a file, or handed to a
+    /// program that will hand it back, is this: the plain one does not
+    /// parse, and two different names can read the same in it.
+    pub fn qualified_name_written(&self, elem: ElementId) -> String {
+        let mut segments = Vec::new();
+        let mut current = Some(elem);
+        while let Some(e) = current {
+            if e == self.root {
+                break;
+            }
+            segments.push(self.model.effective_name(e).unwrap_or("?"));
+            current = self.model.owner(e);
+        }
+        segments.reverse();
+        sysml_syntax::quote_qualified(segments)
     }
 
     /// A qualified name as it was written, for a message: the root is
@@ -1314,8 +1564,7 @@ impl Workspace {
     /// `doc /* ... */` over several lines arrives as `"* Two states, and the
     /// LED follows\n         * which one is current"`. The `*` down the left
     /// is decoration and so is the indentation that carried it, and every
-    /// reader wanting the sentence had to know that -- the diagrams stripped
-    /// it, hover and the MCP server did not.
+    /// reader wanting the sentence would otherwise have to know that.
     pub fn documentation_of(&self, elem: ElementId) -> Option<String> {
         self.documented(elem).map(prose)
     }
@@ -1355,7 +1604,7 @@ fn prose(body: &str) -> String {
 /// held by it -- and this does, the way rustc's own suggestions do.
 ///
 /// A row is given up as soon as every way through it costs more than
-/// `most`, which is what makes a walk over sixty thousand names worth
+/// `most`, which is what makes a walk over every declared name worth
 /// doing: almost all are abandoned on their first letter.
 fn within(name: &str, wanted: &str, most: usize) -> Option<usize> {
     let name: Vec<char> = name.chars().collect();
@@ -1409,8 +1658,9 @@ pub(crate) fn reaches(model: &Model, elem: ElementId, base: ElementId) -> bool {
                 ElementKind::Subclassification => "superclassifier",
                 ElementKind::Subsetting => "subsettedFeature",
                 ElementKind::Redefinition => "redefinedFeature",
-                ElementKind::FeatureTyping => "type",
                 ElementKind::ReferenceSubsetting => "referencedFeature",
+                // a `ConjugatedPortTyping` among them
+                kind if kind.is_a(ElementKind::FeatureTyping) => "type",
                 _ => continue,
             };
             if let Some(Value::Ref(target)) = model.maybe(child, target) {
@@ -1558,6 +1808,8 @@ pub(crate) fn implicit_supertype(kind: ElementKind) -> &'static [&'static str] {
         // `validateMultiplicityRangeBoundResultTypes` asks of the `*`
         // in `[0..*]`.
         LiteralInfinity => &["Performances::literalIntegerEvaluations"],
+        // `checkNullExpressionSpecialization`
+        NullExpression => &["Performances::nullEvaluations"],
         FeatureReferenceExpression => &["Performances::evaluations"],
         Connector => &["Links::links"],
         BindingConnector => &["Links::selfLinks"],
@@ -1661,8 +1913,8 @@ mod tests {
 
     /// A report points at what a reader can go and look at.
     ///
-    /// Most of a model was never written down: of the official corpus's 109616
-    /// elements only 30235 have syntax of their own, and the other 79380 -- an
+    /// Most of a model was never written down: of the official corpus's
+    /// elements only some have syntax of their own, and the rest -- an
     /// implied specialization, a reified connector end, a multiplicity -- are
     /// shown where whatever owns them was written. The one element under no
     /// file is the root, and nothing a constraint is asked of is that.
@@ -1801,9 +2053,9 @@ mod tests {
         assert_eq!(
             conjugations,
             [
-                // written as a statement: the namespace's own, and the
-                // shape it writes its two types in is not read here
-                (Some("K"), None, None),
+                // written as a statement: the namespace's own, relating
+                // the type after `conjugate` to the one after `conjugates`
+                (Some("K"), Some("A"), Some("B")),
                 // written as a clause: B's own, relating B to A
                 (Some("B"), Some("B"), Some("A")),
             ]
@@ -1828,6 +2080,26 @@ mod tests {
             .alias_target(alias)
             .expect("the alias says what it names");
         assert_eq!(ws.qualified_name_of(engine), "P::Engine");
+    }
+
+    #[test]
+    fn a_redefinition_is_named_by_the_name_it_borrows() {
+        let (ws, stats) = resolved_workspace(&[(
+            "m.sysml",
+            "package P {\n  part def Car { part engine; }\n  part def Truck :> Car {\n    part :>> engine { attribute 'peak power'; }\n  }\n}",
+        )]);
+        assert_eq!(stats.unresolved, 0, "unresolved: {:?}", ws.unresolved());
+        let power = ws
+            .named_elements()
+            .find(|&(_, name)| name == "peak power")
+            .map(|(id, _)| id)
+            .expect("the attribute is declared");
+        // `part :>> engine` declares no name, and is the `engine` it redefines
+        assert_eq!(ws.qualified_name_of(power), "P::Truck::engine::peak power");
+        assert_eq!(
+            ws.qualified_name_written(power),
+            "P::Truck::engine::'peak power'"
+        );
     }
 
     #[test]
@@ -1897,7 +2169,7 @@ mod tests {
         let (ws, stats) = resolved_workspace(&[
             (
                 "lib.sysml",
-                "library package Lib {\n  attribute def Real;\n  metadata def SemanticMetadata { attribute baseType; }\n  part def CauseBase { attribute probability : Real; }\n  part causes : CauseBase;\n  metadata def cause :> SemanticMetadata {\n    :>> baseType = causes meta SysML::Usage;\n  }\n}",
+                "library package SysML {\n  metadata def Usage;\n}\nlibrary package Lib {\n  attribute def Real;\n  metadata def SemanticMetadata { attribute baseType; }\n  part def CauseBase { attribute probability : Real; }\n  part causes : CauseBase;\n  metadata def cause :> SemanticMetadata {\n    :>> baseType = causes meta SysML::Usage;\n  }\n}",
             ),
             (
                 "m.sysml",
@@ -2020,7 +2292,7 @@ mod tests {
     ///
     /// The library types the standard implies are found by their whole name,
     /// and the last segment of one is often what a model calls its own
-    /// features: `x` names two hundred and seventy elements of the published
+    /// features: `x` names very many elements of the published
     /// corpus by itself. Taking only the first few hundred candidates left the
     /// answer to how many other things happened to be called the same.
     #[test]

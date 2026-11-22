@@ -136,6 +136,7 @@ pub fn format_parsed_with(parse: &crate::Parse, layout: Layout) -> String {
         line_start: 0,
         line_indent: 0,
         joints: Vec::new(),
+        note_at: None,
         line_breakable: true,
     }
     .run(&all_tokens);
@@ -165,6 +166,11 @@ struct Formatter {
     line_indent: usize,
     /// where that line could be broken, in the order the spaces appear
     joints: Vec<Joint>,
+    /// Where a note trailing the line starts, if one does. What the
+    /// line says ends there, and only that has to fit: a long `// note`
+    /// after `attribute x = 1;` must not break the code before it, which
+    /// would leave the note no shorter and the code split for nothing.
+    note_at: Option<usize>,
     /// A line holding a comment that spans lines is already more than
     /// one line, and the offsets a break is spliced in at do not survive
     /// that, so it is left alone.
@@ -190,6 +196,7 @@ impl Formatter {
             if is_note(kind) {
                 if gap == 0 && !self.line_empty && self.prev.is_some() {
                     // trailing note stays on its line: `part def A; // note`
+                    self.note_at = Some(self.out.len());
                     self.out.push(' ');
                     self.out.push_str(token.text());
                 } else {
@@ -210,7 +217,7 @@ impl Formatter {
             }
             // A block comment spanning lines keeps a line of its own, so
             // that its interior has a column of its own to be brought to.
-            if kind == COMMENT_BODY && token.text().contains('\n') {
+            if kind == COMMENT_BODY && token.text().contains(['\n', '\r']) {
                 self.pending_newlines = self.pending_newlines.max(1);
             }
             if self.pending_newlines > 0 {
@@ -228,7 +235,7 @@ impl Formatter {
                     self.out.push(' ');
                 }
             }
-            if kind == COMMENT_BODY && token.text().contains('\n') {
+            if kind == COMMENT_BODY && token.text().contains(['\n', '\r']) {
                 self.write_comment(token.text());
                 self.line_breakable = false;
             } else {
@@ -280,16 +287,16 @@ impl Formatter {
     }
 
     /// A block comment that spans lines, its interior brought under the
-    /// column the `/*` now sits in.
+    /// column the `/*` sits in.
     ///
     /// The interior is part of the same token as the `/*`, so moving the
-    /// one used to leave the other standing in a column that meant
+    /// one would leave the other standing in a column that meant
     /// something in the file it was written in and nothing in the file
     /// that came out. What the comment says is unchanged: a body is read
     /// with this margin taken off.
     fn write_comment(&mut self, text: &str) {
         let indent = INDENT.repeat(self.depth);
-        let mut lines = text.lines();
+        let mut lines = crate::lines_of(text).into_iter();
         self.out.push_str(lines.next().unwrap_or_default());
         let mut rest: Vec<&str> = lines.collect();
         // A line that only closes the comment is part of the drawing and
@@ -329,7 +336,8 @@ impl Formatter {
             } else {
                 // every line written here shares the margin, by the way
                 // the margin was arrived at
-                self.out.push_str(&line[margin.len()..]);
+                self.out
+                    .push_str(line.strip_prefix(margin.as_str()).unwrap_or(line));
             }
         }
         if closes {
@@ -364,6 +372,7 @@ impl Formatter {
         self.line_start = self.out.len();
         self.line_indent = self.depth * INDENT.len();
         self.joints.clear();
+        self.note_at = None;
         self.line_breakable = true;
     }
 
@@ -444,7 +453,7 @@ impl Formatter {
             stretches.push((from, at));
             from = at + 1;
         }
-        stretches.push((from, self.out.len()));
+        stretches.push((from, self.note_at.unwrap_or(self.out.len())));
         stretches
             .into_iter()
             .enumerate()
@@ -470,12 +479,24 @@ impl Formatter {
                 break;
             }
             if t.kind() == WHITESPACE {
-                lines += t.text().matches('\n').count();
+                lines += line_breaks(t.text());
             }
             cursor = t.next_token();
         }
         lines
     }
+}
+
+/// How many lines `text` breaks, a break being a `\n`, a `\r\n` or a
+/// `\r` on its own.
+///
+/// The lexer ends a line note at either character, so a file written
+/// with lone carriage returns is one of lines to it. Counted by `\n`
+/// alone, the same file would have no breaks at all: a note on a line of
+/// its own would be taken for one trailing the line above, and blank
+/// lines would go.
+fn line_breaks(text: &str) -> usize {
+    text.replace("\r\n", "\n").matches(['\r', '\n']).count()
 }
 
 fn is_note(kind: SyntaxKind) -> bool {
@@ -484,6 +505,33 @@ fn is_note(kind: SyntaxKind) -> bool {
 
 /// Should a single space separate `prev` and `next`?
 fn space_between(prev: &SyntaxToken, next: &SyntaxToken) -> bool {
+    wants_space(prev, next) || would_fuse(prev.text(), next.text())
+}
+
+/// Whether two tokens written with nothing between them would be read
+/// back as something else.
+///
+/// The rules in [`wants_space`] are about tokens that belong together,
+/// and on text that parses they never put two together that lex apart.
+/// Text that does not parse can hold anything: `x : ::` came out as
+/// `x :::`, which reads as `::` then `:`.
+///
+/// Punctuation is not the only thing that runs together. A `.` before a
+/// number is the start of one, so `1 . 5` must not come out as `1.5`, a real
+/// where there was an error, nor `a. 5` as `a.5`, which lexes as
+/// `a` and `.5` and would be spaced the other way on the next pass. So every
+/// pair written tight is lexed again, whatever it is made of; the pairs
+/// are short, and this is the one thing formatting must never do.
+fn would_fuse(prev: &str, next: &str) -> bool {
+    if prev.is_empty() || next.is_empty() {
+        return false;
+    }
+    let joined = format!("{prev}{next}");
+    let (tokens, _) = crate::lexer::lex(&joined);
+    !(tokens.len() == 2 && tokens[0].range.end == prev.len())
+}
+
+fn wants_space(prev: &SyntaxToken, next: &SyntaxToken) -> bool {
     let p = prev.kind();
     let n = next.kind();
 
@@ -550,6 +598,50 @@ mod tests {
         format(text, Dialect::SysML)
     }
 
+    /// A token of no text runs into nothing: put beside one, the other
+    /// lexes as itself, which is not the two tokens the test for fusing
+    /// looks for, and without the guard it would be spaced as though it
+    /// fused.
+    #[test]
+    fn a_token_of_no_text_fuses_with_nothing() {
+        assert!(!would_fuse("", "::"));
+        assert!(!would_fuse("a", ""));
+    }
+
+    /// Text that does not parse can put tokens side by side that no
+    /// model does, and run together they lex as others.
+    #[test]
+    fn two_tokens_are_never_run_together_into_others() {
+        let lexed = |text: &str| -> Vec<String> {
+            crate::lex(text)
+                .0
+                .iter()
+                .filter(|t| !t.kind.is_trivia())
+                .map(|t| text[t.range.clone()].to_string())
+                .collect()
+        };
+        // A `.` before a number starts one, and a number before a `.`
+        // may run on into it: `1 . 5` came out as the real `1.5`, and
+        // `a. 5` as `a.5`, which is `a` and `.5` and was spaced the other
+        // way on the next pass.
+        for text in [
+            "part x : ::A;",
+            "part x = a. .b;",
+            "part x : ::",
+            "part x = 1 . 5;",
+            "part x = a. 5;",
+            "part x = a . 5e3;",
+        ] {
+            let formatted = fmt(text);
+            assert_eq!(lexed(&formatted), lexed(text), "{formatted}");
+            assert_eq!(fmt(&formatted), formatted, "{text}");
+        }
+        // and what is tight on text that parses stays tight
+        assert_eq!(fmt("import P::*;"), "import P::*;\n");
+        assert!(!would_fuse("P", "::"));
+        assert!(would_fuse(":", "::"));
+    }
+
     #[test]
     fn normalizes_spacing_and_indentation() {
         let input =
@@ -594,8 +686,8 @@ mod tests {
     }
 
     /// The interior is part of the same token as the `/*`, so moving one
-    /// without the other used to leave the body standing in a column
-    /// that meant nothing -- which is what a reader saw whenever their
+    /// without the other would leave the body standing in a column
+    /// that meant nothing -- which a reader would see whenever their
     /// editor formatted a file whose indentation was not already right.
     #[test]
     fn a_doc_that_moves_takes_its_body_with_it() {
@@ -620,6 +712,35 @@ mod tests {
             "package P {\n    part def V {\n        doc\n        /*\n        first\n          indented\n        */\n    }\n}\n";
         assert_eq!(fmt(input), expected);
         assert_eq!(fmt(expected), expected);
+    }
+
+    /// What the formatter takes off the lines of a body is what the
+    /// model takes off them, so the doc says the same thing afterwards;
+    /// a margin of bytes rather than of characters panicked besides.
+    #[test]
+    fn a_body_says_after_formatting_what_it_said_before() {
+        for body in [
+            "/* first\n\u{3000}wide\n  two\n    */",
+            "/*\n  two\n\u{3000}wide\n*/",
+            "/* top\n\tA\n      B\n  */",
+            "/* x\n\t\tA\n    B\n\t\t  C */",
+            "/* x\n\u{a0}\u{a0}A\n\u{a0} B */",
+        ] {
+            let input = format!("part def A {{\n  doc {body}\n}}\n");
+            let said = |text: &str| {
+                let parse = crate::parse(text);
+                let token = parse
+                    .syntax()
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .find(|t| t.kind() == crate::SyntaxKind::COMMENT_BODY)
+                    .unwrap();
+                crate::comment_text(token.text())
+            };
+            let formatted = fmt(&input);
+            assert_eq!(said(&formatted), said(&input), "{input:?}");
+            assert_eq!(fmt(&formatted), formatted, "{input:?}");
+        }
     }
 
     #[test]
@@ -653,6 +774,57 @@ mod tests {
         assert_eq!(fmt("port p : ~ P;"), "port p : ~P;\n");
     }
 
+    /// A file written with lone carriage returns has lines like any
+    /// other: the note on a line of its own stays there, and the blank
+    /// line before it stays too. Counted by `\n` alone, the file would have no
+    /// line breaks, so the note would be hung on the end of `part x;` and
+    /// the blank line would go.
+    #[test]
+    fn a_lone_carriage_return_breaks_a_line() {
+        let expected = "package P {\n    part x;\n\n    // own line\n    part y;\n}\n";
+        for ending in ["\r", "\n", "\r\n"] {
+            let input = "package P {\n    part x;\n\n    // own line\n    part y;\n}\n"
+                .replace('\n', ending);
+            assert_eq!(fmt(&input), expected, "{input:?}");
+        }
+        assert_eq!(line_breaks("\r\n\r\r\n\n"), 4);
+    }
+
+    /// A comment whose lines end in a lone `\r` is brought under its new
+    /// column as one ending in `\n` is. Read as one line, its interior
+    /// kept whatever indentation it had.
+    #[test]
+    fn a_comment_written_with_carriage_returns_is_reindented() {
+        let input =
+            "package P {\n        /* first\n           second\n        */\n    part x;\n}\n";
+        let expected = fmt(input);
+        for ending in ["\r", "\r\n"] {
+            let written = input.replace('\n', ending);
+            assert_eq!(fmt(&written), expected, "{written:?}");
+        }
+        assert_eq!(
+            crate::comment_text("/* first\r   second\r*/"),
+            crate::comment_text("/* first\n   second\n*/")
+        );
+    }
+
+    /// A note trailing a line is not what has to fit on it. Measured in,
+    /// a long one broke `attribute x = 1;` after its `=`, which left the
+    /// note just as long and the code split for nothing.
+    #[test]
+    fn a_trailing_note_does_not_break_the_code_before_it() {
+        let note = format!("// a long note{}", ", a long note".repeat(9));
+        let input = format!("package P {{\n    attribute x = 1; {note}\n}}\n");
+        assert_eq!(fmt(&input), input);
+        // code too wide on its own still gives way, and the note stays
+        // at the end of what was its line
+        let wide = format!("attribute x = {} + 1; {note}", "a".repeat(90));
+        let out = fmt(&wide);
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.lines().last().unwrap().ends_with(&note), "{out}");
+        assert_eq!(fmt(&out), out);
+    }
+
     #[test]
     fn a_crlf_file_comes_out_with_one_kind_of_line_ending() {
         let input = "package P {\r\n    part def A; // note\r\n    part def B;\r\n}\r\n";
@@ -672,8 +844,8 @@ mod tests {
         assert_eq!(fmt("part\u{feff}def A;"), "part def A;\n");
     }
 
-    /// A run of notes used to cost the formatter a scan each, so a file
-    /// that is mostly notes took time in the square of its length.
+    /// A run of notes must not cost the formatter a scan each, or a file
+    /// that is mostly notes would take time in the square of its length.
     #[test]
     fn a_file_of_notes_formats_in_one_pass() {
         let input = "part def A {\n".to_string() + &"    // note\n".repeat(20_000) + "}\n";

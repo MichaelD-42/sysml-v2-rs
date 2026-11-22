@@ -28,7 +28,7 @@ use crate::Workspace;
 /// The metamodel states these in OCL beside the constraints, so a
 /// derived property is answered by evaluating what the specification
 /// says it is rather than by a second account of it written here.
-/// Parsed once: there are 235 of them and they are asked for constantly.
+/// Parsed once: there are many of them and they are asked for constantly.
 fn derivations() -> &'static [(ElementKind, String, Expr)] {
     static PARSED: OnceLock<Vec<(ElementKind, String, Expr)>> = OnceLock::new();
     PARSED.get_or_init(|| {
@@ -115,13 +115,12 @@ const TYPED_BY: [&str; 5] = [
 /// counterparts name something the membership does not own, and are left
 /// alone.
 ///
-/// `ParameterMembership::ownedMemberParameter` was not always among them.
-/// While an expression was kept as text rather than as the parameters the
-/// specification counts, reading it as the member made `result` a definite
-/// nothing rather than an unanswered question, and 2847 of a sound corpus
-/// were reported as violations. An expression is now built as that tree,
-/// and two of the four constraints this name reaches hold of the whole
-/// corpus; the other two are refused for reasons of their own.
+/// `ParameterMembership::ownedMemberParameter` is among them because an
+/// expression is built as the tree of parameters the specification
+/// counts. Were it kept as text, reading it as the member would make
+/// `result` a definite nothing rather than an unanswered question, and a
+/// sound corpus would be reported as violations. Some of the constraints
+/// this name reaches are refused for reasons of their own.
 const OWNED_MEMBER: [&str; 14] = [
     "action",
     "condition",
@@ -143,7 +142,7 @@ const OWNED_MEMBER: [&str; 14] = [
 /// builder reads off a keyword.
 ///
 /// Name resolution writes every specialization the semantic libraries
-/// imply, marking the relationship and the element that gained one. So a
+/// imply, marking the relationship and the element that has one. So a
 /// relationship carrying neither is one nothing implied, which is what
 /// the metamodel declares the default to be.
 const WRITTEN_FLAGS: [&str; 2] = ["isImplied", "isImpliedIncluded"];
@@ -265,7 +264,7 @@ const MISNAMED: [(&str, &str); 6] = [
 ///
 /// Closing what is open only helps where the body can then be answered.
 /// `Type::multiplicities` is left out for that reason: closed, it parses,
-/// and `validateFeatureEndMultiplicity` reports twelve hundred violations
+/// and `validateFeatureEndMultiplicity` reports violations
 /// of a sound corpus, because the `allSuperTypes()` and `hasBounds(1, 1)`
 /// it goes on to call answer nothing and an `exists` over nothing is
 /// `false`.
@@ -304,10 +303,37 @@ const UNCLOSED: [(&str, &str, &str); 5] = [
     ),
 ];
 
+/// Constraints whose OCL reads, and reads one end of a relationship where
+/// the words beside it name the other -- with the end the words name.
+///
+/// "A variation `Definition` may not specialize any other variation
+/// `Definition`", and the OCL asks it of `ownedSpecialization.specific`:
+/// the variation itself, which is a variation, so every variation broke it
+/// and the two were left unrun with the rest of [`MISWRITTEN`]. What a
+/// type specializes is the `general` end, and that is all there is to
+/// mend: `enum def F :> E;`, one enumeration extending another, went
+/// unreported.
+const MISREAD: [(&str, &str, &str); 2] = [
+    (
+        "validateDefinitionVariationSpecialization",
+        "ownedSpecialization.specific",
+        "ownedSpecialization.general",
+    ),
+    (
+        "validateUsageVariationSpecialization",
+        "ownedSpecialization.specific",
+        "ownedSpecialization.general",
+    ),
+];
+
 /// The specification's OCL for one of its rules, with what it leaves
-/// open closed.
+/// open closed and what it misreads read as its words say.
 fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
-    match UNCLOSED.iter().find(|(rule, _, _)| *rule == name) {
+    match UNCLOSED
+        .iter()
+        .chain(MISREAD.iter())
+        .find(|(rule, _, _)| *rule == name)
+    {
         Some((_, written, meant)) => ocl.replace(written, meant).into(),
         None => ocl.into(),
     }
@@ -340,22 +366,22 @@ fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
 /// writes `then decide; if true then m;` with `m` a merge node: that one
 /// succession must have its target end both 0..1 and 1..1, and its source
 /// end both 0..1 and 1..1. The corpus says which pair to keep -- with the
-/// `.multiplicity` its siblings write, the mended pair is false of all six
-/// decision nodes and all eight merge nodes, and the ControlNode two hold
-/// of every one of the fourteen. The pilot implementation runs none of the
-/// four and records an issue of its own, SYSML21-306.
+/// `.multiplicity` its siblings write, the mended pair is false of every
+/// decision node and merge node, and the ControlNode two hold of every
+/// one of them. The pilot implementation runs none of these four and
+/// records an issue of its own, SYSML21-306.
 ///
 /// `validateSubsettingFeaturingTypes` is
 /// `subsettingFeature.canAccess(subsettedFeature)`, and `canAccess` holds
 /// the subsetted feature to being featured within one of the featuring
 /// types the subsetting one reaches -- walking *up*, never down. Read as
-/// the metamodel states it, 8653 of the corpus's 20569 subsettings are
+/// the metamodel states it, many of the corpus's subsettings are
 /// rejected.
 ///
 /// The pilot does run it, and does two things the metamodel does not
 /// state: it asks only where the subsetted feature has a featuring type,
-/// which exempts 956 outright, and `TypeUtil.isCompatible` answers one
-/// step more widely. Neither is what the remaining 7697 turn on. They turn
+/// which exempts many outright, and `TypeUtil.isCompatible` answers one
+/// step more widely. Neither is what the rest turn on. They turn
 /// on direction: `accept a : A` gives a transition an `accepted` featured
 /// by the transition and a payload featured by the trigger it owns, and no
 /// upward walk from one reaches the other.
@@ -372,11 +398,11 @@ fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
 /// `Feature` owned by the relationship, carrying the steps as
 /// `FeatureChaining`. This model stands the chain up the same way, so both
 /// ends are owned by the redefinition and featured by nothing. The OCL as
-/// written has no such guard, and reports this one of the corpus's 12941.
+/// written has no such guard, and reports this one of the corpus's.
 ///
 /// `validateMultiplicityRangeBoundResultTypes` holds every bound to coming
 /// to a `ScalarValues::Integer`, and `[nCauses]` counts with an attribute
-/// the notation gives no type. Nineteen of the corpus's 6376 ranges are
+/// the notation gives no type. Some of the corpus's ranges are
 /// written that way, the standard library's own among them. The pilot does
 /// not run the OCL at all: `checkMultiplicityRange` carries "TODO: Correct
 /// validateMultiplicityBoundResults OCL from KERML-199" and asks instead
@@ -393,7 +419,7 @@ fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
 /// Running any of these would report a violation of a sound model, so what
 /// they are is said instead. The two the OCL subset cannot parse are
 /// pinned in `ocl.rs` alongside.
-const MISWRITTEN: [(&str, &str); 8] = [
+const MISWRITTEN: [(&str, &str); 6] = [
     (
         "validateMultiplicityRangeBoundResultTypes",
         "a bound written as a name comes to whatever that name is typed by, and the notation \
@@ -417,14 +443,6 @@ const MISWRITTEN: [(&str, &str); 8] = [
         "the OCL asks for two sets of featuring types to differ where the constraint asks for \
          one the redefining feature has and the redefined one has not, and neither holds of a \
          redefinition between two features of the same type",
-    ),
-    (
-        "validateDefinitionVariationSpecialization",
-        "the specification's own OCL reads `specific` where the constraint says `general`",
-    ),
-    (
-        "validateUsageVariationSpecialization",
-        "the specification's own OCL reads `specific` where the constraint says `general`",
     ),
     (
         "validateMergeNodeIncomingSuccessions",
@@ -491,14 +509,14 @@ fn named_after(rule: &sysml_model::Rule) -> String {
 /// Six is what this can answer for. Past it the walk reaches
 /// `Type::directionOfExcluding`, which climbs the supertypes of every
 /// feature of every type, and opens constraints the model cannot yet meet:
-/// at eight one, at ten a hundred, at twelve four hundred and sixty of the
-/// corpus are reported as violations. Those are the model missing what the
+/// each step past it reports more of the corpus
+/// as violations. Those are the model missing what the
 /// specification counts, not the bound being too low.
 ///
 /// The bound also only buys work: inherited memberships go through five
 /// operations that call one another over every supertype, and no depth
-/// completes them -- at twelve, two thirds of every operation invoked and
-/// a third of the time, all spent arriving at the same "cannot say".
+/// completes them -- a deeper bound spends most operations and time
+/// arriving at the same "cannot say".
 const DEPTH: usize = 6;
 
 /// One constraint that does not hold, and of what.
@@ -510,6 +528,27 @@ pub struct Violation {
     pub says: &'static str,
     /// The element it does not hold of.
     pub element: ElementId,
+    /// What of that element breaks it, said of this model rather than in
+    /// the specification's general words, where that can be said: which
+    /// name is declared twice.
+    pub detail: Option<String>,
+    /// The other element it is about, where there is one: the first
+    /// declaration of the name a second one repeats.
+    pub also: Option<ElementId>,
+}
+
+impl Violation {
+    /// Whether it is certain, and so an error wherever it is shown.
+    ///
+    /// Every constraint fails a check on the command line, but an editor
+    /// shows most of them as warnings: several are asked of what this
+    /// toolchain builds of the abstract syntax, and are only as right as
+    /// that. Two declarations of one name in one namespace are not a
+    /// matter of how the model was built -- the text says it twice -- and
+    /// a name that means both reaches only one of them.
+    pub fn certain(&self) -> bool {
+        self.detail.is_some() && self.rule == "validateNamespaceDistinguishibility"
+    }
 }
 
 /// What running the constraints over a model came to.
@@ -523,6 +562,12 @@ pub struct Checked {
     /// why -- the property the abstract syntax has and this model does
     /// not, or the defect in the specification's own text.
     pub unevaluated: Vec<(&'static str, String)>,
+    /// Constraints some elements answered and others could not: by name,
+    /// how many could not, and why the first of them could not. Such a
+    /// constraint is in neither `held` nor `unevaluated` -- what it says
+    /// of the ones that answered is in `violations`, and nothing is known
+    /// of the rest.
+    pub partly: Vec<(&'static str, usize, String)>,
 }
 
 impl Workspace {
@@ -556,7 +601,7 @@ impl Workspace {
         // for. Name resolution reifies what the notation leaves implicit -- a
         // typing, a subsetting, the ends of a connector -- and the constraints
         // are about those too. Asking only what was written left every rule about
-        // a `Subsetting` asked of nothing, with two thousand in the model.
+        // a `Subsetting` asked of nothing, however many are in the model.
         let mut under: Vec<ElementId> = Vec::new();
         let mut seen: HashSet<ElementId> = HashSet::new();
         for &file in files {
@@ -613,7 +658,19 @@ impl Workspace {
         // that keeps nothing says one thing where the model has such
         // elements elsewhere and another where it has none anywhere:
         // the second is this toolchain not building them.
-        let present: HashSet<ElementKind> = by_kind.keys().copied().collect();
+        //
+        // Anywhere in the model, and not only under the files asked: what
+        // the toolchain builds does not depend on which files are checked.
+        // Tallied over those alone, a check of SysML files -- which have no
+        // `chains` -- would have no `FeatureChaining`, and every rule reading
+        // a `featureTarget` would go unevaluated until an unrelated KerML
+        // file with one was checked beside them.
+        let present: HashSet<ElementKind> = self
+            .model()
+            .ids()
+            .map(|it| self.model().kind(it))
+            .chain(by_kind.keys().copied())
+            .collect();
 
         let mut checked = Checked::default();
         for (rule, expr, refused) in &parsed {
@@ -623,15 +680,58 @@ impl Workspace {
                     .push((rule.name, refused.clone().expect("refused, or it parsed")));
                 continue;
             };
-            let about: Vec<(ElementId, Val)> = by_kind
+            // in the order the model holds them: gathered from a hash map,
+            // the same model reported its violations in a different order
+            // from one run to the next
+            let mut about: Vec<(&str, ElementId, Val)> = by_kind
                 .iter()
                 .filter(|(kind, _)| kind.is_a(rule.metaclass))
-                .flat_map(|(_, them)| them.iter().cloned())
+                .flat_map(|(kind, them)| {
+                    them.iter()
+                        .map(|(elem, it)| (kind.name(), *elem, it.clone()))
+                })
                 .collect();
+            about.sort_by_key(|&(kind, elem, _)| (elem, kind));
+            let about = about.into_iter().map(|(_, elem, it)| (elem, it));
             let mut asked = false;
             let mut unknown = None;
+            let mut unknowns = 0;
             for (elem, it) in about {
-                match self.holds(expr, &it, &present) {
+                // a name declared twice is said at the second declaration,
+                // with the first, rather than of the namespace both are in
+                if rule.name == "validateNamespaceDistinguishibility" {
+                    let repeated = self.owned_repeats(elem);
+                    asked = true;
+                    if repeated.is_empty() {
+                        if !self.distinguishable(elem) {
+                            checked.violations.push(Violation {
+                                rule: rule.name,
+                                says: rule.says,
+                                element: elem,
+                                detail: None,
+                                also: None,
+                            });
+                        }
+                        continue;
+                    }
+                    let within = self.qualified_name_written(elem);
+                    for (again, first, name) in repeated {
+                        checked.violations.push(Violation {
+                            rule: rule.name,
+                            says: rule.says,
+                            element: again,
+                            detail: Some(format!(
+                                "`{}` is declared again in `{within}`, and a name that means it \
+                                 reaches only one of the two",
+                                sysml_syntax::quote(&name)
+                            )),
+                            also: Some(first),
+                        });
+                    }
+                    continue;
+                }
+                let answer = self.holds(expr, &it, &present);
+                match answer {
                     Ok(true) => asked = true,
                     Ok(false) => {
                         asked = true;
@@ -639,15 +739,24 @@ impl Workspace {
                             rule: rule.name,
                             says: rule.says,
                             element: elem,
+                            detail: None,
+                            also: None,
                         });
                     }
                     // an element that cannot answer says nothing about
                     // whether another one can
-                    Err(why) => unknown = unknown.or(Some(why)),
+                    Err(why) => {
+                        unknowns += 1;
+                        unknown = unknown.or(Some(why));
+                    }
                 }
             }
             match (asked, unknown) {
-                (true, _) => checked.held.push(rule.name),
+                // held of every element it was asked of
+                (true, None) => checked.held.push(rule.name),
+                // held, or not, of some: counting it as held would say
+                // the model was checked where it was not
+                (true, Some(why)) => checked.partly.push((rule.name, unknowns, why)),
                 (false, Some(why)) => checked.unevaluated.push((rule.name, why)),
                 // no element of that metaclass is in the model at all,
                 // which is not a rule failing to be evaluated
@@ -655,6 +764,358 @@ impl Workspace {
             }
         }
         checked
+    }
+
+    /// `validateNamespaceDistinguishibility` of one namespace: "All
+    /// `memberships` of a `Namespace` must be distinguishable from each
+    /// other", `membership->forAll(m1 | membership->forAll(m2 | m1 <> m2
+    /// implies m1.isDistinguishableFrom(m2)))`.
+    ///
+    /// Answered here rather than from the OCL, which cannot be: the body
+    /// of `Membership::isDistinguishableFrom` closes one bracket more than
+    /// it opens, calls `oclKindOf` and reads `shortMemberName`, none of
+    /// which exists. What it means is plain from the prose beside it --
+    /// two memberships are told apart unless one's name or short name is
+    /// the other's name or short name and the metaclass of either member
+    /// conforms to the other's -- and read as written it would compare
+    /// every membership with every other, which over a namespace that
+    /// imports a quantities library is millions of evaluations.
+    ///
+    /// Only the namespace's own memberships, aliases among them, are
+    /// compared. An imported membership whose name clashes with an owned
+    /// member or with another import "is hidden and is not included in
+    /// the set of imported memberships" (KerML 7.2.5.4), so it can never
+    /// be what breaks this. And only declared names: a feature that names
+    /// nothing answers to the name of what it redefines, and two of those
+    /// redefining different things are a model the resolver reads without
+    /// complaint.
+    ///
+    /// A type's memberships are its inherited ones as well (KerML 7.3.2.2:
+    /// "the member names of all inherited memberships must be distinct
+    /// from each other and from the member names of all owned
+    /// memberships"), so those are compared too -- see
+    /// [`inherited_distinguishable`](Self::inherited_distinguishable).
+    fn distinguishable(&mut self, namespace: ElementId) -> bool {
+        self.owned_distinguishable(namespace)
+            && (!self.model().kind(namespace).is_a(ElementKind::Type)
+                || self.inherited_distinguishable(namespace))
+    }
+
+    /// The owned memberships of `namespace`, each with the member it
+    /// holds -- what an alias stands for, where it is one -- and the
+    /// names it answers to.
+    fn named_memberships(
+        &self,
+        memberships: impl IntoIterator<Item = ElementId>,
+    ) -> Vec<(ElementId, ElementId, Vec<String>)> {
+        let model = self.model();
+        let mut out = Vec::new();
+        for owned in memberships {
+            let kind = model.kind(owned);
+            let member = if kind == ElementKind::Membership {
+                match model.maybe(owned, "memberElement") {
+                    Some(sysml_model::Value::Ref(target)) => *target,
+                    _ => continue,
+                }
+            } else if is_bare_relationship(kind) {
+                continue;
+            } else {
+                owned
+            };
+            let mut names: Vec<String> = Vec::new();
+            for name in [
+                model.name(owned),
+                model
+                    .get(owned, "declaredShortName")
+                    .and_then(sysml_model::Value::as_str),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !names.iter().any(|it| it == name) {
+                    names.push(name.to_string());
+                }
+            }
+            out.push((owned, member, names));
+        }
+        out
+    }
+
+    /// The inherited half of `validateNamespaceDistinguishibility`: no
+    /// inherited membership may share a name with an owned one or with
+    /// another inherited one where the metaclass of either member conforms
+    /// to the other's.
+    ///
+    /// `part def B :> A { part x; }` beside `A`'s own `part x` declares a
+    /// second `x` rather than redefining the first, and a reader of `B::x`
+    /// cannot tell which is meant. What a redefinition has replaced is not
+    /// inherited at all (`removeRedefinedFeatures`), and one membership
+    /// reached through two supertypes is one membership. Where one of two
+    /// clashing members specializes the other -- a parameter redefining
+    /// the one at its position, which the model does not write down, or a
+    /// redefinition inherited beside what it redefined by another path --
+    /// the refinement stands in its place, as a lookup takes it, and the
+    /// two are not told apart by name because they need not be.
+    fn inherited_distinguishable(&mut self, ty: ElementId) -> bool {
+        let owned = self.model().owned(ty).to_vec();
+        let mut seen: Vec<(String, ElementId, ElementKind)> = Vec::new();
+        let mut candidates: Vec<ElementId> = Vec::new();
+        for (owned, member, names) in self.named_memberships(owned) {
+            candidates.push(member);
+            // The builder names what it stands up for a statement that
+            // writes none -- a transition's inline `do send s to p` is
+            // reified as the `effect` it redefines -- and a name the model
+            // never wrote is not one it can be faulted for repeating.
+            if !self.source.contains_key(&owned) {
+                continue;
+            }
+            let kind = self.model().kind(member);
+            for name in names {
+                seen.push((name, member, kind));
+            }
+        }
+        let mut inherited: Vec<ElementId> = Vec::new();
+        let mut members: HashSet<ElementId> = HashSet::new();
+        // What a supertype imports is left out: an import whose name
+        // clashes with a member there is hidden there and not one of its
+        // memberships, and which of them is hidden is the importing
+        // namespace's business, not a reason to fault this one.
+        for (from, membership) in self.inherited_memberships(ty) {
+            if self.model().owner(membership) == Some(from)
+                && !self.model().kind(membership).is_a(ElementKind::Import)
+            {
+                inherited.push(membership);
+            }
+        }
+        let inherited = self.named_memberships(inherited);
+        candidates.extend(inherited.iter().map(|&(_, member, _)| member));
+        for (_, member, names) in inherited {
+            if !members.insert(member) {
+                continue;
+            }
+            let kind = self.model().kind(member);
+            for name in names {
+                let clashes: Vec<ElementId> = seen
+                    .iter()
+                    .filter(|(other_name, other, other_kind)| {
+                        *other_name == name
+                            && *other != member
+                            && (kind.is_a(*other_kind) || other_kind.is_a(kind))
+                    })
+                    .map(|&(_, other, _)| other)
+                    .collect();
+                if clashes.is_empty() {
+                    seen.push((name, member, kind));
+                    continue;
+                }
+                // Redefined by a member of its own name or of another --
+                // `in v` standing at the place of an inherited `in x`,
+                // which the model does not write down -- it is not
+                // inherited at all (`removeRedefinedFeatures`).
+                let replaced = candidates
+                    .clone()
+                    .into_iter()
+                    .any(|other| other != member && self.reaches(other, member));
+                if replaced {
+                    continue;
+                }
+                for other in clashes {
+                    if !self.reaches(member, other)
+                        && !self.refine_alike(member, other)
+                        && !self.reached_through_a_namesake(member, ty)
+                        && !self.reached_through_a_namesake(other, ty)
+                    {
+                        return false;
+                    }
+                }
+                seen.push((name, member, kind));
+            }
+        }
+        true
+    }
+
+    /// Whether two features redefine one feature between them: `in item
+    /// fuelCmd redefines pwrCmd` written in a port typed by a definition
+    /// whose own `fuelCmd` redefines `pwrCmd` too. Each stands in the
+    /// place of the same inherited feature, under the same name, and
+    /// which of the two a reader means makes no difference to what
+    /// either is the refinement of. The specification's own examples
+    /// write this, and the reference implementation lets it pass.
+    fn refine_alike(&self, one: ElementId, other: ElementId) -> bool {
+        let mut of_one = HashSet::new();
+        self.collect_redefined(one, &mut of_one);
+        if of_one.is_empty() {
+            return false;
+        }
+        let mut of_other = HashSet::new();
+        self.collect_redefined(other, &mut of_other);
+        !of_one.is_disjoint(&of_other)
+    }
+
+    /// Whether `elem` comes from a file other than `ty`'s, under a root
+    /// package that another file declares a root package of the same
+    /// name beside. Which of the two a name then reaches is the
+    /// collision's doing, and `findings` reports the collision: the KerML
+    /// and the SysML editions of the specification's examples both
+    /// declare `VehicleDefinitions`, and loaded together a KerML usage
+    /// inherits the SysML `Wheel`'s `hub` beside the one it declares.
+    fn reached_through_a_namesake(&mut self, elem: ElementId, ty: ElementId) -> bool {
+        if self.element_file(elem) == self.element_file(ty) {
+            return false;
+        }
+        let root = self.root();
+        // the element under the root that `elem` is, or is inside
+        let top = std::iter::successors(Some(elem), |&at| self.model().owner(at))
+            .find(|&at| self.model().owner(at) == Some(root));
+        let Some(name) = top.and_then(|top| self.model().name(top)).map(String::from) else {
+            return false;
+        };
+        self.members_named(root, &name).len() > 1
+    }
+
+    fn owned_distinguishable(&self, namespace: ElementId) -> bool {
+        self.owned_repeats(namespace).is_empty()
+    }
+
+    /// Each owned membership of `namespace` that answers to a name an
+    /// earlier one of a conforming metaclass answers to: the repeat, the
+    /// first, and the name.
+    fn owned_repeats(&self, namespace: ElementId) -> Vec<(ElementId, ElementId, String)> {
+        let mut repeats = Vec::new();
+        let model = self.model();
+        let mut by_name: HashMap<&str, Vec<(ElementId, ElementKind)>> = HashMap::new();
+        for &owned in model.owned(namespace) {
+            let kind = model.kind(owned);
+            // `alias X for A;` is a membership of its own, with a name of
+            // its own, whose member is what it stands for
+            let member = if kind == ElementKind::Membership {
+                match model.maybe(owned, "memberElement") {
+                    Some(sysml_model::Value::Ref(target)) => *target,
+                    _ => continue,
+                }
+            } else if is_bare_relationship(kind) {
+                continue;
+            } else {
+                owned
+            };
+            let names = [
+                model.name(owned),
+                model
+                    .get(owned, "declaredShortName")
+                    .and_then(sysml_model::Value::as_str),
+            ];
+            let mut seen_here: Vec<&str> = Vec::new();
+            for name in names.into_iter().flatten() {
+                // `part def <A> A;` is one membership answering to one
+                // name twice, which is not two memberships
+                if seen_here.contains(&name) {
+                    continue;
+                }
+                seen_here.push(name);
+                let alike = by_name.entry(name).or_default();
+                let member_kind = model.kind(member);
+                let first = alike.iter().find(|&&(other, other_kind)| {
+                    other != owned && (member_kind.is_a(other_kind) || other_kind.is_a(member_kind))
+                });
+                if let Some(&(first, _)) = first {
+                    // said once of each repeat, by the first name it repeats
+                    if !repeats.iter().any(|&(again, _, _)| again == owned) {
+                        repeats.push((owned, first, name.to_string()));
+                    }
+                    continue;
+                }
+                alike.push((owned, member_kind));
+            }
+        }
+        repeats
+    }
+
+    /// Every membership a type inherits: those of everything it specializes,
+    /// and of everything those specialize in turn, less what is private to
+    /// them and less what a redefinition has replaced.
+    ///
+    /// A supertype's imports are inherited with its own memberships, and the
+    /// resolver works out what an import brings in already.
+    pub(crate) fn inherited_memberships(&mut self, elem: ElementId) -> Vec<(ElementId, ElementId)> {
+        let mut queue = self.supertypes(elem);
+        let mut seen = vec![elem];
+        let mut at = 0;
+        let mut memberships: Vec<(ElementId, ElementId)> = Vec::new();
+        while at < queue.len() {
+            let up = queue[at];
+            at += 1;
+            if seen.contains(&up) {
+                continue;
+            }
+            seen.push(up);
+            for member in self.model().owned(up).to_vec() {
+                // what a type keeps to itself is not inherited
+                if self.model().member_visibility(member) == Some(sysml_model::Vis::Private) {
+                    continue;
+                }
+                memberships.push((up, member));
+            }
+            for member in self.inheritable_imported_members(up) {
+                memberships.push((up, member));
+            }
+            queue.extend(self.supertypes(up));
+        }
+        // A feature that redefines another stands in its place, so what
+        // it replaced is not inherited beside it -- whether the
+        // redefining feature is one of these or one the type declares
+        // itself.
+        let mut replaced = HashSet::new();
+        let mine = self.model().owned(elem).to_vec();
+        for &feature in memberships
+            .iter()
+            .map(|(_, member)| member)
+            .chain(mine.iter())
+        {
+            self.collect_redefined(feature, &mut replaced);
+        }
+        // A member declared with a role the standard allows one of
+        // stands in the place of the one that would be inherited: a
+        // requirement's own subject replaces the subject it inherits,
+        // as a function's own result parameter replaces the one of the
+        // function it specializes. The standard says so with an implied
+        // redefinition, which is written into a model only where the
+        // implied relationships are materialised.
+        let mut taken: Vec<Role> = mine
+            .iter()
+            .filter_map(|&it| role_of_one(self, it))
+            .collect();
+        memberships.retain(|(_, member)| {
+            if replaced.contains(member) {
+                return false;
+            }
+            match role_of_one(self, *member) {
+                // nearest first, so the first of a role is the one that
+                // stands and the rest are the ones it stands for
+                Some(role) if taken.contains(&role) => false,
+                Some(role) => {
+                    taken.push(role);
+                    true
+                }
+                None => true,
+            }
+        });
+        memberships
+    }
+
+    /// Everything a feature redefines, directly or through what it
+    /// redefines in turn.
+    fn collect_redefined(&self, feature: ElementId, into: &mut HashSet<ElementId>) {
+        // `redefinedFeature` is Redefinition's alone, so what holds one
+        // is a redefinition and what does not is not
+        for owned in self.model().owned(feature) {
+            let target = match self.model().maybe(*owned, "redefinedFeature") {
+                Some(Value::Ref(target)) => *target,
+                _ => continue,
+            };
+            if into.insert(target) {
+                self.collect_redefined(target, into);
+            }
+        }
     }
 
     /// Evaluate one constraint of one element: whether it holds, or why
@@ -709,13 +1170,20 @@ enum Val {
         member: ElementId,
     },
     Set(Vec<Val>),
+    /// A collection in no order -- a `Set` or a `Bag` -- whose elements
+    /// are still kept in the order they arrived, for whatever reads the
+    /// first of them. Two of these are equal holding the same, however
+    /// each came to be in the order it is: `crossFeature.type->asSet() =
+    /// type->asSet()` asks whether a cross feature has the types its end
+    /// has, not whether it lists them the same way round.
+    Bag(Vec<Val>),
 }
 
 impl Val {
     /// The elements of a value, whether it is one thing or many.
     fn many(&self) -> Vec<Val> {
         match self {
-            Val::Set(items) => items.clone(),
+            Val::Set(items) | Val::Bag(items) => items.clone(),
             Val::Null => Vec::new(),
             other => vec![other.clone()],
         }
@@ -724,8 +1192,18 @@ impl Val {
     fn unknown(&self) -> Option<Val> {
         match self {
             Val::Unknown(_) => Some(self.clone()),
-            Val::Set(items) => items.iter().find_map(Val::unknown),
+            Val::Set(items) | Val::Bag(items) => items.iter().find_map(Val::unknown),
             _ => None,
+        }
+    }
+
+    /// `items`, as a collection kept in order or not as this one is.
+    /// What is selected from a set or collected over one has no order
+    /// either; anything else keeps the one it came in.
+    fn like(&self, items: Vec<Val>) -> Val {
+        match self {
+            Val::Bag(_) => Val::Bag(items),
+            _ => Val::Set(items),
         }
     }
 }
@@ -762,12 +1240,16 @@ impl Scope<'_> {
             // `Sequence{2..n}` is the whole numbers from two to n, not
             // a collection holding one collection: what a range comes
             // to is already the elements.
-            Expr::Collection(items) => Val::Set(
-                items
+            Expr::Collection(items, ordered) => {
+                let items = items
                     .iter()
                     .flat_map(|item| self.eval(item).many())
-                    .collect(),
-            ),
+                    .collect();
+                match ordered {
+                    true => Val::Set(items),
+                    false => Val::Bag(items),
+                }
+            }
             Expr::Name(name) => self.name(name),
             Expr::Not(inner) => match self.eval(inner) {
                 Val::Bool(it) => Val::Bool(!it),
@@ -865,18 +1347,18 @@ impl Scope<'_> {
             Val::Unknown(_) => target.clone(),
             Val::Null => Val::Null,
             // OCL collects a property over a collection
-            Val::Set(items) => {
+            Val::Set(items) | Val::Bag(items) => {
                 let mut out = Vec::new();
                 for item in items {
                     // a collection never holds nothing -- `Set{null}`
                     // is the empty collection -- so what comes back is
                     // either one thing or several
                     match self.navigate(&item.clone(), name) {
-                        Val::Set(more) => out.extend(more),
+                        Val::Set(more) | Val::Bag(more) => out.extend(more),
                         one => out.push(one),
                     }
                 }
-                Val::Set(out)
+                target.like(out)
             }
             Val::Elem(elem) => self.property(*elem, name),
             Val::Membership { owner, member } => self.membership_property(*owner, *member, name),
@@ -1061,6 +1543,21 @@ impl Scope<'_> {
         self.ws.named_globally(qualified)
     }
 
+    /// Whether a name written inside `connector`'s own statement resolved
+    /// to nothing -- which, among what a connector writes, is an end.
+    fn an_end_resolves_to_nothing(&self, connector: ElementId) -> bool {
+        let (Some(file), Some((written, _))) = (
+            self.ws.element_file(connector),
+            self.ws.element_ranges(connector),
+        ) else {
+            return false;
+        };
+        self.ws
+            .unresolved()
+            .iter()
+            .any(|it| it.file == file && written.contains_range(it.range))
+    }
+
     /// One property of one element, or [`Val::Unknown`] where this model
     /// does not carry it.
     fn property(&mut self, elem: ElementId, name: &str) -> Val {
@@ -1093,6 +1590,29 @@ impl Scope<'_> {
             {
                 return Val::Bool(evaluable);
             }
+        }
+        // A connector's ends are what its operands resolved to, and an
+        // operand that resolved to nothing is no end at all: counted, it
+        // says `succession step1 then camera.focusedState;` relates one
+        // feature, which is not what the model says but what the
+        // workspace failed to find. The name is reported as unresolved
+        // already; the count is not this model's to be judged by.
+        if matches!(
+            name,
+            "relatedFeature"
+                | "relatedElement"
+                | "connectorEnd"
+                | "sourceFeature"
+                | "targetFeature"
+                | "target"
+                | "source"
+        ) && self.ws.model().kind(elem).is_a(ElementKind::Connector)
+            && self.an_end_resolves_to_nothing(elem)
+        {
+            return Val::Unknown(format!(
+                "an end of `{}` resolves to nothing",
+                self.ws.qualified_name_of(elem)
+            ));
         }
         let model = self.ws.model();
         let name = written_as_meant(model.kind(elem), name);
@@ -1130,11 +1650,11 @@ impl Scope<'_> {
                         .then_some(member)
                 })
                 .collect();
-            // Owning none of them used to be answered "cannot say", on the grounds
-            // that the builder reifies some of the abstract syntax's relationships
-            // and not others. That cost 188818 answers over the corpus, and the
-            // published abstract syntax says it was wrong: a literal is written
-            // closed on itself, owning nothing.
+            // Owning none of them is not "cannot say", though the builder
+            // reifies some of the abstract syntax's relationships and not
+            // others: the published abstract syntax says a literal is written
+            // closed on itself, owning nothing, and "cannot say" would cost
+            // a great many answers over the corpus.
             //
             // What the metamodel declares single-valued answers with the value rather
             // than a collection of one.
@@ -1349,7 +1869,7 @@ impl Scope<'_> {
         // `maybe` rather than `get`, because this is the one place where any
         // property may fairly be asked of any element: the abstract syntax a
         // constraint reaches through is the specification's rather than this
-        // model's. Six hundred and thirteen pairs go through here that the
+        // model's. Many pairs go through here that the
         // metaclass does not have, and none is a misspelling.
         let held = model.maybe(elem, name).or_else(|| {
             redefining(model.kind(elem), name).and_then(|under| model.maybe(elem, under))
@@ -1418,95 +1938,14 @@ impl Scope<'_> {
         }
     }
 
-    /// Every membership a type inherits: those of everything it specializes,
-    /// and of everything those specialize in turn, less what is private to
-    /// them and less what a redefinition has replaced.
-    ///
-    /// A supertype's imports are inherited with its own memberships, and the
-    /// resolver works out what an import brings in already.
+    /// Every membership a type inherits; see
+    /// [`Workspace::inherited_memberships`].
     fn inherited(&mut self, elem: ElementId) -> Vec<Val> {
-        let mut queue = self.ws.supertypes(elem);
-        let mut seen = vec![elem];
-        let mut at = 0;
-        let mut memberships: Vec<(ElementId, ElementId)> = Vec::new();
-        while at < queue.len() {
-            let up = queue[at];
-            at += 1;
-            if seen.contains(&up) {
-                continue;
-            }
-            seen.push(up);
-            for member in self.ws.model().owned(up).to_vec() {
-                // what a type keeps to itself is not inherited
-                if self.ws.model().member_visibility(member) == Some(sysml_model::Vis::Private) {
-                    continue;
-                }
-                memberships.push((up, member));
-            }
-            for member in self.ws.imported_members(up) {
-                memberships.push((up, member));
-            }
-            queue.extend(self.ws.supertypes(up));
-        }
-        // A feature that redefines another stands in its place, so what
-        // it replaced is not inherited beside it -- whether the
-        // redefining feature is one of these or one the type declares
-        // itself.
-        let mut replaced = HashSet::new();
-        let mine = self.ws.model().owned(elem).to_vec();
-        for &feature in memberships
-            .iter()
-            .map(|(_, member)| member)
-            .chain(mine.iter())
-        {
-            self.collect_redefined(feature, &mut replaced);
-        }
-        // A member declared with a role the standard allows one of
-        // stands in the place of the one that would be inherited: a
-        // requirement's own subject replaces the subject it inherits,
-        // as a function's own result parameter replaces the one of the
-        // function it specializes. The standard says so with an implied
-        // redefinition, which is written into a model only where the
-        // implied relationships are materialised.
-        let mut taken: Vec<Role> = mine
-            .iter()
-            .filter_map(|&it| role_of_one(self.ws, it))
-            .collect();
-        memberships.retain(|(_, member)| {
-            if replaced.contains(member) {
-                return false;
-            }
-            match role_of_one(self.ws, *member) {
-                // nearest first, so the first of a role is the one that
-                // stands and the rest are the ones it stands for
-                Some(role) if taken.contains(&role) => false,
-                Some(role) => {
-                    taken.push(role);
-                    true
-                }
-                None => true,
-            }
-        });
-        memberships
+        self.ws
+            .inherited_memberships(elem)
             .into_iter()
             .map(|(owner, member)| Val::Membership { owner, member })
             .collect()
-    }
-
-    /// Everything a feature redefines, directly or through what it
-    /// redefines in turn.
-    fn collect_redefined(&self, feature: ElementId, into: &mut HashSet<ElementId>) {
-        // `redefinedFeature` is Redefinition's alone, so what holds one
-        // is a redefinition and what does not is not
-        for owned in self.ws.model().owned(feature) {
-            let target = match self.ws.model().maybe(*owned, "redefinedFeature") {
-                Some(Value::Ref(target)) => *target,
-                _ => continue,
-            };
-            if into.insert(target) {
-                self.collect_redefined(target, into);
-            }
-        }
     }
 
     /// A derived property, worked out the way the specification says.
@@ -1577,15 +2016,15 @@ impl Scope<'_> {
         // `supertypes(excludeImplied)->reject(...).nonPrivateMemberships(...)`
         // -- an operation written of many things is written of each of
         // them, the way a property read of many is read of each.
-        if let Val::Set(items) = &target {
+        if let Val::Set(items) | Val::Bag(items) = &target {
             let mut out = Vec::new();
             for item in items.clone() {
                 match self.operation(&item, name, args) {
-                    Val::Set(more) => out.extend(more),
+                    Val::Set(more) | Val::Bag(more) => out.extend(more),
                     one => out.push(one),
                 }
             }
-            return Val::Set(out);
+            return target.like(out);
         }
         self.operation(&target, name, args)
     }
@@ -1627,12 +2066,13 @@ impl Scope<'_> {
             "notEmpty" => Val::Bool(!items.is_empty()),
             // A `Set` and an `OrderedSet` hold each value once; a `Bag`
             // and a `Sequence` hold what they were given.
-            "asSet" | "asOrderedSet" => {
-                Val::Set(once_each(items.iter().flat_map(Val::many).collect()))
-            }
-            "asBag" | "asSequence" | "flatten" => {
-                Val::Set(items.iter().flat_map(Val::many).collect())
-            }
+            // and a `Set` and a `Bag` keep no order, which is what
+            // comparing two of them depends on
+            "asSet" => Val::Bag(once_each(items.iter().flat_map(Val::many).collect())),
+            "asOrderedSet" => Val::Set(once_each(items.iter().flat_map(Val::many).collect())),
+            "asBag" => Val::Bag(items.iter().flat_map(Val::many).collect()),
+            "asSequence" => Val::Set(items.iter().flat_map(Val::many).collect()),
+            "flatten" => target.like(items.iter().flat_map(Val::many).collect()),
             "first" => items.first().cloned().unwrap_or(Val::Null),
             "last" => items.last().cloned().unwrap_or(Val::Null),
             "at" => match taken {
@@ -1677,11 +2117,11 @@ impl Scope<'_> {
             "including" => {
                 let mut out = items;
                 out.push(taken);
-                Val::Set(out)
+                target.like(out)
             }
             "excluding" => {
                 let dropped = taken;
-                Val::Set(
+                target.like(
                     items
                         .into_iter()
                         .filter(|item| equal(item, &dropped) != Val::Bool(true))
@@ -1698,11 +2138,11 @@ impl Scope<'_> {
             "union" => {
                 let mut out = items;
                 out.extend(taken.many());
-                Val::Set(once_each(out))
+                target.like(once_each(out))
             }
             "intersection" => {
                 let other = taken.many();
-                Val::Set(
+                target.like(
                     items
                         .into_iter()
                         .filter(|item| other.iter().any(|it| equal(item, it) == Val::Bool(true)))
@@ -1755,7 +2195,7 @@ impl Scope<'_> {
                         kind.name()
                     ));
                 }
-                Val::Set(kept)
+                target.like(kept)
             }
             "closure" => {
                 // The transitive closure: the body read of each element, then of
@@ -1778,7 +2218,7 @@ impl Scope<'_> {
                         }
                     }
                 }
-                Val::Set(found)
+                target.like(found)
             }
             "forAll" | "exists" | "select" | "reject" | "collect" | "any" => {
                 let mut kept = Vec::new();
@@ -1791,7 +2231,7 @@ impl Scope<'_> {
                         // "the result is flattened": a `collect` whose
                         // body comes to many things adds each of them,
                         // not the collection they arrived in
-                        ("collect", Val::Set(more)) => kept.extend(more.clone()),
+                        ("collect", Val::Set(more) | Val::Bag(more)) => kept.extend(more.clone()),
                         ("collect", _) => kept.push(value),
                         ("forAll", Val::Bool(false)) => return Val::Bool(false),
                         ("exists", Val::Bool(true)) => return Val::Bool(true),
@@ -1805,7 +2245,9 @@ impl Scope<'_> {
                     "forAll" => Val::Bool(true),
                     "exists" => Val::Bool(false),
                     "any" => kept.first().cloned().unwrap_or(Val::Null),
-                    _ => Val::Set(kept),
+                    // what is collected over a set has no order, as what
+                    // is selected from one has none
+                    _ => target.like(kept),
                 }
             }
             _ => Val::Unknown(format!("`->{name}` is not implemented")),
@@ -2164,7 +2606,36 @@ fn equal(left: &Val, right: &Val) -> Val {
         // a property with nothing in it is the empty collection or null
         // depending on how the metamodel declared it, and a rule asking
         // whether it is null means the same by both
-        (Val::Null, Val::Set(items)) | (Val::Set(items), Val::Null) => Val::Bool(items.is_empty()),
+        (Val::Null, Val::Set(items) | Val::Bag(items))
+        | (Val::Set(items) | Val::Bag(items), Val::Null) => Val::Bool(items.is_empty()),
+        // A set or a bag is the same as another holding the same, each
+        // as many times, in whatever order: `Set{1, 2} = Set{2, 1}`.
+        // Only where both keep an order does the order count.
+        (Val::Bag(one), Val::Bag(other) | Val::Set(other)) | (Val::Set(one), Val::Bag(other)) => {
+            if one.len() != other.len() {
+                return Val::Bool(false);
+            }
+            let mut unmatched: Vec<&Val> = other.iter().collect();
+            for item in one {
+                match unmatched
+                    .iter()
+                    .position(|it| equal(item, it) == Val::Bool(true))
+                {
+                    Some(at) => {
+                        unmatched.swap_remove(at);
+                    }
+                    None => return Val::Bool(false),
+                }
+            }
+            Val::Bool(true)
+        }
+        (Val::Set(one), Val::Set(other)) => Val::Bool(
+            one.len() == other.len()
+                && one
+                    .iter()
+                    .zip(other)
+                    .all(|(a, b)| equal(a, b) == Val::Bool(true)),
+        ),
         _ => Val::Bool(left == right),
     }
 }
@@ -2267,7 +2738,7 @@ fn redefining(kind: ElementKind, name: &str) -> Option<&'static str> {
 /// `featuringTypes`, `associationEnds`, `connectorEnds`,
 /// `featureMemberships` and `subsettedFeatures` are written that way and
 /// declared in the singular. There is no other reading, and the
-/// alternative is answering none of the six constraints that navigate
+/// alternative is answering none of the constraints that navigate
 /// through them.
 ///
 /// Only where the written name is declared nowhere on the metaclass, so a
@@ -2442,7 +2913,7 @@ mod tests {
         (ws, elem)
     }
 
-    /// Twenty-two constraints are about a membership, and this model
+    /// Some constraints are about a membership, and this model
     /// keeps the containment one stands for rather than the membership
     /// itself. Put back together, they are asked of what the model does
     /// hold -- and what one of them reports is the member, which is
@@ -3043,6 +3514,37 @@ mod tests {
         assert_eq!(ws.judge("self.specializes(self)", car), Some(true));
     }
 
+    /// A `Set` and a `Bag` keep no order, so two of them holding the same
+    /// are equal however each lists it; an `OrderedSet` and a `Sequence`
+    /// keep one, and are equal only in the same order. Compared as lists,
+    /// `validateFeatureCrossFeatureType` -- `crossFeature.type->asSet() =
+    /// type->asSet()` -- failed an end whose cross feature named the
+    /// same two types the other way round.
+    #[test]
+    fn a_set_is_equal_to_another_holding_the_same_in_any_order() {
+        let (mut ws, car) = about("part def Car;\n", "Car");
+        for (ocl, holds) in [
+            ("Set{1, 2} = Set{2, 1}", true),
+            ("Bag{1, 2, 2} = Bag{2, 1, 2}", true),
+            ("Bag{1, 2, 2} = Bag{1, 1, 2}", false),
+            ("Set{1, 2} = Set{1, 3}", false),
+            ("Sequence{1, 2}->asSet() = Sequence{2, 1}->asSet()", true),
+            ("Set{1, 2}->select(n | n > 0) = Set{2, 1}", true),
+            ("Set{1, 2}->including(3) = Set{3, 2, 1}", true),
+            ("Set{1, 2}->collect(n | n) = Bag{2, 1}", true),
+            ("Set{Set{1, 2}} = Set{Set{2, 1}}", true),
+            ("Sequence{1, 2} = Sequence{2, 1}", false),
+            ("OrderedSet{1, 2} = OrderedSet{2, 1}", false),
+            (
+                "Sequence{1, 2}->asOrderedSet() = Sequence{2, 1}->asOrderedSet()",
+                false,
+            ),
+            ("Sequence{1, 2} = Sequence{1, 2}", true),
+        ] {
+            assert_eq!(ws.judge(ocl, car), Some(holds), "{ocl}");
+        }
+    }
+
     /// A number the model stores, of the two kinds it stores.
     #[test]
     fn a_number_in_the_model_is_read_as_one() {
@@ -3118,7 +3620,7 @@ mod tests {
         // be hiding.
         //
         // Relationships answer the same way and once did not: an empty answer was
-        // called ambiguous, and the doubt cost 188818 answers over the corpus.
+        // called ambiguous, and the doubt costs a great many answers over the corpus.
         // The published abstract syntax settles it -- a literal is written closed
         // on itself, owning nothing.
         let (mut ws, car) = about("part def Car;\n", "Car");
@@ -3567,12 +4069,16 @@ mod tests {
     /// whose memberElement is a Feature.` Asking it needs the implicit
     /// iterator as well, since the constraint binds no variable to read
     /// the memberships of.
+    ///
+    /// The value is a name rather than a literal: with no library loaded
+    /// here, a literal has no result to inherit, and the value assigned is
+    /// in the model as the second argument.
     #[test]
     fn what_an_assignment_refers_to_is_there_to_be_asked_for() {
         let mut ws = Workspace::new();
         let file = ws.add_file(
             "test.sysml",
-            "action def A {\n\tattribute v;\n\taction x;\n\tassign v := 1;\n}\n",
+            "action def A {\n\tattribute v;\n\tattribute w;\n\taction x;\n\tassign v := w;\n}\n",
         );
         ws.resolve_all();
         let checked = ws.check_rules(&[file]);
@@ -3791,6 +4297,27 @@ mod tests {
         );
     }
 
+    /// What [`MISREAD`] mends is written in the specification exactly
+    /// where it says, once, and the rule reads either way -- otherwise the
+    /// mending is a replacement of nothing, and the rule is the one that
+    /// reported every variation.
+    #[test]
+    fn what_is_misread_is_where_the_specification_writes_it() {
+        for (name, written, meant) in MISREAD {
+            let rule = sysml_model::RULES
+                .iter()
+                .find(|it| it.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is one of the specification's rules"));
+            assert_eq!(rule.ocl.matches(written).count(), 1, "`{name}`");
+            let mended = closed(name, rule.ocl);
+            assert!(
+                mended.contains(meant) && !mended.contains(written),
+                "`{name}`"
+            );
+            assert!(crate::ocl::parse(&mended).is_ok(), "`{name}`");
+        }
+    }
+
     /// Every constraint is asked of every element of its metaclass, and
     /// what cannot be asked is named rather than passed over.
     #[test]
@@ -3805,7 +4332,7 @@ mod tests {
         // carrying what they are rather than a model's answer
         let named: Vec<&str> = checked.unevaluated.iter().map(|(name, _)| *name).collect();
         assert!(
-            named.contains(&"validateUsageVariationSpecialization"),
+            named.contains(&"validateRedefinitionFeaturingTypes"),
             "{named:?}"
         );
         // and every reason says what could not be answered

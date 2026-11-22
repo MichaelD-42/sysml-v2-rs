@@ -72,6 +72,14 @@ pub fn parse_dialect(text: &str, dialect: crate::Dialect) -> Parse {
         gave_up: false,
         plain_target: false,
         carries_payload: false,
+        in_metadata_body: false,
+        opens_metadata_body: false,
+        declaring_effect: false,
+        stops_at_then: false,
+        handed_body: false,
+        connector_ends: false,
+        named: false,
+        guard: false,
     };
     parser.source_file();
     Parse {
@@ -90,6 +98,20 @@ pub fn parse_dialect(text: &str, dialect: crate::Dialect) -> Parse {
 /// nests about a dozen deep, so the limit is only ever reached by input
 /// nobody wrote by hand.
 const MAX_DEPTH: usize = 512;
+
+/// Whether what leads a statement lets a kind keyword follow in its tail:
+/// `then action b`, `return part x`, `end x [1] feature y`. Anywhere else
+/// a kind keyword starts the next declaration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Licence {
+    /// Only after one of the words that declares part-way through.
+    No,
+    /// Straight away, and on through the words that may stand before the
+    /// kind keyword.
+    Next,
+    /// Anywhere in the tail.
+    Throughout,
+}
 
 struct Parser<'t> {
     text: &'t str,
@@ -114,6 +136,33 @@ struct Parser<'t> {
     /// KerML's `binding ab of a = b` writes the same shape and means a
     /// connector end, so which statement it is decides which it means.
     carries_payload: bool,
+    /// Inside the body of a metadata usage, where a bare `x = 1;` is
+    /// what `:>> x = 1;` says: `MetadataBodyUsage = 'ref'? (':>>' |
+    /// 'redefines')? OwnedRedefinition ...`. The name is the feature of
+    /// the metadata definition being given a value, not a new one.
+    in_metadata_body: bool,
+    /// The body the element being read opens, if it opens one, is such
+    /// a body.
+    opens_metadata_body: bool,
+    /// The declaration about to be read is the action a transition's `do`
+    /// writes, which a `then` may follow straight after its name.
+    declaring_effect: bool,
+    /// The declaration being read is such an effect, which ends where the
+    /// transition's `then` begins.
+    stops_at_then: bool,
+    /// While reading the ends an n-ary connector lists.
+    connector_ends: bool,
+    /// The declaration whose tail is about to be read has a name, which
+    /// a reference or a value may not follow without a word between.
+    named: bool,
+    /// The expression about to be read is a transition's guard, the one
+    /// place an `if` stands without the `?` of a conditional expression:
+    /// `accept S if ready then on`.
+    guard: bool,
+    /// The declaration about to be read is the body an `if` or a `while`
+    /// is handed, `if c action t { } else ...`, whose `else` is the
+    /// node's own and not this declaration's.
+    handed_body: bool,
 }
 
 impl Parser<'_> {
@@ -130,6 +179,15 @@ impl Parser<'_> {
 
     fn current(&self) -> SyntaxKind {
         self.nth(0)
+    }
+
+    /// Is the n-th upcoming non-trivia token a name spelled `word`?
+    fn nth_is_word(&self, n: usize, word: &str) -> bool {
+        self.tokens[self.pos..]
+            .iter()
+            .filter(|t| !t.kind.is_trivia())
+            .nth(n)
+            .is_some_and(|t| t.kind == IDENT && &self.text[t.range.clone()] == word)
     }
 
     fn at(&self, kind: SyntaxKind) -> bool {
@@ -255,23 +313,40 @@ impl Parser<'_> {
         matches!(self.nth(n), IDENT | UNRESTRICTED_NAME)
     }
 
+    /// Whether a qualified name starts `n` tokens on: a name, or the
+    /// `$::` of `QualifiedName = ( '$' '::' )? ( Name '::' )* Name` that
+    /// roots it at the global namespace. Where only a reference can stand
+    /// -- after `@`, `#`, or `metadata` with no name of its own -- a test
+    /// for a name alone turned `@$::P::code` away.
+    fn nth_starts_qualified(&self, n: usize) -> bool {
+        self.nth_is_name(n) || (self.nth(n) == DOLLAR && self.nth(n + 1) == COLON_COLON)
+    }
+
     /// A bare name that the next token confirms to be a declaration
     /// (`level = 3;`, `x : T;`, enum values `red;`).
     fn at_anonymous_usage(&self) -> bool {
-        self.at_name()
-            && matches!(
-                self.nth(1),
-                COLON
-                    | COLON_GT
-                    | COLON_GT_GT
-                    | COLON_COLON_GT
-                    | EQ
-                    | COLON_EQ
-                    | SEMICOLON
-                    | L_BRACE
-                    | L_BRACKET
-                    | DEFAULT_KW
-            )
+        self.at_anonymous_usage_from(0)
+    }
+
+    /// [`Self::at_anonymous_usage`], `n` tokens on: past the `<a>` of
+    /// `<a> b : T;`, which `Identification = ( '<' declaredShortName '>'
+    /// )? declaredName?` lets a kind-less usage open with as well.
+    ///
+    /// `ordered` and `nonunique` alone are a `MultiplicityPart`, which is
+    /// a `FeatureSpecializationPart` of its own: `x ordered;`.
+    fn at_anonymous_usage_from(&self, n: usize) -> bool {
+        self.nth_is_name(n)
+            && (self.nth(n + 1).specializes_a_feature()
+                || matches!(
+                    self.nth(n + 1),
+                    EQ | COLON_EQ
+                        | SEMICOLON
+                        | L_BRACE
+                        | L_BRACKET
+                        | DEFAULT_KW
+                        | ORDERED_KW
+                        | NONUNIQUE_KW
+                ))
     }
 
     /// Does `(` open a parameter list (rather than an expression)?
@@ -281,10 +356,49 @@ impl Parser<'_> {
             || k1.is_def_kind_kw()
             || k1 == L_BRACKET // `([1] myCart, [0..1] products)`
             || (matches!(k1, IDENT | UNRESTRICTED_NAME)
-                && matches!(
-                    self.nth(2),
-                    COLON | COLON_GT | COLON_GT_GT | COLON_COLON_GT | COLON_EQ | DEFAULT_KW
-                ))
+                && (self.nth(2).specializes_a_feature() || matches!(self.nth(2), COLON_EQ | DEFAULT_KW)))
+    }
+
+    /// The type an `accept` written with no payload name waits for.
+    ///
+    /// The name after `accept` is that type unless what follows it
+    /// declares it as the payload's name.
+    fn opt_accepted_type(&mut self) {
+        let names_the_payload = matches!(
+            self.nth(1),
+            COLON
+                | TYPED_KW
+                | DEFINED_KW
+                | COLON_GT
+                | SPECIALIZES_KW
+                | SUBSETS_KW
+                | CROSSES_KW
+                | COLON_GT_GT
+                | REDEFINES_KW
+                | COLON_COLON_GT
+                | REFERENCES_KW
+                | EQ
+                | COLON_EQ
+                | DEFAULT_KW
+                | L_BRACKET
+                | DOT
+                // `accept sig after 10[s]` names the payload a trigger
+                // gives a value: `Identification ... TriggerValuePart`
+                | WHEN_KW
+                | AT_KW
+                | AFTER_KW
+        );
+        if self.at_name() && !names_the_payload {
+            self.start_node(TYPING);
+            self.type_ref();
+            self.finish_node();
+        } else if self.nth(1) != DOT {
+            // `accept s : Sig` declares the payload `s`: `PayloadFeature =
+            // Identification PayloadFeatureSpecializationPart ...`. Read as
+            // a reference, it was a name that resolved to nothing standing
+            // where the payload's name belongs.
+            self.opt_name();
+        }
     }
 
     fn at_expr_start(&self) -> bool {
@@ -298,6 +412,8 @@ impl Parser<'_> {
                 | TRUE_KW
                 | FALSE_KW
                 | NULL_KW
+                // `ExtentExpression = 'all' TypeResultMember`
+                | ALL_KW
                 | L_PAREN
                 | MINUS
                 | PLUS
@@ -333,11 +449,17 @@ impl Parser<'_> {
 
     fn member_inner(&mut self) {
         let cp = self.checkpoint();
+        let mut seen_visibility = false;
         // visibility and `#name` user-defined-keyword prefixes, in any order
         loop {
-            if self.at(HASH) && self.nth_is_name(1) {
+            if self.at(HASH) && self.nth_starts_qualified(1) {
                 self.opt_prefix_metadata();
             } else if self.current().is_visibility_kw() {
+                if seen_visibility {
+                    self.error_and_bump("a member has one visibility, and it is already given");
+                    continue;
+                }
+                seen_visibility = true;
                 self.bump();
             } else {
                 break;
@@ -369,6 +491,10 @@ impl Parser<'_> {
             SPECIALIZATION_KW | SUBCLASSIFIER_KW | SUBTYPE_KW | SUBSET_KW | REDEFINITION_KW
             | CONJUGATION_KW | DISJOINING_KW | DISJOINT_KW | INVERTING_KW | INVERSE_KW
             | FEATURING_KW | TYPING_KW => self.lead_stmt(cp, RELATION_STMT),
+            // `conjugate A ~ B;` -- `Conjugation = ( 'conjugation'
+            // Identification )? 'conjugate' ...`, the way `subtype A :> B;`
+            // goes without its `specialization`
+            CONJUGATE_KW => self.lead_stmt(cp, RELATION_STMT),
             // `render asElementTable { ... }` renders by the rendering it
             // names, the way `perform` performs by the action it names;
             // `render rendering r1 : R` declares one instead.
@@ -413,6 +539,30 @@ impl Parser<'_> {
             COLON_GT | COLON_GT_GT | COLON_COLON_GT | SPECIALIZES_KW | SUBSETS_KW
             | REDEFINES_KW | REFERENCES_KW | CROSSES_KW | EQ | COLON_EQ => {
                 self.start_node_at(cp, USAGE);
+                self.usage_tail();
+                self.finish_node();
+            }
+            // `x = 1;` in a metadata body gives a feature of the metadata
+            // definition its value, as `:>> x = 1;` would
+            _ if self.in_metadata_body && self.at_anonymous_usage() => {
+                self.start_node_at(cp, USAGE);
+                self.start_node(REDEFINITION);
+                self.type_ref();
+                self.finish_node();
+                self.usage_tail();
+                self.finish_node();
+            }
+            // `<r> red;` in an enumeration, `<a> b : T;` -- a kind-less
+            // usage with a short name: `EnumeratedValue = 'enum'? Usage`
+            LT if self.nth_is_name(1)
+                && self.nth(2) == GT
+                && (self.at_anonymous_usage_from(3)
+                    || self.nth(3).specializes_a_feature()
+                    || matches!(self.nth(3), SEMICOLON | L_BRACE | L_BRACKET)) =>
+            {
+                self.start_node_at(cp, USAGE);
+                self.opt_short_name();
+                self.opt_name();
                 self.element_tail();
                 self.finish_node();
             }
@@ -426,11 +576,7 @@ impl Parser<'_> {
             _ if self.at_expr_start() => {
                 self.start_node_at(cp, EXPR_STMT);
                 self.expression();
-                if self.at(L_BRACE) {
-                    // structured control: `if i < 0 { ... }`
-                    self.body();
-                }
-                self.eat(SEMICOLON);
+                self.end_expression_statement();
                 self.finish_node();
             }
             _ => self.error_and_bump(format!(
@@ -449,6 +595,7 @@ impl Parser<'_> {
             self.error(format!("expected `package`, found {:?}", self.current()));
         }
         self.opt_short_name();
+        self.named = self.at_name();
         self.opt_name();
         self.element_tail();
         self.finish_node();
@@ -469,6 +616,8 @@ impl Parser<'_> {
             self.expect(R_BRACKET);
             self.finish_node();
         }
+        // `import SI::mm mm;` imports one name, and nothing follows it
+        self.named = true;
         self.element_tail();
         self.finish_node();
     }
@@ -481,6 +630,7 @@ impl Parser<'_> {
         self.opt_name();
         self.expect(FOR_KW);
         self.qualified_name_chain();
+        self.named = true;
         self.element_tail();
         self.finish_node();
     }
@@ -552,10 +702,22 @@ impl Parser<'_> {
     fn metadata_annotation(&mut self, cp: Checkpoint) {
         self.start_node_at(cp, METADATA_ANNOTATION);
         self.bump();
-        if self.at_name() {
+        if self.nth_starts_qualified(0) {
             self.qualified_name_chain();
+            self.named = true;
+            // `@m typed by M`: the same `MetadataUsageDeclaration` as
+            // after `metadata`, whose `typed` SysML does not reserve
+            if self.nth_is_word(0, "typed") && self.nth(1) == BY_KW {
+                self.start_node(TYPING);
+                self.bump(); // `typed`
+                self.bump(); // `by`
+                self.type_ref();
+                self.finish_node();
+            }
+        } else {
+            self.error("expected the metadata definition the annotation is of");
         }
-        self.element_tail();
+        self.metadata_tail();
         self.finish_node();
     }
 
@@ -564,8 +726,59 @@ impl Parser<'_> {
         self.start_node_at(cp, node);
         let led = self.current();
         self.bump();
+        if self.at(led) {
+            self.error_and_bump("this is written twice");
+        }
+        self.opt_statement_name(led);
         self.element_tail_from(led);
         self.finish_node();
+    }
+
+    /// The name a relationship written as a statement of its own declares:
+    /// `specialization Gen subtype A specializes B;`, `dependency Use from
+    /// A to B;`. It is there only where the keyword that introduces what
+    /// is related follows it -- `specialization subtype A ...` names
+    /// nothing -- and read as a reference, it was a name that resolved to
+    /// nothing and a relationship with no name.
+    fn opt_statement_name(&mut self, led: SyntaxKind) {
+        let relates = |kind: SyntaxKind| match led {
+            SPECIALIZATION_KW => matches!(
+                kind,
+                SUBTYPE_KW | SUBCLASSIFIER_KW | SUBSET_KW | REDEFINITION_KW | TYPING_KW
+            ),
+            CONJUGATION_KW => kind == CONJUGATE_KW,
+            DISJOINING_KW => kind == DISJOINT_KW,
+            INVERTING_KW => kind == INVERSE_KW,
+            FEATURING_KW => kind == OF_KW,
+            DEPENDENCY_KW => kind == FROM_KW,
+            _ => false,
+        };
+        if led == FOR_KW {
+            // `for i in xs` and `for n : T in xs` declare the loop
+            // variable: `ForVariableDeclarationMember = UsageDeclaration`
+            if self.at_name() && matches!(self.nth(1), IN_KW | COLON | TYPED_KW) {
+                self.opt_name();
+                self.named = true;
+            }
+            return;
+        }
+        self.opt_short_name();
+        if self.at_name() && (relates(self.nth(1)) || led.is_control_node_kw()) {
+            self.opt_name();
+            self.named = true;
+        }
+    }
+
+    /// `merge m;`, `then fork F { ... }`: the name after a control node's
+    /// keyword is the one it declares -- `MergeNode = ControlNodePrefix
+    /// 'merge' UsageDeclaration ActionBody` -- however the statement goes
+    /// on.
+    fn control_node(&mut self) -> bool {
+        self.bump();
+        self.opt_short_name();
+        let named = self.at_name();
+        self.opt_name();
+        named
     }
 
     /// `transition <shortName>? Name? first a then b;`
@@ -587,20 +800,33 @@ impl Parser<'_> {
     fn adapter_usage(&mut self, cp: Checkpoint) {
         self.start_node_at(cp, USAGE);
         self.eat(NOT_KW); // `not satisfy r1 by p;`
+        let led = self.current();
         self.bump();
+        if self.at(led) {
+            self.error_and_bump("this is written twice");
+        }
         self.eat(NOT_KW);
         self.opt_prefix_metadata(); // `assume #goal constraint c;`
         if self.current().is_def_kind_kw() {
             self.def_kind_keywords();
             self.opt_short_name();
-            self.opt_decl_name();
+            // after a kind keyword the name is always the one declared --
+            // `ActionUsageDeclaration`, `'requirement' UsageDeclaration` --
+            // so whatever follows it says nothing about that: checked
+            // against the tokens a declaration is known to go on with,
+            // `exhibit state s parallel { ... }` lost its name to a
+            // reference that resolved to nothing
+            let before = self.pos;
+            self.opt_name();
             if self.at(L_PAREN) {
                 self.param_list();
             }
+            self.named = self.pos != before;
         } else if self.at_expr_start() {
             self.plain_target = true;
             self.expression();
             self.plain_target = false;
+            self.named = true;
         }
         self.element_tail();
         self.finish_node();
@@ -609,8 +835,21 @@ impl Parser<'_> {
     /// `subject x : T;`, `return x;`, `variant part v;`, `render asTree;`
     fn kw_usage(&mut self, cp: Checkpoint) {
         self.start_node_at(cp, USAGE);
-        let variant = self.at(VARIANT_KW);
+        let led = self.current();
         self.bump();
+        // `variant w;` names a usage the model already has: `VariantReference
+        // = OwnedReferenceSubsetting FeatureSpecialization* UsageBody`, and
+        // only a kind keyword -- `variant part w;` -- declares one. Read as a
+        // declaration, it made a second `w` that refers to nothing.
+        if led == VARIANT_KW && self.at_name() {
+            self.plain_target = true;
+            self.expression();
+            self.plain_target = false;
+            self.named = true;
+            self.element_tail();
+            self.finish_node();
+            return;
+        }
         // `ActorUsage : PartUsage = 'actor' UsageExtensionKeyword* Usage`,
         // and the same shape for `subject`, `stakeholder`, `objective`,
         // `return` and `variant`: the keyword comes first and the
@@ -619,7 +858,7 @@ impl Parser<'_> {
         self.opt_prefix_metadata();
         // `VariantUsageElement` is a full usage, so the kind comes before the
         // name: `variant part <'PC-2'> radar;`
-        if variant {
+        if led == VARIANT_KW {
             while self.current().is_modifier_kw() {
                 self.bump();
             }
@@ -629,8 +868,12 @@ impl Parser<'_> {
             }
         }
         self.opt_short_name();
+        let before = self.pos;
         self.opt_decl_name();
-        self.element_tail();
+        self.named = self.pos != before;
+        // `return part x;`, `variant part v;`: the keyword leads a
+        // declaration its kind keyword comes after
+        self.element_tail_licensed(led, Licence::Next);
         self.finish_node();
     }
 
@@ -644,6 +887,9 @@ impl Parser<'_> {
             if k == USE_KW {
                 self.eat(CASE_KW);
             }
+            if self.at(k) {
+                self.error_and_bump("this is already said of the declaration");
+            }
             if !matches!(k, ASSOC_KW | SUCCESSION_KW) {
                 break;
             }
@@ -653,7 +899,7 @@ impl Parser<'_> {
     /// Definitions and usages share modifiers and kind keywords; `def` (or a
     /// KerML classifier kind) decides definition vs usage.
     fn opt_prefix_metadata(&mut self) {
-        while self.at(HASH) && self.nth_is_name(1) {
+        while self.at(HASH) && self.nth_starts_qualified(1) {
             self.start_node(PREFIX_METADATA);
             self.bump();
             self.qualified_name_chain();
@@ -673,10 +919,28 @@ impl Parser<'_> {
     }
 
     fn definition_or_usage_inner(&mut self, cp: Checkpoint) {
+        let effect = std::mem::take(&mut self.declaring_effect);
+        let handed = std::mem::take(&mut self.handed_body);
+        let mut ended = false;
+        let mut prefixed = false;
+        let mut written: Vec<SyntaxKind> = Vec::new();
         loop {
             if self.current().is_modifier_kw() {
+                let here = self.current();
+                ended |= here == END_KW;
+                prefixed = true;
+                let direction = |k: SyntaxKind| matches!(k, IN_KW | OUT_KW | INOUT_KW);
+                if written.contains(&here) {
+                    self.error_and_bump("this is already said of the declaration");
+                    continue;
+                }
+                if direction(here) && written.iter().any(|&k| direction(k)) {
+                    self.error_and_bump("a feature has one direction, and it is already given");
+                    continue;
+                }
+                written.push(here);
                 self.bump();
-            } else if self.at(HASH) && self.nth_is_name(1) {
+            } else if self.at(HASH) && self.nth_starts_qualified(1) {
                 self.opt_prefix_metadata();
             } else {
                 break;
@@ -685,7 +949,9 @@ impl Parser<'_> {
         // `abstract message messages : M ...` — message declarations after
         // modifiers behave like a usage kind
         self.carries_payload = self.at(MESSAGE_KW);
-        self.eat(MESSAGE_KW);
+        if self.eat(MESSAGE_KW) && self.at(MESSAGE_KW) {
+            self.error_and_bump("this is already said of the declaration");
+        }
         let is_classifier = matches!(
             self.current(),
             TYPE_KW
@@ -706,6 +972,9 @@ impl Parser<'_> {
         // out in front of it. `metadata Classified { ... }` says what
         // `@Classified { ... }` says.
         let is_metadata = self.at(METADATA_KW);
+        let is_connector = self.at(CONNECTOR_KW);
+        let kinded = self.current().is_def_kind_kw();
+        let kind_kw = self.current();
         self.def_kind_keywords();
         let node = if self.at(DEF_KW) || is_classifier {
             DEFINITION
@@ -715,12 +984,31 @@ impl Parser<'_> {
         self.start_node_at(cp, node);
         self.eat(DEF_KW);
         self.eat(ALL_KW); // `struct all Curve` — sufficiency marker
+                          // `inv false x { ... }` negates the invariant: `Invariant =
+                          // FeaturePrefix 'inv' ( 'true' | isNegated ?= 'false' )?
+                          // FeatureDeclaration? ...`, before the name it declares
+        if kind_kw == INV_KW && matches!(self.current(), TRUE_KW | FALSE_KW) {
+            self.bump();
+        }
         self.opt_prefix_metadata();
         self.opt_short_name();
+        let before = self.pos;
+        // what a nameless definition may go straight on to:
+        // `DefinitionDeclaration = Identification? SubclassificationPart?`,
+        // and KerML's `TypeRelationshipPart`s after it
+        let relates = matches!(
+            self.current(),
+            SPECIALIZES_KW
+                | CONJUGATES_KW
+                | DISJOINT_KW
+                | UNIONS_KW
+                | INTERSECTS_KW
+                | DIFFERENCES_KW
+        ) && (self.nth_is_name(1) || self.nth(1) == FROM_KW);
         if node == DEFINITION {
             // `def` has been read, and a definition's name is the only
             // thing that belongs after it
-            if self.current().is_keyword() {
+            if self.current().is_keyword() && !relates {
                 self.keyword_as_name();
             } else {
                 self.opt_name();
@@ -730,12 +1018,100 @@ impl Parser<'_> {
         } else {
             // usages: only take a name the next token confirms, so that
             // `flow p1.torque to p2.torque;` keeps `p1.torque` an expression
+            self.declaring_effect = effect;
+            self.opt_decl_name();
+            self.declaring_effect = false;
+        }
+        // Only what connects may open on the features it connects --
+        // `flow a.b to c.d`, `succession a then b`, `binding x = y`;
+        // anything else has a name there or nothing, and `part 123;` or
+        // `part x :: A;` read as a usage with a stray expression after it
+        let connects = matches!(
+            kind_kw,
+            FLOW_KW
+                | SUCCESSION_KW
+                | BINDING_KW
+                | CONNECTOR_KW
+                | CONNECTION_KW
+                | INTERFACE_KW
+                | ALLOCATION_KW
+        );
+        // Some words that start an expression also belong straight after
+        // the kind keyword of a nameless declaration: `action if c { }`
+        // (`ActionNodeUsageDeclaration = 'action' UsageDeclaration?`
+        // before an `IfNode`), `inv false { ... }` (`'inv' ( 'true' |
+        // 'false' )?`) and `type ~ A;` (`ConjugationPart`). A name the
+        // next token did not confirm is only wrong here when a path goes
+        // on from it; `part x` still being typed has its own error.
+        let belongs = match self.current() {
+            IF_KW | TILDE => true,
+            IDENT | UNRESTRICTED_NAME => !matches!(self.nth(1), COLON_COLON | DOT),
+            _ => false,
+        };
+        if self.pos == before
+            && !is_metadata
+            && (kind_kw.is_def_kind_kw() || node == DEFINITION)
+            && !connects
+            && self.at_expr_start()
+            && !self.at(L_PAREN)
+            && !belongs
+        {
+            let word = &self.text[self.current_range()];
+            let message = if self.at_name() {
+                format!("expected the name it declares: `{word}` goes on into a path, and a declared name is one name")
+            } else {
+                format!("expected the name it declares, found `{word}`")
+            };
+            self.error(message);
+        }
+        let unnamed = self.pos == before && self.at(L_BRACKET);
+        // `end [*] ref cause : Situation;` writes a cross multiplicity
+        // between the `end` and the declaration of the end, as `end [1]
+        // part x : T;` does: `EndUsagePrefix = 'end'
+        // OwnedCrossMultiplicityMember? ...`. With no kind keyword after
+        // it the declaration went on as the end's own, and its name was
+        // read as a reference to nothing.
+        if ended && !kinded && node == USAGE && unnamed {
+            self.multiplicity();
+            // only the run of prefixes straight up to the name: `end [1] in
+            // ordered part bead` names its end after a kind keyword, which
+            // reads the way it always has
+            let mut ahead = 0;
+            while self.nth(ahead).is_modifier_kw() {
+                ahead += 1;
+            }
+            if ahead > 0 && self.nth_is_name(ahead) {
+                let nested = self.checkpoint();
+                self.definition_or_usage(nested);
+                self.finish_node();
+                return;
+            }
             self.opt_decl_name();
         }
-        if self.at(L_PAREN) {
+        if self.at(L_PAREN) && is_connector {
+            // KerML's `connector c (a, b, c);` lists the ends it connects
+            self.connector_ends();
+        } else if self.at(L_PAREN) {
             self.param_list();
         }
-        self.element_tail();
+        let stops = std::mem::replace(&mut self.stops_at_then, effect);
+        self.named = self.pos != before;
+        self.handed_body = handed;
+        if is_metadata && node == USAGE {
+            self.metadata_tail();
+        } else if ended {
+            // `end x [1..*] feature y : T;` goes on to declare the end's
+            // feature, which is what lets a kind keyword follow
+            self.element_tail_licensed(EOF, Licence::Throughout);
+        } else if prefixed && !kinded {
+            // `in event occurrence e;`, `variation perform action a;`:
+            // the modifiers lead a declaration their kind keyword comes
+            // after, by way of the word that adapts it
+            self.element_tail_licensed(EOF, Licence::Next);
+        } else {
+            self.element_tail();
+        }
+        self.stops_at_then = stops;
         self.carries_payload = false;
         self.finish_node();
     }
@@ -753,15 +1129,175 @@ impl Parser<'_> {
     /// written after `then` is the action the succession runs into,
     /// where the same shape after `do` is the statement's own body.
     fn element_tail_from(&mut self, led: SyntaxKind) {
+        let licence = match led {
+            // `for i in xs { ... }`: the `in` is the statement's own
+            FOR_KW => Licence::Throughout,
+            _ => Licence::No,
+        };
+        self.element_tail_licensed(led, licence);
+    }
+
+    /// [`element_tail_from`], told whether what leads the statement lets
+    /// a kind keyword follow.
+    fn element_tail_licensed(&mut self, led: SyntaxKind, licence: Licence) {
         // What the last turn of the loop dispatched on, starting from
         // the lead-in, so `then action { ... }` reads alike whether the
         // `then` opened the statement or came part-way through it.
         let mut previous = led;
+        let handed = std::mem::take(&mut self.handed_body);
+        // `if c action t { }` and `while c action b { }` hand the node its
+        // body as a declaration: `ActionBodyParameter = ( 'action'
+        // UsageDeclaration? )? '{' ActionBodyItem* '}'`, once, after what
+        // the node asks
+        let mut hands = matches!(led, IF_KW | WHILE_KW);
+        if led == ACCEPT_KW {
+            let before = self.pos;
+            self.opt_accepted_type();
+            self.named |= self.pos != before;
+        }
+        // Whether a kind keyword may come next. Only a few words declare
+        // something part-way through a statement -- `then action b`, `do
+        // action D`, `end x [1] feature y` -- with any modifiers between
+        // (`then event occurrence e`). Anywhere else a kind keyword is the
+        // next declaration, and this one was left without its `;`: `part
+        // def A` then `part a : A;` on the next line read as one
+        // declaration owning the other, with no error, and the formatter
+        // then joined the two lines into one.
+        let opens = |kind: SyntaxKind| {
+            matches!(
+                kind,
+                THEN_KW | ELSE_KW | FIRST_KW | DO_KW | ENTRY_KW | EXIT_KW | LOOP_KW
+            )
+        };
+        // and what may stand between that word and the kind keyword
+        let keeps = |kind: SyntaxKind| {
+            kind.is_def_kind_kw()
+                || kind.is_modifier_kw()
+                || kind.is_visibility_kw()
+                || matches!(
+                    kind,
+                    PERFORM_KW
+                        | EXHIBIT_KW
+                        | EVENT_KW
+                        | INCLUDE_KW
+                        | SATISFY_KW
+                        | ASSERT_KW
+                        | ASSUME_KW
+                        | REQUIRE_KW
+                        | VERIFY_KW
+                        | FRAME_KW
+                )
+        };
+        let mut throughout = licence == Licence::Throughout;
+        let mut licensed = licence != Licence::No || opens(led);
+        // Whether what was read last ends an operand -- a name, a type, a
+        // value, a multiplicity -- that another may not follow until some
+        // word joins them: `part x y;`, `part x : A B;`, `part x = 1 2;`
+        // and `part x [1] [2];` say nothing a model can mean.
+        let mut operand = std::mem::take(&mut self.named);
+        let mut counted = false;
+        // What a declaration says once: its typing, its value and each
+        // of `ordered` and `nonunique`. A word that joins a second
+        // operand -- `connect a to b`, `first a then b` -- starts afresh.
+        let mut given: Vec<SyntaxKind> = Vec::new();
         loop {
             let here = self.current();
+            // no keyword of a statement is written twice in a row, and
+            // no comma: `send send x`, `via via p`, `a, , b`
+            // -- save the words that each lead an operand of their own:
+            // `redefines a redefines b`, `unions A unions B`
+            let leads_operand = matches!(
+                here,
+                TYPED_KW
+                    | DEFINED_KW
+                    | SPECIALIZES_KW
+                    | SUBSETS_KW
+                    | CROSSES_KW
+                    | REDEFINES_KW
+                    | REFERENCES_KW
+                    | CHAINS_KW
+                    | UNIONS_KW
+                    | INTERSECTS_KW
+                    | DIFFERENCES_KW
+                    | DISJOINT_KW
+                    | INVERSE_KW
+                    | FEATURED_KW
+                    | CONJUGATES_KW
+                    | ABOUT_KW
+            );
+            if here == previous && !leads_operand && (here.is_keyword() || here == COMMA) {
+                self.error_and_bump("this is written twice");
+                continue;
+            }
+            let once = match here {
+                COLON | TYPED_KW | DEFINED_KW => Some(COLON),
+                EQ | COLON_EQ | DEFAULT_KW => Some(EQ),
+                ORDERED_KW | NONUNIQUE_KW => Some(here),
+                _ => None,
+            };
+            if let Some(once) = once {
+                if given.contains(&once) {
+                    self.error(match once {
+                        COLON => "the declaration is already typed: more types are listed with `,`",
+                        EQ => "the declaration is already given a value",
+                        _ => "this is already said of the declaration",
+                    });
+                }
+                given.push(once);
+            } else if matches!(
+                here,
+                OF_KW | FROM_KW | TO_KW | VIA_KW | THEN_KW | ELSE_KW | FIRST_KW | DO_KW | BY_KW
+                    | ACCEPT_KW | SEND_KW | ASSIGN_KW | CONNECT_KW | BIND_KW | ALLOCATE_KW
+                    | FOR_KW | AT_KW | AFTER_KW | WHEN_KW | IF_KW | COMMA | L_PAREN
+                    // KerML may type a feature again after another of
+                    // its relationships: `feature x1 subsets g typed by
+                    // A subsets f typed by B`
+                    | COLON_GT | SPECIALIZES_KW | SUBSETS_KW | CROSSES_KW | COLON_GT_GT
+                    | REDEFINES_KW | COLON_COLON_GT | REFERENCES_KW
+            ) {
+                given.clear();
+            }
+            let was_operand = std::mem::replace(
+                &mut operand,
+                matches!(
+                    here,
+                    COLON
+                        | TYPED_KW
+                        | DEFINED_KW
+                        | COLON_GT
+                        | SPECIALIZES_KW
+                        | SUBSETS_KW
+                        | CROSSES_KW
+                        | COLON_GT_GT
+                        | REDEFINES_KW
+                        | COLON_COLON_GT
+                        | REFERENCES_KW
+                        | EQ
+                        | COLON_EQ
+                        | DEFAULT_KW
+                        | CHAINS_KW
+                        | UNIONS_KW
+                        | INTERSECTS_KW
+                        | DIFFERENCES_KW
+                        | DISJOINT_KW
+                        | INVERSE_KW
+                        | FEATURED_KW
+                        | CONJUGATES_KW
+                        | CONJUGATE_KW
+                        | TILDE
+                        | ABOUT_KW
+                ),
+            );
+            let was_counted = std::mem::replace(&mut counted, here == L_BRACKET);
             let after_flow = matches!(previous, THEN_KW | ELSE_KW | FIRST_KW);
+            let after_connect = matches!(previous, CONNECT_KW | ALLOCATE_KW);
+            let after_do = previous == DO_KW;
             previous = here;
+            let may_declare = throughout || licensed;
+            licensed = opens(here) || (licensed && keeps(here));
             match here {
+                // `do action D then S2;` -- the `then` is the transition's
+                THEN_KW if self.stops_at_then => return,
                 SEMICOLON => {
                     self.start_node(BODY);
                     self.bump();
@@ -771,8 +1307,20 @@ impl Parser<'_> {
                 L_BRACE => {
                     self.body();
                     // `if c { ... } else { ... }` carries on past its
-                    // first body; nothing else in the language does
-                    if self.at(ELSE_KW) {
+                    // first body; nothing else in the language does --
+                    // and a body handed to an `if` leaves its `else` to it
+                    if self.at(ELSE_KW) && !handed {
+                        // `else if d { ... }` hands the branch an `if` of
+                        // its own -- `ActionBodyParameterMember |
+                        // IfNodeParameterMember` -- and read on in this
+                        // statement its condition was a loose expression
+                        // and its body a second `else`
+                        if self.nth(1) == IF_KW {
+                            self.bump(); // `else`
+                            let cp = self.checkpoint();
+                            self.if_member(cp);
+                            return;
+                        }
                         continue;
                     }
                     return;
@@ -791,11 +1339,17 @@ impl Parser<'_> {
                 | INVERSE_KW | FEATURED_KW | CONJUGATES_KW | CONJUGATE_KW | TILDE => {
                     self.kerml_relation_part()
                 }
+                L_BRACKET if was_counted => {
+                    self.error("a multiplicity is already given");
+                    self.multiplicity();
+                }
                 L_BRACKET => self.multiplicity(),
                 EQ | COLON_EQ | DEFAULT_KW => self.value_part(),
                 ABOUT_KW => self.about_part(),
                 // `( cause1 ::> causer1, ... )` is a parameter list;
                 // `for n in (1, 2, 3)` is an expression
+                // `connect ([1] w.a, [1] w.b, [2] w.c)` lists the ends
+                L_PAREN if self.at_param_list() && after_connect => self.connector_ends(),
                 L_PAREN if self.at_param_list() => self.param_list(),
                 L_PAREN => self.expression(),
                 // statement continuation keywords and misc glue
@@ -805,27 +1359,94 @@ impl Parser<'_> {
                 // KerML also writes `binding instant[n] of [0..1] a = ...`,
                 // where what follows `of` is a multiplicity rather than the
                 // payload's type
-                OF_KW if self.nth_is_name(1) => self.payload_part(),
-                OF_KW | FROM_KW | TO_KW | VIA_KW | THEN_KW | ELSE_KW | FIRST_KW | ACCEPT_KW
-                | AT_KW | AFTER_KW | WHEN_KW | UNTIL_KW | WHILE_KW | DO_KW | BY_KW | ALL_KW
-                | PARALLEL_KW | ASSIGN_KW | SEND_KW | MERGE_KW | DECIDE_KW | FORK_KW | JOIN_KW
-                | TERMINATE_KW | LOOP_KW | FOR_KW | NEW_KW | ORDERED_KW | NONUNIQUE_KW
-                | CONNECT_KW | BIND_KW | MESSAGE_KW | ALLOCATE_KW | SUBTYPE_KW | SUBSET_KW
+                // `inverting i inverse a of b;` and `featuring f of g by T;`
+                // relate the feature after `of`, and carry no payload
+                OF_KW
+                    if self.nth_is_name(1)
+                        && !matches!(led, INVERTING_KW | INVERSE_KW | FEATURING_KW) =>
+                {
+                    self.payload_part();
+                    operand = true;
+                }
+                // `accept S;` waits for an `S`: `PayloadFeature = ... |
+                // OwnedFeatureTyping OwnedMultiplicity?`. A lone name is the
+                // type, since naming the payload takes the `:` (or a value)
+                // that `accept s : S` writes after it. Read as a name, the
+                // payload was called `S` and typed by nothing.
+                ACCEPT_KW => {
+                    self.bump();
+                    let before = self.pos;
+                    self.opt_accepted_type();
+                    operand = self.pos != before;
+                }
+                OF_KW | FROM_KW | TO_KW | VIA_KW | THEN_KW | ELSE_KW | FIRST_KW | AT_KW
+                | AFTER_KW | WHEN_KW | UNTIL_KW | WHILE_KW | DO_KW | BY_KW | ALL_KW
+                | PARALLEL_KW | ASSIGN_KW | SEND_KW | TERMINATE_KW | LOOP_KW | ORDERED_KW
+                | NONUNIQUE_KW | CONNECT_KW | BIND_KW | ALLOCATE_KW | SUBTYPE_KW | SUBSET_KW
                 | REDEFINITION_KW | TYPING_KW | SPECIALIZATION_KW | SUBCLASSIFIER_KW | COMMA
                 | QUESTION | QUESTION_QUESTION | FAT_ARROW | LANGUAGE_KW => self.bump(),
-                // nested declarations inside statements: `then perform body;`,
-                // `then private action whileLoop { ... }`
+                k if k.is_control_node_kw() => operand = self.control_node(),
+                // `action f for i in xs { ... }` declares its loop variable
+                // as the statement form does
+                FOR_KW => {
+                    self.bump();
+                    self.opt_statement_name(FOR_KW);
+                    // the loop variable is this tail's operand, and left
+                    // in the flag it would be taken by the first member
+                    // of the body: `action f for i in xs { first a then
+                    // b; }` read `a` as following a name
+                    operand = std::mem::take(&mut self.named);
+                    // `for i : T in xs`: the `in` is the loop's own
+                    throughout = true;
+                }
+                // `then timeslice bob { ... }` declares the portion the
+                // flow runs into, and the name after the portion kind is
+                // its own, as it is when no `then` leads
+                TIMESLICE_KW | SNAPSHOT_KW if after_flow => {
+                    self.bump();
+                    let before = self.pos;
+                    self.opt_decl_name();
+                    operand = self.pos != before;
+                }
+                // `then message m of T` declares the message the flow
+                // runs into, before what it carries
+                MESSAGE_KW => {
+                    self.bump();
+                    let before = self.pos;
+                    self.opt_decl_name();
+                    operand = self.pos != before;
+                }
+                // `then event o.e[1];`, `then perform body;`, `then include
+                // u { ... }`: the step the flow runs into, declared the way
+                // the same words declare it as a member -- `then action a`
+                // already is. Read as loose words of the statement, what
+                // the step adapts was never looked up, and `then perform
+                // nope;` passed.
                 PERFORM_KW | EXHIBIT_KW | EVENT_KW | INCLUDE_KW | SATISFY_KW | ASSERT_KW
-                | ASSUME_KW | REQUIRE_KW | VERIFY_KW | FRAME_KW => self.bump(),
+                | ASSUME_KW | REQUIRE_KW | VERIFY_KW | FRAME_KW => {
+                    if after_flow {
+                        let nested = self.checkpoint();
+                        self.adapter_usage(nested);
+                        return;
+                    }
+                    self.bump();
+                }
+                k if k.is_visibility_kw() && !may_declare => {
+                    self.error_and_bump("a visibility stands before the member it is of")
+                }
                 k if k.is_visibility_kw() => self.bump(),
                 // `connect [1] lugNutPort ::> wheel.lugNutPort to ...` — a
                 // named connector end; parse just the name and its
                 // reference so `to`/`from` stay with the enclosing statement
                 _ if self.at_name() && matches!(self.nth(1), COLON_COLON_GT | REFERENCES_KW) => {
+                    if was_operand {
+                        self.error("a connector end names itself before what it references, and nothing joins it to what comes before");
+                    }
                     self.start_node(USAGE);
                     self.opt_name();
                     self.relationship_part(REFERENCES);
                     self.finish_node();
+                    operand = true;
                 }
                 // `end [0..1] #M feature x : X;` — a prefix metadata
                 // annotation may follow the multiplicity, since
@@ -834,7 +1455,7 @@ impl Parser<'_> {
                 // annotates is the feature the declaration goes on to
                 // name, so it opens the nested declaration rather than
                 // being read as part of the one already open.
-                HASH if self.nth_is_name(1) => {
+                HASH if self.nth_starts_qualified(1) && may_declare => {
                     let nested = self.checkpoint();
                     self.definition_or_usage(nested);
                     return;
@@ -843,15 +1464,62 @@ impl Parser<'_> {
                 // feature declaration ends the enclosing element, and so
                 // does the nameless `then action { ... }`, which declares
                 // the action the succession runs into
-                k if k.is_def_kind_kw()
+                k if may_declare
+                    && k.is_def_kind_kw()
                     && (self.nth_is_name(1) || (after_flow && self.nth(1) == L_BRACE)) =>
                 {
                     let nested = self.checkpoint();
+                    self.declaring_effect = after_do;
                     self.definition_or_usage(nested);
+                    if after_do && self.at(THEN_KW) {
+                        continue;
+                    }
                     return;
                 }
-                k if k.is_def_kind_kw() || k.is_modifier_kw() => self.bump(),
-                _ if self.at_expr_start() => self.expression(),
+                ACTION_KW
+                    if hands && was_operand && (self.nth_is_name(1) || self.nth(1) == L_BRACE) =>
+                {
+                    hands = false;
+                    let nested = self.checkpoint();
+                    self.handed_body = true;
+                    self.definition_or_usage(nested);
+                    // the `until` after a loop's body closes it as a
+                    // statement of its own, as after `loop action b { }`
+                    if self.at(ELSE_KW) {
+                        continue;
+                    }
+                    return;
+                }
+                k if may_declare && (k.is_def_kind_kw() || k.is_modifier_kw()) => self.bump(),
+                // the next declaration, where this one should have ended:
+                // said here, and left for the body to read as its own
+                k if k.is_def_kind_kw() || k.is_modifier_kw() => {
+                    let word = self.tokens[self.pos..]
+                        .iter()
+                        .find(|t| !t.kind.is_trivia())
+                        .map_or("", |t| &self.text[t.range.clone()]);
+                    self.error(format!(
+                        "expected `;` or `{{` before `{word}`: the declaration before it is not ended"
+                    ));
+                    return;
+                }
+                // `if` guards a transition: `accept S if ready then on`
+                _ if self.at_expr_start() && was_operand && !matches!(here, L_PAREN | IF_KW) => {
+                    let word = self.tokens[self.pos..]
+                        .iter()
+                        .find(|t| !t.kind.is_trivia())
+                        .map_or("", |t| &self.text[t.range.clone()]);
+                    self.error(format!(
+                        "unexpected `{word}`: nothing joins it to what comes before"
+                    ));
+                    self.expression();
+                    operand = true;
+                }
+                _ if self.at_expr_start() => {
+                    self.guard = here == IF_KW;
+                    self.expression();
+                    operand = true;
+                }
                 _ => self.error_and_bump(format!(
                     "unexpected token {:?} in declaration",
                     self.current()
@@ -875,28 +1543,73 @@ impl Parser<'_> {
             self.expression();
             if self.eat(ELSE_KW) {
                 self.expression();
+            } else {
+                self.error("expected `else`: a conditional expression gives both values");
             }
             self.start_node_at(cp, COND_EXPR);
             self.finish_node();
             self.start_node_at(cp, EXPR_STMT);
-            self.eat(SEMICOLON);
+            self.end_expression_statement();
             self.finish_node();
             return;
         }
         self.start_node_at(cp, CONTROL_STMT);
-        self.element_tail();
+        // `if f f.image then shoot;`: the condition is one expression
+        self.named = true;
+        self.element_tail_from(IF_KW);
         self.finish_node();
+    }
+
+    /// What ends an expression written as a member: a `;`, or the end
+    /// of the body it is the result of. Anything else -- `speed speed :
+    /// T;`, `{ a.b b.c < 1 }`, `xs->forAll forAll { ... }` -- runs two
+    /// members together.
+    fn end_expression_statement(&mut self) {
+        if self.eat(SEMICOLON) || matches!(self.current(), R_BRACE | EOF) {
+            return;
+        }
+        if self.at(L_BRACE) {
+            // read as a body all the same, so what it holds is not
+            // taken for members of the one around it
+            self.error("an expression has no body: expected `;`");
+            self.body();
+            return;
+        }
+        self.error("expected `;` after the expression");
     }
 
     /// `{ member* }`
     fn body(&mut self) {
         self.start_node(BODY);
         self.bump();
+        let outer = self.in_metadata_body;
+        self.in_metadata_body = std::mem::take(&mut self.opens_metadata_body);
+        let stops = std::mem::take(&mut self.stops_at_then);
         while !matches!(self.current(), R_BRACE | EOF) {
             self.member();
         }
+        self.stops_at_then = stops;
+        self.in_metadata_body = outer;
         self.expect(R_BRACE);
         self.finish_node();
+    }
+
+    /// The rest of a kind-less usage, whose body is a metadata body when
+    /// it is itself written in one.
+    fn usage_tail(&mut self) {
+        if self.in_metadata_body {
+            self.metadata_tail();
+        } else {
+            self.element_tail();
+        }
+    }
+
+    /// Read the rest of an element whose body, if it has one, is the body
+    /// of a metadata usage.
+    fn metadata_tail(&mut self) {
+        self.opens_metadata_body = true;
+        self.element_tail();
+        self.opens_metadata_body = false;
     }
 
     /// A comma continues a type-reference list only when what follows looks
@@ -910,6 +1623,9 @@ impl Parser<'_> {
     fn continues_ref_list(&self) -> bool {
         self.at(COMMA)
             && (self.nth_is_name(1) || self.nth(1) == TILDE)
+            // only the symbols: `subsets step, usage subsets M::items`
+            // continues the list and then opens another clause, which a
+            // keyword here would have read as a declaration of `usage`
             && !matches!(
                 self.nth(2),
                 COLON | COLON_GT | COLON_GT_GT | COLON_COLON_GT | COLON_EQ | DEFAULT_KW
@@ -937,7 +1653,11 @@ impl Parser<'_> {
         self.start_node(kind);
         self.bump();
         self.type_ref();
-        while self.continues_ref_list() {
+        // `References = REFERENCES OwnedReferenceSubsetting` names one
+        // feature and no list: in `connect (a ::> w.a, b references w.b)`
+        // the comma ends the connector end, and taken as a second target
+        // it swallowed the next end's name
+        while kind != REFERENCES && self.continues_ref_list() {
             self.bump();
             self.type_ref();
         }
@@ -962,18 +1682,18 @@ impl Parser<'_> {
                      // it, not a payload named `CallGiveItems`: a declaration must say
                      // what the payload specializes -- or, in a flow, give it a value,
                      // which is `PayloadFeature = Identification ValuePart`.
-        let declared = matches!(
-            self.nth(1),
-            COLON | COLON_GT | COLON_GT_GT | TYPED_KW | DEFINED_KW
-        ) || (self.carries_payload
-            && matches!(self.nth(1), EQ | COLON_EQ | DEFAULT_KW));
+        let declared = self.nth(1).specializes_a_feature()
+            || (self.carries_payload && matches!(self.nth(1), EQ | COLON_EQ | DEFAULT_KW));
         if declared {
             self.opt_name();
             loop {
                 match self.current() {
                     COLON | TYPED_KW | DEFINED_KW => self.typing_part(),
-                    COLON_GT | SPECIALIZES_KW | SUBSETS_KW => self.relationship_part(SUBSETTING),
+                    COLON_GT | SPECIALIZES_KW | SUBSETS_KW | CROSSES_KW => {
+                        self.relationship_part(SUBSETTING)
+                    }
                     COLON_GT_GT | REDEFINES_KW => self.relationship_part(REDEFINITION),
+                    COLON_COLON_GT | REFERENCES_KW => self.relationship_part(REFERENCES),
                     L_BRACKET => self.multiplicity(),
                     EQ | COLON_EQ | DEFAULT_KW => self.value_part(),
                     _ => break,
@@ -1013,6 +1733,11 @@ impl Parser<'_> {
             FEATURED_KW => {
                 self.eat(BY_KW);
             }
+            // `~ ~ A` says nothing `A` does not: the type it conjugates
+            // is named once
+            CONJUGATES_KW | CONJUGATE_KW | TILDE if self.at(TILDE) => {
+                self.error_and_bump("this is written twice");
+            }
             _ => {}
         }
         self.type_ref();
@@ -1028,11 +1753,26 @@ impl Parser<'_> {
     fn multiplicity(&mut self) {
         self.start_node(MULTIPLICITY);
         self.bump();
-        while !matches!(
+        // `[n * 2]` and `[1..count]` bound by expressions, whose names
+        // are references like any other: read as tokens, a name in a
+        // bound was never looked up, and one that names nothing passed
+        // as a bound nobody could read. `0..*` is one range expression,
+        // and `*` alone is the literal it is anywhere else.
+        if self.at_expr_start() {
+            self.expr_bp(0);
+        }
+        if !matches!(
             self.current(),
             R_BRACKET | SEMICOLON | L_BRACE | R_BRACE | EOF
         ) {
-            self.bump();
+            // `[2 2]`, `[ [*]`: a multiplicity is one bound or one range
+            self.error("expected `]`: a multiplicity is one bound or one range");
+            while !matches!(
+                self.current(),
+                R_BRACKET | SEMICOLON | L_BRACE | R_BRACE | EOF
+            ) {
+                self.bump();
+            }
         }
         self.expect(R_BRACKET);
         self.finish_node();
@@ -1048,6 +1788,10 @@ impl Parser<'_> {
         }
         if self.at_expr_start() || self.at(L_BRACE) {
             self.expression();
+        } else if !self.at(L_BRACKET) {
+            // KerML's `binding [1] a = [1] b` gives the other end its
+            // multiplicity first
+            self.error("expected the value it is given");
         }
         self.finish_node();
     }
@@ -1057,6 +1801,10 @@ impl Parser<'_> {
         self.start_node(PARAM_LIST);
         self.bump();
         while !matches!(self.current(), R_PAREN | EOF) {
+            if self.at(COMMA) {
+                self.error_and_bump("expected a parameter before the `,`");
+                continue;
+            }
             self.param();
             if !self.eat(COMMA) {
                 break;
@@ -1064,6 +1812,19 @@ impl Parser<'_> {
         }
         self.expect(R_PAREN);
         self.finish_node();
+    }
+
+    /// `( end, end, ... )`: what an n-ary connector connects.
+    ///
+    /// Read as a parameter list, with one difference: an end names a
+    /// feature it references, and declares a name of its own only with
+    /// `references` -- `ConnectorEnd = OwnedCrossMultiplicityMember? (
+    /// NAME REFERENCES )? OwnedReferenceSubsetting`. Read as a parameter,
+    /// `connector c (a, b, cc);` declared three features beside its ends.
+    fn connector_ends(&mut self) {
+        self.connector_ends = true;
+        self.param_list();
+        self.connector_ends = false;
     }
 
     fn param(&mut self) {
@@ -1077,6 +1838,19 @@ impl Parser<'_> {
         if self.at(L_BRACKET) {
             // `[1] myCart` — multiplicity before the parameter name
             self.multiplicity();
+        }
+        // `connect ([1] w.a, [1] w.b)`: a connector end may write the
+        // feature it references as a chain, and a chain is never the name
+        // of a declaration -- `ConnectorEnd = OwnedCrossMultiplicityMember?
+        // ( NAME REFERENCES )? OwnedReferenceSubsetting`
+        let referenced = matches!(self.nth(1), DOT | COLON_COLON)
+            || (self.connector_ends && !matches!(self.nth(1), COLON_COLON_GT | REFERENCES_KW));
+        if self.at_name() && referenced {
+            self.start_node(REFERENCES);
+            self.type_ref();
+            self.finish_node();
+            self.finish_node();
+            return;
         }
         self.opt_short_name();
         self.opt_name();
@@ -1109,10 +1883,10 @@ impl Parser<'_> {
     ///
     /// Both notations reserve their keywords, and a name that collides
     /// with one is written in single quotes: `part def 'frame';`. Bare,
-    /// the keyword used to fall through to [`Self::element_tail`], which
-    /// sweeps up loose keywords -- so the definition came out with no
-    /// name at all, and nothing was said, because nothing had asked for
-    /// one.
+    /// the keyword would fall through to [`Self::element_tail`], which
+    /// sweeps up loose keywords -- so the definition would come out with
+    /// no name at all, and nothing would be said, because nothing asked
+    /// for one.
     ///
     /// Only after `def` (or a KerML classifier keyword), where a name is
     /// the one thing that belongs. A usage's name is not so certain:
@@ -1135,17 +1909,42 @@ impl Parser<'_> {
 
     /// A name is only consumed when the following token confirms this is a
     /// declaration (used for `return x;` vs `return x * 2;`).
-    /// The name of a metadata usage, which only a `:` or a `typed by`
-    /// after it makes one. Without one the name is the metadata
-    /// definition the usage is typed by, and the typing that says so is
-    /// built around it here -- `metadata Classified { ... }` reads as
-    /// `metadata : Classified { ... }`.
+    /// The name of a metadata usage, which only a `:`, a `typed by` or a
+    /// `defined by` after it makes one. Without one the name is the
+    /// metadata definition the usage is typed by, and the typing that
+    /// says so is built around it here -- `metadata Classified { ... }`
+    /// reads as `metadata : Classified { ... }`, and so does `metadata
+    /// $::P::Classified { ... }`, whose `$::` no name can begin.
+    ///
+    /// `defined by` is SysML's `DEFINED_BY = ':' | 'defined' 'by'`, the
+    /// spelling of the `:` everywhere else a usage is typed; read as
+    /// typings, `metadata m defined by M;` had two and no name.
     fn opt_typing_name(&mut self) {
+        if self.at(DOLLAR) && self.nth(1) == COLON_COLON {
+            self.start_node(TYPING);
+            self.type_ref();
+            self.finish_node();
+            return;
+        }
         if !self.at_name() {
             return;
         }
-        if matches!(self.nth(1), COLON | TYPED_KW) {
+        if matches!(self.nth(1), COLON | TYPED_KW)
+            || (self.nth(1) == DEFINED_KW && self.nth(2) == BY_KW)
+        {
             self.opt_name();
+            return;
+        }
+        // `MetadataUsageDeclaration = ( Identification ( ':' | 'typed' 'by'
+        // ) )? ...` writes `typed by` here though SysML reserves no
+        // `typed`, so it comes as a name
+        if self.nth_is_word(1, "typed") && self.nth(2) == BY_KW {
+            self.opt_name();
+            self.start_node(TYPING);
+            self.bump(); // `typed`
+            self.bump(); // `by`
+            self.type_ref();
+            self.finish_node();
             return;
         }
         self.start_node(TYPING);
@@ -1207,7 +2006,27 @@ impl Parser<'_> {
                     // `succession s first a then b;` and `transition t
                     // first a then b;` declare themselves before `first`
                     | FIRST_KW
+                    // `action aa accept S;`, `state s parallel { ... }`,
+                    // `action stop terminate;`, `action a assign x := 1;`:
+                    // an action node or a state written with its own name
+                    // in front of what it does. Read as a reference, the
+                    // action had no name at all.
+                    | ACCEPT_KW
+                    | SEND_KW
+                    | TERMINATE_KW
+                    | ASSIGN_KW
+                    | PARALLEL_KW
+                    // `then action aLoop while i > 0 { ... }`: a loop
+                    // node, and an `if`, named before what it asks
+                    | WHILE_KW
+                    | LOOP_KW
+                    | FOR_KW
+                    | IF_KW
             )
+            // `accept s do action D then S2;` declares the effect `D` of
+            // the transition, which goes on to its target; anywhere
+            // else `succession a then b` makes `a` where the flow starts
+            || self.at_name() && self.declaring_effect && self.nth(1) == THEN_KW
         {
             self.opt_name();
         }
@@ -1218,8 +2037,17 @@ impl Parser<'_> {
         if self.at(LT) {
             self.start_node(SHORT_NAME);
             self.bump();
-            while !matches!(self.current(), GT | SEMICOLON | L_BRACE | R_BRACE | EOF) {
+            // `'<' NAME '>'`: one name, as `< <'3'>` is not
+            if self.at_name() {
                 self.bump();
+            } else {
+                self.error(format!("expected a short name, found {:?}", self.current()));
+            }
+            if !matches!(self.current(), GT | SEMICOLON | L_BRACE | R_BRACE | EOF) {
+                self.error("expected `>`: a short name is one name");
+                while !matches!(self.current(), GT | SEMICOLON | L_BRACE | R_BRACE | EOF) {
+                    self.bump();
+                }
             }
             self.expect(GT);
             self.finish_node();
@@ -1303,8 +2131,16 @@ impl Parser<'_> {
         let cp = self.checkpoint();
         match self.current() {
             NOT_KW | MINUS | PLUS | TILDE | ALL_KW => {
+                let all = self.at(ALL_KW);
                 self.start_node(UNARY_EXPR);
                 self.bump();
+                // `ExtentExpression = 'all' TypeResultMember`: a type
+                if all && !self.at_name() {
+                    self.error(format!(
+                        "expected the type `all` gives the extent of, found {:?}",
+                        self.current()
+                    ));
+                }
                 self.expr_bp(13);
                 self.finish_node();
             }
@@ -1313,6 +2149,8 @@ impl Parser<'_> {
                 self.bump();
                 if self.at_name() {
                     self.qualified_name_chain();
+                } else {
+                    self.error("expected the type it tests for");
                 }
                 self.finish_node();
             }
@@ -1337,6 +2175,7 @@ impl Parser<'_> {
             IF_KW => {
                 // `if c ? t else f` (a lone `if c` is left open for
                 // transition guards: `accept x if c then s`)
+                let guard = std::mem::take(&mut self.guard);
                 self.start_node(COND_EXPR);
                 self.bump();
                 self.expr_bp(0);
@@ -1344,7 +2183,11 @@ impl Parser<'_> {
                     self.expr_bp(0);
                     if self.eat(ELSE_KW) {
                         self.expr_bp(0);
+                    } else {
+                        self.error("expected `else`: a conditional expression gives both values");
                     }
+                } else if !guard {
+                    self.error("expected `?`: a conditional expression says what it gives");
                 }
                 self.finish_node();
             }
@@ -1431,7 +2274,24 @@ impl Parser<'_> {
                     match self.current() {
                         L_PAREN => self.arg_list(),
                         L_BRACE => self.body_expr(),
-                        UNRESTRICTED_NAME | STRING => self.bump(),
+                        // `xs->reduce max` and `xs->reduce '+'` hand over the
+                        // function they name: `FunctionReferenceExpression =
+                        // FunctionReferenceMember`, a reference like any
+                        // other. Left outside the expression, `max` was
+                        // looked up by nothing.
+                        IDENT | UNRESTRICTED_NAME => {
+                            self.start_node(NAME_REF);
+                            self.bump();
+                            while self.at(COLON_COLON) && self.nth_is_name(1) {
+                                self.bump();
+                                self.bump();
+                            }
+                            self.finish_node();
+                            // `xs->size size()`: one of the three, not two
+                            if matches!(self.current(), L_PAREN | L_BRACE) {
+                                self.error("`->` takes its arguments, a body or a function, and only one of them");
+                            }
+                        }
                         _ => {}
                     }
                     self.finish_node();
@@ -1476,10 +2336,20 @@ impl Parser<'_> {
             if type_rhs {
                 if self.at_name() || self.at(TILDE) {
                     self.type_ref();
+                } else if matches!(
+                    self.current(),
+                    ISTYPE_KW | HASTYPE_KW | AS_KW | META_KW | AT | AT_AT
+                ) {
+                    self.error_and_bump("this is written twice");
+                    self.expr_bp(13);
                 } else {
                     self.expr_bp(13);
                 }
             } else {
+                // `a * * (b)`: `*` stands for a bound only in a range
+                if self.at(STAR) && lbp >= 10 {
+                    self.error("expected an operand, found `*`");
+                }
                 self.expr_bp(lbp + 1);
             }
             self.finish_node();
@@ -1537,7 +2407,10 @@ fn binary_bp(kind: SyntaxKind) -> Option<(u8, bool)> {
         XOR_KW => (4, false),
         AND_KW | AMP => (5, false),
         EQ_EQ | NOT_EQ | EQ_EQ_EQ | NOT_EQ_EQ => (6, false),
-        ISTYPE_KW | HASTYPE_KW | AS_KW | META_KW => (7, true),
+        // `ClassificationTestOperator = 'istype' | 'hastype' | '@'` and
+        // `MetaClassificationTestOperator = '@@'`: left out, `xs @ T` read
+        // as `xs` with a stray annotation after it, and `T` went unread
+        ISTYPE_KW | HASTYPE_KW | AS_KW | META_KW | AT | AT_AT => (7, true),
         LT | GT | LT_EQ | GT_EQ => (8, false),
         DOT_DOT => (9, false),
         PLUS | MINUS => (10, false),
@@ -1557,6 +2430,331 @@ mod tests {
         assert_eq!(parse.errors(), &[], "unexpected errors for:\n{text}");
         assert_eq!(parse.syntax().text().to_string(), text, "lossless violated");
         parse
+    }
+
+    /// A declaration left without its `;` is an error where the next one
+    /// begins, and the next one is a declaration of its own. It is not
+    /// read as owned by the one before it with no error at all, which
+    /// would let `fmt --write` join the two lines into one.
+    #[test]
+    fn a_declaration_without_its_semicolon_is_an_error() {
+        for text in [
+            "part def A\npart a : A;\n",
+            "package P\npart x;\n",
+            "part x\npart y;\n",
+            "attribute a = 1\nattribute b = 2;\n",
+            "part def A :> B\npart c;\n",
+            "part def A\nabstract part c;\n",
+            "part def A\nprivate part c;\n",
+            "part def A\nref part c;\n",
+            "port def A\nport p;\n",
+            "enum def E\nenum a;\n",
+            "part def A part;\n",
+            "part part part;\n",
+            "part def A abstract ref in out;\n",
+        ] {
+            let parse = parse(text);
+            let said: Vec<&str> = parse
+                .errors()
+                .iter()
+                .map(|it| it.message.as_str())
+                .collect();
+            let unended = said
+                .iter()
+                .any(|it| it.contains("the declaration before it is not ended"));
+            assert!(unended, "{text:?}: {said:?}");
+            assert_eq!(parse.syntax().text().to_string(), text, "lossless violated");
+        }
+        // the next declaration is a sibling, not a member
+        let parse = parse("part def A\npart a : A;\n");
+        let top: Vec<SyntaxKind> = parse.syntax().children().map(|it| it.kind()).collect();
+        assert_eq!(top, [DEFINITION, USAGE]);
+        let parse = parse_dialect("classifier A\nfeature a : A;\n", crate::Dialect::KerML);
+        assert!(!parse.errors().is_empty());
+
+        // and every place the language does declare part-way through a
+        // statement still does
+        for text in [
+            "action a { then action b; }",
+            "action a { first start; then action b; then done; }",
+            "action a { then event occurrence e; }",
+            "action a { then private action w { } }",
+            "state def S { entry action e; do action d; exit action x; }",
+            "state def S { state s1; accept T do action D then s1; }",
+            // `feature` is a kind keyword of KerML alone: SysML names
+            // the kind of an owned cross feature's end with its own
+            "connection def C { end x [1] part y : T; end [0..1] item z : T; }",
+            "action a { in event occurrence e; }",
+            "action a { variation perform action p { variant action q; } }",
+            "calc def C { return part :>> r : T; return attribute v : T; }",
+            "part def V { variation part p : T { variant part a; } }",
+            "action a { loop action b { } until c; }",
+            "action a { for i in xs { } }",
+            "action a { for n : T in (1, 2) { } }",
+            "action a { then for t in 1..3 { action f; } }",
+            "action a { action aFor for u : T in 1..3 { action g; } }",
+        ] {
+            check_ok(text);
+        }
+    }
+
+    /// What a declaration says once is an error said twice, and two
+    /// operands with nothing between them say nothing a model can mean.
+    #[test]
+    fn a_declaration_says_each_thing_once_and_joins_what_it_lists() {
+        for (text, wanted) in [
+            ("private private part x;", "one visibility"),
+            ("abstract abstract part def A;", "already said"),
+            ("in out part x;", "one direction"),
+            ("part x ordered ordered;", "written twice"),
+            ("part x ordered [1] ordered;", "already said"),
+            ("part x : A : B;", "already typed"),
+            ("part x = 1 = 2;", "already given a value"),
+            ("part x = ;", "expected the value"),
+            ("part x [1] [2];", "a multiplicity is already given"),
+            ("part x y z;", "unexpected `y`"),
+            ("part def A B;", "unexpected `B`"),
+            ("part x : A B;", "unexpected `B`"),
+            ("part x = 1 2;", "unexpected `2`"),
+            ("part x \"s\";", "unexpected `\"s\"`"),
+            ("part def A private;", "stands before the member"),
+            ("attribute x = if c ? 1;", "expected `else`"),
+            ("if c ? 1;", "expected `else`"),
+            ("action a { accept S via via p; }", "written twice"),
+            ("part def A :> B, , C;", "written twice"),
+            ("attribute attribute x;", "already said"),
+        ] {
+            let parse = parse(text);
+            let said: Vec<&str> = parse
+                .errors()
+                .iter()
+                .map(|it| it.message.as_str())
+                .collect();
+            assert!(
+                said.iter().any(|it| it.contains(wanted)),
+                "{text:?}: {said:?}"
+            );
+            assert_eq!(parse.syntax().text().to_string(), text, "lossless violated");
+        }
+        // and what the language does write twice, or back to back, still reads
+        for text in [
+            "part x : A, B :> c, d ordered nonunique [1] = 1;",
+            "action a { accept S if ready then b; }",
+            "action a { first x if g then b; }",
+            "connection c connect [1] a to [1] b;",
+            "attribute x = if c ? 1 else 2;",
+            "action a { action b : B (x, y); }",
+            "action a { then private action w { } }",
+        ] {
+            check_ok(text);
+        }
+        for text in [
+            "feature x1 subsets g typed by A subsets f typed by B;",
+            "binding [1] a.b = [1] c;",
+            "assoc A { end x [1] feature y : T; }",
+            "classifier F unions A unions B;",
+            "feature f redefines a redefines b;",
+        ] {
+            let parse = parse_dialect(text, crate::Dialect::KerML);
+            assert!(parse.ok(), "{text:?}: {:?}", parse.errors());
+        }
+    }
+
+    /// What a declaration names, imports, references or relates is one
+    /// thing, and what follows it is joined to it by a word -- wherever
+    /// the statement starts, not only after a kind keyword.
+    #[test]
+    fn what_a_member_names_is_one_thing_and_says_where_it_ends() {
+        for (text, wanted) in [
+            ("part x :: A;", "a declared name is one name"),
+            ("part 123;", "expected the name it declares"),
+            ("part def 123;", "expected the name it declares"),
+            ("package P P { }", "unexpected `P`"),
+            ("private import SI::mm mm;", "unexpected `mm`"),
+            ("private import Views::* *;", "unexpected `*`"),
+            ("alias T for A::B B;", "unexpected `B`"),
+            ("part x { @M M { } }", "unexpected `M`"),
+            ("part x { @ { } }", "expected the metadata definition"),
+            ("metadata def M M :> N;", "unexpected `M`"),
+            ("part x { metadata M M; }", "unexpected `M`"),
+            ("part x { perform perform a; }", "written twice"),
+            ("part x { event event a.b; }", "written twice"),
+            ("part x { perform a.b b; }", "unexpected `b`"),
+            ("part x { variant v v; }", "unexpected `v`"),
+            ("part x { message message m; }", "already said"),
+            ("flow f of F F from a to b;", "unexpected `F`"),
+            ("action a { join j j; }", "unexpected `j`"),
+            ("action a { first s then merge m m; }", "unexpected `m`"),
+            ("action a { accept s S S; }", "unexpected `S`"),
+            ("action a { if f f.g then b; }", "unexpected `f`"),
+            ("action a { then if if c < 1 { } }", "expected `?`"),
+            ("speed speed : V;", "expected `;`"),
+            ("constraint c { a.b b.c < 1 }", "expected `;`"),
+            ("constraint c { if a ? b else c c }", "expected `;`"),
+            ("calc c { xs->forAll forAll { } }", "only one of them"),
+            ("calc c { xs->size size() }", "only one of them"),
+            (
+                "part wheel[2 2];",
+                "a multiplicity is one bound or one range",
+            ),
+            (
+                "part c : C[ [*];",
+                "a multiplicity is one bound or one range",
+            ),
+            ("part def < <'3'> T;", "expected a short name"),
+            ("part def <a b> T;", "a short name is one name"),
+            ("attribute x = a meta meta T;", "written twice"),
+            ("attribute x = (a as as T);", "written twice"),
+            ("attribute x = all all T;", "expected the type `all`"),
+            ("attribute x = a * * (b);", "expected an operand"),
+            ("filter @ @Safety;", "expected the type it tests for"),
+            ("action a (x : X, , y : Y);", "expected a parameter"),
+            ("connection c connect a ::> b.c c to d;", "unexpected `c`"),
+            ("connection c connect a a ::> b.c to d;", "nothing joins it"),
+            ("part x { ref #M n #N z; }", "unexpected token HASH"),
+        ] {
+            let parse = parse(text);
+            let said: Vec<&str> = parse
+                .errors()
+                .iter()
+                .map(|it| it.message.as_str())
+                .collect();
+            assert!(
+                said.iter().any(|it| it.contains(wanted)),
+                "{text:?}: {said:?}"
+            );
+            assert_eq!(parse.syntax().text().to_string(), text, "lossless violated");
+        }
+        for (text, wanted) in [
+            ("classifier C unions A A, B;", "unexpected `A`"),
+            ("classifier D disjoint from C C;", "unexpected `C`"),
+            ("feature f chains a.b b;", "unexpected `b`"),
+            ("feature g ~ ~ B::f;", "written twice"),
+            ("type C4 conjugates ~ C1;", "written twice"),
+            ("disjoint disjoint a from b;", "written twice"),
+            ("inverse inverse g of f;", "written twice"),
+            ("feature x featured by T T;", "unexpected `T`"),
+            ("comment about a a /* c */", "expected COMMENT_BODY"),
+        ] {
+            let parse = parse_dialect(text, crate::Dialect::KerML);
+            let said: Vec<&str> = parse
+                .errors()
+                .iter()
+                .map(|it| it.message.as_str())
+                .collect();
+            assert!(
+                said.iter().any(|it| it.contains(wanted)),
+                "{text:?}: {said:?}"
+            );
+        }
+        // and what the language does write in those places still reads
+        for text in [
+            "package P { }",
+            "private import Views::*;",
+            "part def <'1.1'> T;",
+            "part x { @M { a = 1; } metadata m : M; metadata M about x; }",
+            "part x { perform a.b; event a.b[1]; variant v; }",
+            "flow of F from a.b to c.d;",
+            "flow f of F[1] from a to b;",
+            "succession a then b;",
+            "action a { join j; first s then merge m; accept S; accept s : S via p; }",
+            "action a { accept S if ready then b; if c then d; }",
+            "constraint c { a.b < 1 }",
+            "constraint c { a; b }",
+            "constraint c { if a ? b else c }",
+            "calc c { xs->forAll { in x; x > 0 } and xs->reduce max }",
+            "part wheel[2..*] ordered;",
+            "attribute x = (a as T) meta T;",
+            "attribute x = - - 1 * 2;",
+            "attribute x = not not a;",
+            "attribute x = all T;",
+            "attribute x = [*];",
+            "filter @Safety;",
+            "action a (x : X, y : Y);",
+            "connection c connect a ::> b.c to [1] d ::> e;",
+            "part x { end #cause cause ::> a; }",
+        ] {
+            let parse = parse(text);
+            assert!(parse.ok(), "{text:?}: {:?}", parse.errors());
+        }
+        for text in [
+            "classifier C unions A, B;",
+            "classifier D disjoint from C;",
+            "feature f chains a.b = 1;",
+            "feature g ~ B::f;",
+            "type C4 conjugates C1;",
+            "disjoint a from b;",
+            "feature x featured by T;",
+        ] {
+            let parse = parse_dialect(text, crate::Dialect::KerML);
+            assert!(parse.ok(), "{text:?}: {:?}", parse.errors());
+        }
+    }
+
+    /// Every name written where the grammar declares one comes out as a
+    /// `NAME`, and every name it refers to as a reference, wherever the
+    /// statement goes on to.
+    #[test]
+    fn a_name_is_declared_where_the_grammar_declares_one() {
+        let declared = |text: &str| -> Vec<String> {
+            let parse = check_ok(text);
+            parse
+                .syntax()
+                .descendants()
+                .filter(|it| it.kind() == NAME)
+                .map(|it| it.text().to_string())
+                .collect()
+        };
+        for (text, names) in [
+            ("accept s : S;", &["s"][..]),
+            ("accept sig after 10;", &["sig"]),
+            ("accept S;", &[]),
+            ("merge m;", &["m"]),
+            ("then fork <f> F { }", &["F"]),
+            ("for i in xs { }", &["i"]),
+            ("for n : T in xs { }", &["n"]),
+            ("then timeslice bob { }", &["bob"]),
+            ("then snapshot s[1];", &["s"]),
+            ("then message m of T;", &["m"]),
+            ("action aa accept S;", &["aa"]),
+            ("action s2 send x via p;", &["s2"]),
+            ("action stop terminate;", &["stop"]),
+            ("action a1 assign x := 1;", &["a1"]),
+            ("state s parallel { }", &["s"]),
+            ("then action aLoop while c { }", &["aLoop"]),
+            ("action l loop { }", &["l"]),
+            ("action f for i in xs { }", &["f", "i"]),
+            ("action i if c { }", &["i"]),
+            ("end [*] ref cause : T;", &["cause"]),
+            ("end [1] in ordered part bead : T;", &["bead"]),
+            ("end [1] x : T;", &["x"]),
+            ("accept s : S do action D then S2;", &["s", "D"]),
+            ("succession a then b;", &[]),
+            ("then event o.e[1];", &[]),
+            ("then perform p;", &[]),
+            ("accept S do perform p then s2;", &[]),
+        ] {
+            assert_eq!(declared(text), names, "{text}");
+        }
+        // `do action D then S2;` -- the transition goes on to `S2`, which
+        // the action it declares on the way does not take for its own
+        let parse = check_ok("accept s : S do action D then S2;");
+        let statement = parse.syntax().first_child().expect("one statement");
+        let target = statement
+            .children()
+            .filter(|it| it.kind() == NAME_REF)
+            .map(|it| it.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(target, ["S2"]);
+        // `then event o.e[1];` is the event the flow runs into, which
+        // adapts `o.e` once
+        let parse = check_ok("then event o.e[1];");
+        let event = parse
+            .syntax()
+            .descendants()
+            .find(|it| it.kind() == USAGE)
+            .expect("the event is declared");
+        assert!(event.children().any(|it| it.kind() == MULTIPLICITY));
     }
 
     #[test]
@@ -1683,9 +2881,9 @@ mod tests {
         }
     }
 
-    /// Nesting past the limit used to take the process down: the recursion
-    /// overflowed the stack while parsing, and where the tree was built by
-    /// a loop instead it overflowed again when rowan dropped it.
+    /// Nesting past the limit must not take the process down: the recursion
+    /// would overflow the stack while parsing, and where the tree is built by
+    /// a loop instead it would overflow again when rowan dropped it.
     #[test]
     fn nesting_past_the_limit_is_reported_once_and_left_flat() {
         for text in [
@@ -1693,7 +2891,6 @@ mod tests {
             format!("attribute x = {};", "(".repeat(50_000)),
             format!("attribute x = a{};", ".a".repeat(20_000)),
             format!("attribute x = 1{};", " + 1".repeat(20_000)),
-            (0..20_000).fold(String::new(), |text, n| text + &format!("part a{n} ")) + ";",
             format!("attribute x = f{};", "(1)".repeat(20_000)),
         ] {
             let parse = parse(&text);
@@ -1717,9 +2914,32 @@ mod tests {
         }
     }
 
-    /// A definition named after a reserved word used to lose its name:
-    /// `element_tail` swept the keyword up and nothing said so, because
-    /// nothing had asked for a name. The word is kept -- as the name it
+    /// `part a0 part a1 part a2 ... ;` must not nest each declaration in
+    /// the one before it until the depth limit gives up. Each is a
+    /// declaration of its own that is missing its `;`, so nothing nests.
+    #[test]
+    fn declarations_run_together_are_siblings_not_a_nest() {
+        let text = (0..20_000).fold(String::new(), |text, n| text + &format!("part a{n} ")) + ";";
+        let parse = parse(&text);
+        assert_eq!(parse.syntax().text().to_string(), text, "lossless");
+        assert!(parse
+            .errors()
+            .iter()
+            .all(|e| !e.message.contains("nested more than")));
+        assert_eq!(
+            parse
+                .errors()
+                .iter()
+                .filter(|e| e.message.contains("not ended"))
+                .count(),
+            19_999
+        );
+        assert_eq!(parse.syntax().children().count(), 20_000);
+    }
+
+    /// A definition named after a reserved word must not lose its name,
+    /// as `element_tail` sweeping the keyword up would, silently, because
+    /// nothing asked for a name. The word is kept -- as the name it
     /// was written as, so an editor can still find and rename it -- and
     /// the message says how to spell it.
     #[test]
@@ -1871,5 +3091,208 @@ mod tests {
         check_ok("analysis def Fuel { subject v : Vehicle; return fuelEconomy : Real; }");
         check_ok("verification def V { objective verifyMass { verify massReq; } }");
         check_ok("satisfy requirement massReq by vehicle;");
+    }
+
+    /// The loop variable of `action f for i in xs` is that declaration's
+    /// own; it once leaked into the first member of the body, which then
+    /// read its first operand as following a name.
+    #[test]
+    fn a_loop_variable_stays_with_its_loop() {
+        check_ok("action f for i in xs { first a then b; }");
+        check_ok("action f for i in xs { send S() to b; }");
+        check_ok("action f for i in xs { assign x := 1; }");
+        check_ok("action f for i in xs { bind a = b; }");
+        check_ok("action f for i in xs { connect a to b; }");
+    }
+
+    /// `else if d { ... }` is an `if` of its own, handed to the first as
+    /// its else branch, and not a loose `if d` followed by a second `else`.
+    #[test]
+    fn an_else_if_is_an_if_of_its_own() {
+        let text = "action def A { if c { action x; } else if d { action y; } else { action z; } }";
+        check_ok(text);
+        let tree = parse(text).syntax();
+        let ifs = tree
+            .descendants()
+            .filter(|node| node.kind() == CONTROL_STMT)
+            .collect::<Vec<_>>();
+        assert_eq!(ifs.len(), 2);
+        assert_eq!(ifs[1].parent().as_ref(), Some(&ifs[0]));
+        assert!(!ifs[0].children().any(|it| it.kind() == COND_EXPR));
+        // the inner `if` has both of the bodies after its condition
+        assert_eq!(ifs[1].children().filter(|it| it.kind() == BODY).count(), 2);
+        check_ok("action def A { if c { action x; } else if d { action y; } }");
+        check_ok("action def A { if a { } else if b { } else if c { } else { } }");
+    }
+
+    /// What may follow the kind keyword of a nameless declaration besides
+    /// a name, and how many errors a name that is not one earns.
+    #[test]
+    fn a_nameless_declaration_may_go_on_without_a_name() {
+        check_ok("action a { action if c { } }");
+        check_ok_kerml("class C { inv false { y > 0 } }");
+        check_ok_kerml("class C { inv true { y > 0 } }");
+        check_ok_kerml("type ~ A;");
+        check_ok_kerml("feature ~ B::f;");
+        let count = |text: &str| parse(text).errors().len();
+        // a declaration still being typed has one error, not two
+        assert_eq!(count("part x"), 1);
+        assert_eq!(count("part x y;"), 1);
+        assert_eq!(count("attribute x 1;"), 1);
+        // and what is no name is still said to be none
+        assert_eq!(count("part 123;"), 1);
+        assert_eq!(count("part x :: A;"), 1);
+        assert!(parse("part x :: A;").errors()[0]
+            .message
+            .contains("expected the name it declares"));
+    }
+
+    /// Forms the grammar writes that were refused as errors.
+    #[test]
+    fn what_the_grammar_writes_is_read() {
+        // `ActionBodyParameter = ( 'action' UsageDeclaration? )? '{' ... '}'`
+        // straight after what an `if` or a `while` asks
+        let branches = check_ok("action def A { if c action t { } else action e { } action z; }");
+        let statement = branches
+            .syntax()
+            .descendants()
+            .find(|it| it.kind() == CONTROL_STMT)
+            .unwrap();
+        // both bodies are the `if`'s, and what follows is beside it
+        assert_eq!(
+            statement
+                .children()
+                .map(|it| it.kind())
+                .filter(|&it| it == USAGE)
+                .count(),
+            2
+        );
+        assert!(!statement.text().to_string().contains('z'));
+        check_ok("action def A { if c action { } }");
+        let loop_ = check_ok("action def A { while c action b { } until d; action z; }");
+        let statements: Vec<String> = loop_
+            .syntax()
+            .descendants()
+            .filter(|it| it.kind() == CONTROL_STMT)
+            .map(|it| it.text().to_string())
+            .collect();
+        // the `until` closes the loop as it does after `loop action b { }`
+        assert_eq!(statements, ["while c action b { }", "until d;"]);
+        // `EnumeratedValue = 'enum'? Usage`, and `Identification` may open
+        // with a short name
+        check_ok("enum def Color { <r> red; }");
+        check_ok("part def P { <a> b : T; }");
+        // a `MultiplicityPart` alone is a `FeatureSpecializationPart`
+        check_ok("part def P { x ordered; y nonunique : T; }");
+        // `DefinitionDeclaration = Identification? SubclassificationPart?`
+        check_ok("part def specializes X;");
+        assert_eq!(parse("part def specializes;").errors().len(), 1);
+        // `MetadataUsageDeclaration = ( Identification ( ':' | 'typed'
+        // 'by' ) )? ...`, though SysML reserves no `typed`
+        let metadata = check_ok("part def P { metadata m typed by M; }");
+        let usage = metadata
+            .syntax()
+            .descendants()
+            .filter(|it| it.kind() == USAGE)
+            .last()
+            .unwrap();
+        let kinds: Vec<SyntaxKind> = usage.children().map(|it| it.kind()).collect();
+        assert_eq!(kinds, [NAME, TYPING, BODY]);
+        // `Invariant = ... 'inv' ( 'true' | isNegated ?= 'false' )?
+        // FeatureDeclaration? ...`
+        check_ok_kerml("class C { inv true x { y } }");
+        check_ok_kerml("class C { inv false x { false } }");
+        // `Conjugation = ( 'conjugation' Identification )? 'conjugate' ...`
+        check_ok_kerml("class A; class B; conjugate A ~ B;");
+    }
+
+    /// The last usage in `text`, by the kinds of its children.
+    fn last_usage_shape(parse: &Parse) -> Vec<SyntaxKind> {
+        let usage = parse
+            .syntax()
+            .descendants()
+            .filter(|it| it.kind() == USAGE)
+            .last()
+            .unwrap();
+        usage.children().map(|it| it.kind()).collect()
+    }
+
+    /// `QualifiedName = ( '$' '::' )? ( Name '::' )* Name`, and every
+    /// place a metadata definition is named takes a `QualifiedName`. The
+    /// tests for one there asked for a name, so `@$::P::code { }` was
+    /// turned away, `#$::P::code part y;` read as a stray `#` before an
+    /// expression, and `metadata $::P::code { }` left the reference
+    /// standing as an expression rather than the usage's type. An
+    /// importer would otherwise have to write `metadata code_ : $::P::code`
+    /// to get round it, instead of `@$::P::code`.
+    #[test]
+    fn a_metadata_definition_may_be_named_from_the_global_root() {
+        let annotation = check_ok("part x { @$::P::code { } }");
+        let reference = annotation
+            .syntax()
+            .descendants()
+            .find(|it| it.kind() == METADATA_ANNOTATION)
+            .and_then(|it| it.children().find(|it| it.kind() == QUALIFIED_NAME))
+            .map(|it| it.text().to_string());
+        assert_eq!(reference.as_deref(), Some("$::P::code"));
+        check_ok("part x { @@$::P::code; }");
+
+        let usage = check_ok("part x { metadata $::P::code { } }");
+        assert_eq!(last_usage_shape(&usage), [TYPING, BODY]);
+        let named = check_ok("part x { metadata c : $::P::code; }");
+        assert_eq!(last_usage_shape(&named), [NAME, TYPING, BODY]);
+
+        let prefixed = check_ok("part x { #$::P::code part y; }");
+        assert!(prefixed
+            .syntax()
+            .descendants()
+            .any(|it| it.kind() == PREFIX_METADATA && it.text() == "#$::P::code"));
+        check_ok("#$::P::code part def D;");
+        check_ok_kerml("#$::P::code class C;");
+        check_ok_kerml("class C { @$::P::code; }");
+        // a `$` that roots nothing is still no metadata definition
+        assert!(!parse("part x { @$ { } }").errors().is_empty());
+    }
+
+    /// `metadata m defined by M;` names `m`: `DEFINED_BY = ':' | 'defined'
+    /// 'by'` is how SysML spells the `:` of a typing, and a metadata usage
+    /// is typed like any other. Only `:` and `typed by` were taken to
+    /// mark the name, so this read as two typings, by `m` and by `M`, of
+    /// a usage with no name at all.
+    #[test]
+    fn a_metadata_usage_defined_by_its_definition_is_named() {
+        for text in [
+            "part def P { metadata m defined by M; }",
+            "part def P { metadata m typed by M; }",
+            "part def P { metadata m : M; }",
+        ] {
+            assert_eq!(
+                last_usage_shape(&check_ok(text)),
+                [NAME, TYPING, BODY],
+                "{text}"
+            );
+        }
+        // `@` opens the same declaration; its name stands where the
+        // definition does when there is no typing, and every spelling of
+        // the typing follows it alike
+        for text in [
+            "part def P { @m defined by M; }",
+            "part def P { @m typed by M; }",
+            "part def P { @m : M; }",
+        ] {
+            let parse = check_ok(text);
+            let annotation = parse
+                .syntax()
+                .descendants()
+                .find(|it| it.kind() == METADATA_ANNOTATION)
+                .unwrap();
+            let kinds: Vec<SyntaxKind> = annotation.children().map(|it| it.kind()).collect();
+            assert_eq!(kinds, [QUALIFIED_NAME, TYPING, BODY], "{text}");
+        }
+        // and with nothing after it the name is still the definition
+        assert_eq!(
+            last_usage_shape(&check_ok("part def P { metadata M; }")),
+            [TYPING, BODY]
+        );
     }
 }

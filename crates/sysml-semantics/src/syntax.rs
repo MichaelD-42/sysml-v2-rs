@@ -45,7 +45,8 @@ pub(crate) fn listed_end(child: &SyntaxNode) -> bool {
                 .any(|it| it.kind() == SyntaxKind::REFERENCES)
 }
 
-/// Whether the name after `connector` is the end it runs from.
+/// Whether the name after `connector` or `interface` is the end it runs
+/// from.
 ///
 /// KerML writes a connector's declaration only in front of a `from`, so
 /// `connector eng to tanks.main1;` names no connector: it relates `eng`
@@ -58,6 +59,9 @@ pub(crate) fn names_an_end(node: &SyntaxNode) -> bool {
             .any(|it| it.kind() == wanted)
     };
     has(SyntaxKind::CONNECTOR_KW) && has(SyntaxKind::TO_KW) && !has(SyntaxKind::FROM_KW)
+        // SysML's interface likewise only in front of a `connect`:
+        // `interface b to c;` connects `b` and `c`
+        || has(SyntaxKind::INTERFACE_KW) && has(SyntaxKind::TO_KW) && !has(SyntaxKind::CONNECT_KW)
         || has(SyntaxKind::BINDING_KW)
             && !has(SyntaxKind::BIND_KW)
             && !has(SyntaxKind::OF_KW)
@@ -185,17 +189,21 @@ pub(crate) fn operand_chain_steps(operand: &SyntaxNode) -> Vec<usize> {
 /// An end may carry a multiplicity of its own -- `connector ps :
 /// ProductSelection ([0..*] myCart, ...)` -- and what is written inside
 /// the brackets is a bound and not a step of the name. Counted as one,
-/// the `*` of `[0..*]` made the steps say two where the name had one
-/// segment, and reading a prefix of that name went off the end of it.
+/// the `*` of `[0..*]` would make the steps say two where the name has one
+/// segment, and reading a prefix of that name would go off the end of it.
+/// Only a multiplicity inside the operand is passed over: a name written
+/// as a bound -- the `count` of `[count]` -- is an operand of its own,
+/// and its tokens are the whole of it.
 pub(crate) fn operand_name_tokens(
     operand: &SyntaxNode,
-) -> impl Iterator<Item = sysml_syntax::SyntaxToken> {
+) -> impl Iterator<Item = sysml_syntax::SyntaxToken> + '_ {
     operand
         .descendants_with_tokens()
         .filter_map(|e| e.into_token())
-        .filter(|token| {
+        .filter(move |token| {
             !token
                 .parent_ancestors()
+                .take_while(|up| up != operand)
                 .any(|up| up.kind() == SyntaxKind::MULTIPLICITY)
         })
 }
@@ -310,6 +318,44 @@ pub(crate) fn invoked_through_arrow(node: &SyntaxNode) -> Option<String> {
         .map(|token| token.text().to_string())
 }
 
+/// What a control node asks, or hands over, written as expressions.
+///
+/// The condition of `if g then a;`, `while g { ... }` and `until g;`, the
+/// collection `for i in xs` walks, the guard of a transition (`if g`), the
+/// time or condition a trigger waits for (`accept when g`, `at t`, `after
+/// d`) and what `send x via p` sends. The model keeps several of these as
+/// the text they were written as, and their names were never looked up:
+/// `if nope { ... }` passed as a model with every name resolved.
+pub(crate) fn asked_expressions(node: &SyntaxNode) -> Vec<SyntaxNode> {
+    use SyntaxKind::*;
+    let mut asking = false;
+    // `in` asks only in a `for`: elsewhere it is a direction
+    let mut looping = false;
+    let mut asked = Vec::new();
+    for part in node.children_with_tokens() {
+        if let Some(token) = part.as_token() {
+            match token.kind() {
+                kind if kind.is_trivia() => {}
+                FOR_KW => looping = true,
+                IN_KW => asking = looping,
+                IF_KW | WHILE_KW | UNTIL_KW | WHEN_KW | AT_KW | AFTER_KW | SEND_KW => {
+                    asking = true;
+                }
+                _ => asking = false,
+            }
+            continue;
+        }
+        let child = part.into_node().expect("checked for a token above");
+        // a transition's `if g` is one node, guard and keyword both
+        if (asking || child.kind() == COND_EXPR) && child.kind().is_expression() {
+            asked.push(child);
+        } else {
+            asking = false;
+        }
+    }
+    asked
+}
+
 /// The name an invocation writes in front of its arguments.
 ///
 /// `new Foo(1)` writes `new` in front of the name, and what it
@@ -361,6 +407,23 @@ pub(crate) fn metadata_target(node: &SyntaxNode) -> Option<Target> {
 }
 
 pub(crate) fn relationship_parts(node: &SyntaxNode) -> Vec<(SyntaxKind, Vec<Target>)> {
+    parts_written(node, false)
+}
+
+/// What the payload of an accept is written with: `accept s : Sig` types
+/// the payload `s`, and the action that waits for it is no `Sig`. Read
+/// with the action's own, `action a accept s : Sig;` made `a` one and
+/// left `s` typed by nothing, so `a.s.x` named nothing.
+pub(crate) fn payload_parts(node: &SyntaxNode) -> Vec<(SyntaxKind, Vec<Target>)> {
+    parts_written(node, true)
+}
+
+fn parts_written(node: &SyntaxNode, of_payload: bool) -> Vec<(SyntaxKind, Vec<Target>)> {
+    let accepts = node
+        .children_with_tokens()
+        .find(|it| it.kind() == SyntaxKind::ACCEPT_KW)
+        .map(|it| it.text_range().end());
+    let payload = |part: &SyntaxNode| accepts.is_some_and(|at| part.text_range().start() >= at);
     // `connector a ::> a.x to b;` writes no `from`, so `a ::> a.x` is
     // the end it runs from -- `ConnectorEnd : Feature = ...
     // ( declaredName = NAME REFERENCES )? OwnedReferenceSubsetting` --
@@ -368,6 +431,7 @@ pub(crate) fn relationship_parts(node: &SyntaxNode) -> Vec<(SyntaxKind, Vec<Targ
     // refers to.
     let end_refers = names_an_end(node);
     node.children()
+        .filter(|part| payload(part) == of_payload)
         .filter_map(|part| match part.kind() {
             SyntaxKind::REFERENCES if end_refers => None,
             SyntaxKind::TYPING
@@ -407,7 +471,7 @@ pub(crate) fn relationship_parts(node: &SyntaxNode) -> Vec<(SyntaxKind, Vec<Targ
                     SyntaxKind::TILDE => SyntaxKind::CONJUGATES_KW,
                     other => other,
                 };
-                matches!(
+                let relates = matches!(
                     lead,
                     SyntaxKind::UNIONS_KW
                         | SyntaxKind::INTERSECTS_KW
@@ -416,8 +480,13 @@ pub(crate) fn relationship_parts(node: &SyntaxNode) -> Vec<(SyntaxKind, Vec<Targ
                         | SyntaxKind::CONJUGATES_KW
                         | SyntaxKind::FEATURED_KW
                         | SyntaxKind::DISJOINT_KW
-                )
-                .then_some((lead, part))
+                        // `feature h inverse of g;`
+                        | SyntaxKind::INVERSE_KW
+                        // `conjugation c conjugate A conjugates B;` -- the
+                        // conjugated type, which only a statement writes
+                        | SyntaxKind::CONJUGATE_KW
+                );
+                relates.then_some((lead, part))
             }
             _ => None,
         })
@@ -468,6 +537,27 @@ pub(crate) fn adapter_target_segments(node: &SyntaxNode) -> Option<Vec<String>> 
 /// The operand a `perform`/`exhibit`/`assert`/... usage adapts, when it
 /// names one rather than declaring it.
 pub(crate) fn adapter_target(node: &SyntaxNode) -> Option<SyntaxNode> {
+    // `entry a;`, `do a;` and `exit a;` perform the action they name:
+    // `StatePerformActionUsage = PerformActionUsageDeclaration ...`. Only
+    // a name right after the keyword is that action -- `do send x via p`
+    // sends `x` rather than performing it.
+    if node.kind() == SyntaxKind::CONTROL_STMT {
+        let mut parts = node
+            .children_with_tokens()
+            .filter(|part| !part.kind().is_trivia());
+        let performs = parts.next().is_some_and(|lead| {
+            matches!(
+                lead.kind(),
+                SyntaxKind::ENTRY_KW | SyntaxKind::DO_KW | SyntaxKind::EXIT_KW
+            )
+        });
+        let operand = parts
+            .next()
+            .and_then(|part| part.into_node())
+            .filter(|_| performs)
+            .filter(|it| matches!(it.kind(), SyntaxKind::NAME_REF | SyntaxKind::PATH_EXPR))?;
+        return (!operand_segments(&operand).is_empty()).then_some(operand);
+    }
     if node.kind() != SyntaxKind::USAGE {
         return None;
     }
@@ -489,6 +579,7 @@ pub(crate) fn adapter_target(node: &SyntaxNode) -> Option<SyntaxNode> {
                     | SyntaxKind::VERIFY_KW
                     | SyntaxKind::FRAME_KW
                     | SyntaxKind::RENDER_KW
+                    | SyntaxKind::VARIANT_KW
                     | SyntaxKind::NOT_KW
             )
         });
@@ -512,10 +603,6 @@ pub(crate) fn adapter_target(node: &SyntaxNode) -> Option<SyntaxNode> {
 /// `f` returns, so there is no namespace for `b` to be a member of.
 pub(crate) fn name_chains(node: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
     match node.kind() {
-        // `list->select { in i; i > 2 }` declares `i` inside a body that
-        // is not built into the model, so the names there have a scope
-        // nothing here can see. Reporting them would be a false alarm.
-        SyntaxKind::BODY_EXPR => return,
         SyntaxKind::NAME_REF => {
             out.push(node.clone());
             return;
@@ -577,12 +664,23 @@ pub(crate) fn operand_segments(operand: &SyntaxNode) -> Vec<String> {
 /// `feature aa subsets non;` apart from a model that means it, when `non`
 /// is a classifier declared next door.
 ///
-/// Only what a feature relates is narrowed. What a definition specializes
-/// is a `Classifier` for a `Subclassification` and a `Type` for a plain
-/// `Specialization`, and this parser hands both the same node.
-pub(crate) fn expected_kind(part: SyntaxKind, is_definition: bool) -> Option<ElementKind> {
+/// What a definition specializes is a `Classifier` for a
+/// `Subclassification` -- `Subclassification::superclassifier :
+/// Classifier` -- and a `Type` for a plain `Specialization`, and this
+/// parser hands both the same node. Which it is follows from what is
+/// declaring it: a classifier's is a subclassification, so `part def B
+/// :> a;` naming a part usage names nothing, as `part b :> A;` naming a
+/// definition already did. KerML's `type T specializes f;` relates two
+/// types, and a feature is one.
+pub(crate) fn expected_kind(
+    part: SyntaxKind,
+    is_definition: bool,
+    declaring: ElementKind,
+) -> Option<ElementKind> {
     match part {
-        SyntaxKind::SUBSETTING | SyntaxKind::CROSSES_KW if is_definition => None,
+        SyntaxKind::SUBSETTING | SyntaxKind::CROSSES_KW if is_definition => declaring
+            .is_a(ElementKind::Classifier)
+            .then_some(ElementKind::Classifier),
         SyntaxKind::SUBSETTING
         | SyntaxKind::CROSSES_KW
         | SyntaxKind::REDEFINITION
@@ -607,7 +705,18 @@ pub(crate) fn may_name_itself(part: SyntaxKind, is_definition: bool) -> bool {
         // association, this one included, so the path may start with
         // the very name being declared
         SyntaxKind::SUBSETTING | SyntaxKind::CROSSES_KW => !is_definition,
-        SyntaxKind::REDEFINITION | SyntaxKind::REFERENCES => true,
+        SyntaxKind::REFERENCES => true,
+        // A redefined feature is looked up in the supertypes of the
+        // owning type, not in the owning type itself: "the local
+        // namespace of the owning type of the redefining feature is not
+        // included in the name resolution of the redefined features"
+        // (KerML 7.3.4.5, 8.2.3.5.1). So `part engine :>> engine;` where
+        // no supertype has an `engine` redefines nothing; answering with
+        // itself would report a model naming nothing as sound.
+        SyntaxKind::REDEFINITION => false,
+        // `feature outsideOfOccurrences ... inverse of outsideOfOccurrences`:
+        // a symmetric relation is its own inverse
+        SyntaxKind::INVERSE_KW => true,
         _ => false,
     }
 }
@@ -639,6 +748,18 @@ pub(crate) fn relation_ends(kind: ElementKind) -> Option<(SyntaxKind, &'static s
         ),
         ElementKind::FeatureTyping => (SyntaxKind::TYPING_KW, "typedFeature", "type"),
         ElementKind::Disjoining => (SyntaxKind::DISJOINT_KW, "typeDisjoined", "disjoiningType"),
+        // `inverting i inverse a of b;` -- the feature after `inverse` is
+        // inverted, the one after `of` inverts it
+        ElementKind::FeatureInverting => (
+            SyntaxKind::INVERSE_KW,
+            "featureInverted",
+            "invertingFeature",
+        ),
+        // `featuring f of g by T;` -- `g` is featured by `T`; nothing read
+        // either name, and `by Nope` went unreported
+        ElementKind::TypeFeaturing => (SyntaxKind::OF_KW, "featureOfType", "featuringType"),
+        // `conjugation c conjugate A conjugates B;` and `... conjugate A ~ B;`
+        ElementKind::Conjugation => (SyntaxKind::CONJUGATE_KW, "conjugatedType", "originalType"),
         _ => return None,
     };
     Some(ends)
@@ -646,8 +767,20 @@ pub(crate) fn relation_ends(kind: ElementKind) -> Option<(SyntaxKind, &'static s
 
 /// The reference written directly after `keyword`, if the next thing is one.
 pub(crate) fn operand_after(node: &SyntaxNode, keyword: SyntaxKind) -> Option<SyntaxNode> {
+    operand_after_in(node, keyword, node.text_range())
+}
+
+/// [`operand_after`], among what is written within `window`.
+pub(crate) fn operand_after_in(
+    node: &SyntaxNode,
+    keyword: SyntaxKind,
+    window: TextRange,
+) -> Option<SyntaxNode> {
     let mut seen = false;
-    for element in node.children_with_tokens() {
+    for element in node
+        .children_with_tokens()
+        .filter(|part| window.contains_range(part.text_range()))
+    {
         match element.as_token() {
             Some(token) if token.kind().is_trivia() => {}
             Some(token) => {
@@ -811,9 +944,14 @@ pub(crate) fn end_operands(node: &SyntaxNode, of: ElementKind) -> Vec<SyntaxNode
                         || token.kind().is_modifier_kw()
                         || token.kind().is_visibility_kw()
                         || token.kind().is_def_kind_kw()
+                        // `succession all [*] guard then ...`:
+                        // `isSufficient ?= 'all' 'first'?` stands in
+                        // front of the end the succession runs from
                         || matches!(
                             token.kind(),
-                            SyntaxKind::SUCCESSION_KW | SyntaxKind::TRANSITION_KW
+                            SyntaxKind::SUCCESSION_KW
+                                | SyntaxKind::TRANSITION_KW
+                                | SyntaxKind::ALL_KW
                         )
                 })
             })

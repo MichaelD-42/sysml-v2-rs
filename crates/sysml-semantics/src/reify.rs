@@ -11,7 +11,7 @@
 //! what an end reached through a chain participates in.
 
 use sysml_model::{ElementId, ElementKind, Value};
-use sysml_syntax::{SyntaxKind, SyntaxNode};
+use sysml_syntax::{Dialect, SyntaxKind, SyntaxNode, TextRange};
 
 use crate::syntax::*;
 use crate::{Reached, Reference, ResolveStats, Workspace};
@@ -33,7 +33,7 @@ impl Workspace {
             Some(def) => {
                 stats.resolved += 1;
                 self.references.push(Reference {
-                    file: self.elem_file.get(&usage).copied().unwrap_or(0),
+                    file: self.file_of(usage),
                     range: target.range,
                     name_range: target.name_range,
                     target: def,
@@ -42,12 +42,7 @@ impl Workspace {
                 self.reify(usage, false, SyntaxKind::TYPING, def);
             }
             None => {
-                self.record_miss(
-                    self.elem_file.get(&usage).copied().unwrap_or(0),
-                    target.range,
-                    &target.segments,
-                    stats,
-                );
+                self.record_miss(self.file_of(usage), target.range, &target.segments, stats);
             }
         }
     }
@@ -94,81 +89,29 @@ impl Workspace {
         part: SyntaxKind,
         target: ElementId,
     ) {
-        let (kind, source_prop, target_prop) = match part {
-            SyntaxKind::SUBSETTING if is_definition => (
-                ElementKind::Subclassification,
-                "subclassifier",
-                "superclassifier",
-            ),
-            SyntaxKind::SUBSETTING => (
-                ElementKind::Subsetting,
-                "subsettingFeature",
-                "subsettedFeature",
-            ),
-            SyntaxKind::REDEFINITION => (
-                ElementKind::Redefinition,
-                "redefiningFeature",
-                "redefinedFeature",
-            ),
-            SyntaxKind::REFERENCES => (
-                ElementKind::ReferenceSubsetting,
-                "referencingFeature",
-                "referencedFeature",
-            ),
-            // `datatype N :> V, A intersects V, A;` -- a type written as
-            // the union, intersection or difference of others, and
-            // `feature chain chains source.target` a feature written as
-            // the chain through them
-            SyntaxKind::UNIONS_KW => (ElementKind::Unioning, "typeUnioned", "unioningType"),
-            SyntaxKind::INTERSECTS_KW => (
-                ElementKind::Intersecting,
-                "typeIntersected",
-                "intersectingType",
-            ),
-            SyntaxKind::DIFFERENCES_KW => (
-                ElementKind::Differencing,
-                "typeDifferenced",
-                "differencingType",
-            ),
-            SyntaxKind::CHAINS_KW => (
-                ElementKind::FeatureChaining,
-                "featureChained",
-                "chainingFeature",
-            ),
-            // `feature h2 ... disjoint from h1;` -- what a feature is
-            // declared not to overlap. Written this way there is no
-            // statement to hang it off, and until it was read the name
-            // after `from` was looked at by nothing: a typo in one was a
-            // model this toolchain called sound.
-            SyntaxKind::DISJOINT_KW => (ElementKind::Disjoining, "typeDisjoined", "disjoiningType"),
-            // A cross subsetting is a subsetting, so the end that
-            // declares it is its `subsettingFeature` like any other;
-            // what it crosses to is the narrower name. Its
-            // `crossingFeature` is derived from which feature owns it,
-            // so nothing is stored for that.
-            SyntaxKind::CROSSES_KW => (
-                ElementKind::CrossSubsetting,
-                "subsettingFeature",
-                "crossedFeature",
-            ),
-            // `class B conjugates A;` -- the conjugation is owned by the
-            // type that is conjugated, which is what tells it from
-            // `conjugation c conjugate B conjugates A;`, where the
-            // namespace owns it and B is not itself a conjugated type.
-            SyntaxKind::CONJUGATES_KW => {
-                (ElementKind::Conjugation, "conjugatedType", "originalType")
-            }
-            // `member feature inCart : ShoppingCart featured by
-            // Product_Account;` -- what features a feature, written
-            // beside the declaration rather than as a statement of its
-            // own. Without it the feature is featured by whatever owns
-            // it, which is what it says the feature is *not*.
-            SyntaxKind::FEATURED_KW => {
-                (ElementKind::TypeFeaturing, "featureOfType", "featuringType")
-            }
-            // relationship_parts only yields the kinds above plus TYPING
-            _ => (ElementKind::FeatureTyping, "typedFeature", "type"),
-        };
+        // `port pt : ~PD;` types the port by the conjugate `PD`
+        // owns, and the grammar writes that typing as a metaclass of
+        // its own: `ConjugatedPortTyping : ConjugatedPortTyping = '~'
+        // originalPortDefinition = ~[QualifiedName]`. It is a typing
+        // still, and its `conjugatedPortDefinition` is its `type` by
+        // another name -- the metamodel redefines the one as the
+        // other -- so both are kept, and whatever reads the type of a
+        // typing reads this one too.
+        let (kind, source_prop, target_prop) = relationship_for(part, is_definition);
+        if kind == ElementKind::FeatureTyping
+            && self.model.kind(target) == ElementKind::ConjugatedPortDefinition
+        {
+            self.reified(
+                elem,
+                ElementKind::ConjugatedPortTyping,
+                &[
+                    ("typedFeature", Value::Ref(elem)),
+                    ("type", Value::Ref(target)),
+                    ("conjugatedPortDefinition", Value::Ref(target)),
+                ],
+            );
+            return;
+        }
         self.reified(
             elem,
             kind,
@@ -187,6 +130,9 @@ impl Workspace {
     /// makes the two ends of such a relationship differ at all.
     ///
     /// A single name is no chain: that is the feature the name reached.
+    /// `owner` is the relationship the operand is an end of, which owns the
+    /// chain as its `ownedRelatedElement` and is where the steps are looked
+    /// up from.
     pub(crate) fn chained(
         &mut self,
         owner: ElementId,
@@ -197,16 +143,106 @@ impl Workspace {
         if steps.len() < 2 {
             return target;
         }
+        let chain = self.chain_steps(owner, segments, steps);
+        self.chain_feature(owner, chain)
+    }
+    /// The relationship a declaration clause writes, where what it names is
+    /// written as a chain: `feature sub subsets f.x;`, `crosses b.c1`.
+    ///
+    /// The relationship comes first and the chain is its own. Made ahead of
+    /// it, as `chained` once made it, the chain `Feature` was owned
+    /// by the declaring feature through a `FeatureMembership` -- so `sub` came
+    /// to have a feature named `x` among its `ownedFeature`s, which nothing
+    /// wrote -- and the relationship held a feature it did not own. The
+    /// grammar has the operand as `ownedRelatedElement += FeatureChain`, and
+    /// each step under it a `FeatureChaining`, as `chains f.x` writes.
+    pub(crate) fn reify_through(
+        &mut self,
+        elem: ElementId,
+        is_definition: bool,
+        part: SyntaxKind,
+        written: (&[String], &[usize]),
+        target: ElementId,
+    ) {
+        let (segments, steps) = written;
+        if steps.len() < 2 {
+            return self.reify(elem, is_definition, part, target);
+        }
+        // the steps are named from where the declaration is, not from
+        // inside the relationship that will hold them
+        let chain = self.chain_steps(elem, segments, steps);
+        let (kind, source_prop, target_prop) = relationship_for(part, is_definition);
+        // the one an earlier pass made, as `reified` takes it:
+        // the same declaring end, and a chain of its own through the same
+        // steps
+        let already = self.model.owned(elem).iter().copied().find(|&child| {
+            self.model.kind(child) == kind
+                && !self.claimed.contains(&child)
+                && self.model.maybe(child, source_prop) == Some(&Value::Ref(elem))
+                && self
+                    .model
+                    .maybe(child, target_prop)
+                    .and_then(Value::as_id)
+                    .is_some_and(|feature| {
+                        self.model.owner(feature) == Some(child)
+                            && self.model.chaining_feature(feature) == chain.as_slice()
+                    })
+        });
+        let relationship = match already {
+            Some(child) => child,
+            None => {
+                let child = self.model.create(kind);
+                self.model.add_owned(elem, child);
+                self.try_set(child, source_prop, Value::Ref(elem));
+                child
+            }
+        };
+        self.claimed.insert(relationship);
+        let feature = self.chain_feature(relationship, chain);
+        self.try_set(relationship, target_prop, Value::Ref(feature));
+    }
+    /// What each step of a dotted operand resolved to, from `scope`.
+    fn chain_steps(
+        &mut self,
+        scope: ElementId,
+        segments: &[String],
+        steps: &[usize],
+    ) -> Vec<ElementId> {
         // the whole path already resolved, so every prefix of it does too
-        let chain: Vec<ElementId> = steps
+        steps
             .iter()
-            .filter_map(|&depth| self.resolve_from(owner, &segments[..depth]))
-            .collect();
-        self.reified(
-            owner,
+            .filter_map(|&depth| self.resolve_from(scope, &segments[..depth]))
+            .collect()
+    }
+    /// Stand the `Feature` a chain is under `holder`, with a
+    /// `FeatureChaining` for each step.
+    ///
+    /// `chainingFeature` is derived -- "the chainingFeatures of its
+    /// ownedFeatureChainings" -- and kept as well, since that is where
+    /// everything reading a chain looks.
+    fn chain_feature(&mut self, holder: ElementId, chain: Vec<ElementId>) -> ElementId {
+        let feature = self.reified(
+            holder,
             ElementKind::Feature,
-            &[("chainingFeature", Value::RefList(chain))],
-        )
+            &[("chainingFeature", Value::RefList(chain.clone()))],
+        );
+        self.chainings(feature, chain);
+        feature
+    }
+    /// Give `feature` a `FeatureChaining` for each step of `chain`, which
+    /// it owns: `ownedFeatureChaining` is what `chainingFeature` is derived
+    /// from. Taken again on a later pass rather than made twice.
+    fn chainings(&mut self, feature: ElementId, chain: Vec<ElementId>) {
+        for step in chain {
+            self.reified(
+                feature,
+                ElementKind::FeatureChaining,
+                &[
+                    ("featureChained", Value::Ref(feature)),
+                    ("chainingFeature", Value::Ref(step)),
+                ],
+            );
+        }
     }
     /// The two types a relationship written as its own statement relates.
     ///
@@ -225,7 +261,7 @@ impl Workspace {
         stats: &mut ResolveStats,
         chains: bool,
     ) {
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         let segments = operand_segments(operand);
         let range = operand.text_range();
         match self.resolve_written(id, &segments, false, None) {
@@ -254,10 +290,8 @@ impl Workspace {
         id: ElementId,
         node: &SyntaxNode,
         stats: &mut ResolveStats,
-    ) {
-        let Some((keyword, source_prop, target_prop)) = relation_ends(self.model.kind(id)) else {
-            return;
-        };
+    ) -> Option<()> {
+        let (keyword, source_prop, target_prop) = relation_ends(self.model.kind(id))?;
         // `subset a.b subsets c.d;` writes a chain on either side, and a
         // subsetting is the one relationship the abstract syntax stands
         // a chain feature under. A specialization or a typing relates
@@ -265,7 +299,7 @@ impl Workspace {
         // beneath either.
         let chains = self.model.kind(id).is_a(ElementKind::Subsetting)
             || self.model.kind(id) == ElementKind::Disjoining;
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         if let Some(operand) = operand_after(node, keyword) {
             self.resolve_operand_into(id, &operand, source_prop, stats, chains);
         }
@@ -276,7 +310,11 @@ impl Workspace {
             // B;` names the relationship first, which leaves `disjoint
             // A` a part of its own -- so the part is the end this one
             // relationship reads as its source rather than its target.
-            let prop = match part == SyntaxKind::DISJOINT_KW {
+            // `inverting i inverse a of b;` is read the same way
+            let prop = match matches!(
+                part,
+                SyntaxKind::DISJOINT_KW | SyntaxKind::INVERSE_KW | SyntaxKind::CONJUGATE_KW
+            ) {
                 true => source_prop,
                 false => target_prop,
             };
@@ -297,11 +335,18 @@ impl Workspace {
         }
         // and the end after `from` has no part of its own in either
         // shape: only the keyword standing before it says where it is.
-        if self.model.kind(id) == ElementKind::Disjoining {
-            if let Some(operand) = operand_after(node, SyntaxKind::FROM_KW) {
+        let after = match self.model.kind(id) {
+            ElementKind::Disjoining => Some(SyntaxKind::FROM_KW),
+            ElementKind::FeatureInverting => Some(SyntaxKind::OF_KW),
+            ElementKind::TypeFeaturing => Some(SyntaxKind::BY_KW),
+            _ => None,
+        };
+        if let Some(keyword) = after {
+            if let Some(operand) = operand_after(node, keyword) {
                 self.resolve_operand_into(id, &operand, target_prop, stats, chains);
             }
         }
+        Some(())
     }
     /// Resolve the operands of a `connect`/`bind`/`allocate` statement and
     /// record what they point at as the connector's `relatedFeature`s, so a
@@ -312,7 +357,7 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         // What the connector relates, in the order it relates them, and
         // how each of them was reached. The ends are reified once that
         // order is settled: `connectorEnd->at(1)` is the one it runs
@@ -338,7 +383,12 @@ impl Workspace {
                         target,
                     );
                     related.push(target);
-                    reached.push(Reached::Written(segments, operand_chain_steps(&operand)));
+                    let cross = self.cross_multiplicity(id, &operand);
+                    reached.push(Reached::Written(
+                        segments,
+                        operand_chain_steps(&operand),
+                        cross,
+                    ));
                 }
                 None => {
                     self.record_miss(file, range, &segments, stats);
@@ -427,10 +477,25 @@ impl Workspace {
             .find(|&child| self.model.kind(child).is_a(ElementKind::SuccessionAsUsage))
             .filter(|_| self.model.kind(id).is_a(ElementKind::TransitionUsage))
             .unwrap_or(id);
+        // An end the source declared -- `connect [1] e ::> a.p to [2] b;` --
+        // is the builder's, and is not one to be made again here. Left
+        // unclaimed, it was the `ReferenceUsage` end the `b` looked for, and
+        // the connector came to relate `b` through `e` and to have one end
+        // instead of two.
+        let declared: Vec<ElementId> = self
+            .model
+            .owned(holder)
+            .iter()
+            .copied()
+            .filter(|&it| self.model.flag(it, "isEnd") && self.source.contains_key(&it))
+            .collect();
+        self.claimed.extend(declared);
         for step in reached {
             match step {
-                Reached::Written(segments, steps) => self.reify_end(holder, &segments, &steps),
-                Reached::Beside(target) => self.end_reaching(holder, vec![target]),
+                Reached::Written(segments, steps, cross) => {
+                    self.reify_end(holder, &segments, &steps, cross)
+                }
+                Reached::Beside(target) => self.end_reaching(holder, vec![target], None),
             }
         }
         if !related.is_empty() {
@@ -445,14 +510,23 @@ impl Workspace {
     /// nearest member of the same body before it that a succession can join.
     ///
     /// A step or an occurrence, since a sequence model writes `event
-    /// occurrence e; then f;`. Where the nearest one is another succession the
-    /// answer is the end of it facing this one: `then a; then b;` runs a to b.
+    /// occurrence e; then f;`. Another succession, or a conditional one, is
+    /// passed over rather than followed: "the source of a succession
+    /// represented using the then shorthand is ... the nearest occurrence
+    /// lexically previous to the then, skipping over any intervening
+    /// non-occurrence usages (and conditional successions)" (SysML 7.17.4),
+    /// so `fork f; then a; then b;` runs f to a and f to b, and the branches
+    /// written under a `decide` all leave the decision.
     fn step_before(&self, succession: ElementId) -> Option<ElementId> {
         let owner = self.model.owner(succession)?;
         let members = self.model.owned(owner);
         let at = members.iter().position(|&it| it == succession)?;
         for &member in members[..at].iter().rev() {
             let kind = self.model.kind(member);
+            if kind.is_a(ElementKind::SuccessionAsUsage) || kind.is_a(ElementKind::TransitionUsage)
+            {
+                continue;
+            }
             if kind.is_a(ElementKind::ConnectorAsUsage) {
                 // the one before this went somewhere, and that is where
                 // this one starts
@@ -486,7 +560,7 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         let Some(about) = node
             .children()
             .find(|child| child.kind() == SyntaxKind::ABOUT)
@@ -538,13 +612,17 @@ impl Workspace {
             .filter(|child| child.kind() == SyntaxKind::QUALIFIED_NAME)
         {
             let segments = name_segments(&qname);
-            if let Some(target) = self.resolve_from(id, &segments) {
-                stats.resolved += 1;
-                let file = self.elem_file.get(&id).copied().unwrap_or(0);
-                let range = qname.text_range();
-                let at = segment_ranges(&qname);
-                self.record(id, file, range, last_name_range(&qname), &at, target);
-                self.reify(id, false, SyntaxKind::TYPING, target);
+            let file = self.file_of(id);
+            let range = qname.text_range();
+            match self.resolve_from(id, &segments) {
+                Some(target) => {
+                    stats.resolved += 1;
+                    let at = segment_ranges(&qname);
+                    self.record(id, file, range, last_name_range(&qname), &at, target);
+                    self.reify(id, false, SyntaxKind::TYPING, target);
+                }
+                // `#nope part x;` annotates `x` with nothing at all
+                None => self.record_miss(file, range, &segments, stats),
             }
         }
     }
@@ -560,7 +638,7 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         let (mut clients, mut suppliers) = (Vec::new(), Vec::new());
         let mut supplying = false;
         for part in node.children_with_tokens() {
@@ -650,14 +728,46 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
+        // A transition carries its trigger and its effect as actions of
+        // their own, each written in a clause of the statement: `accept s
+        // via p` waits through `p`, and `do send x to q` sends to `q`.
+        // Read as the transition's, neither was looked up at all.
+        if self.model.kind(id) == ElementKind::TransitionUsage {
+            for (role, opens) in [
+                ("triggerAction", SyntaxKind::ACCEPT_KW),
+                ("effectAction", SyntaxKind::DO_KW),
+            ] {
+                let carried: Vec<ElementId> = match self.model.maybe(id, role) {
+                    Some(Value::RefList(actions)) => actions.clone(),
+                    _ => Vec::new(),
+                };
+                if let Some(window) = sysml_model::clause(node, opens) {
+                    for action in carried {
+                        self.resolve_arguments_in(action, node, window, stats);
+                    }
+                }
+            }
+            return;
+        }
+        self.resolve_arguments_in(id, node, node.text_range(), stats);
+    }
+    /// What an action is handed by the clauses written within `window`.
+    fn resolve_arguments_in(
+        &mut self,
+        id: ElementId,
+        node: &SyntaxNode,
+        window: TextRange,
+        stats: &mut ResolveStats,
+    ) {
         let kind = self.model.kind(id);
         let arguments: &[(usize, SyntaxKind)] = match kind {
             ElementKind::SendActionUsage => &[(1, SyntaxKind::VIA_KW), (2, SyntaxKind::TO_KW)],
             ElementKind::AcceptActionUsage => &[(1, SyntaxKind::VIA_KW)],
+            ElementKind::TerminateActionUsage => &[(0, SyntaxKind::TERMINATE_KW)],
             ElementKind::AssignmentActionUsage => &[],
             _ => return,
         };
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         let mut resolve = |ws: &mut Self, operand: SyntaxNode| {
             let segments = operand_segments(&operand);
             let at = operand_ranges(&operand);
@@ -696,7 +806,7 @@ impl Workspace {
             .filter(|&child| self.model.kind(child) == ElementKind::ReferenceUsage)
             .collect();
         for &(slot, keyword) in arguments {
-            let Some(operand) = operand_after(node, keyword) else {
+            let Some(operand) = operand_after_in(node, keyword, window) else {
                 continue;
             };
             let Some(target) = resolve(self, operand) else {
@@ -793,7 +903,13 @@ impl Workspace {
     /// The final target alone cannot say which part an end belongs to --
     /// `w1.hub` and `w2.hub` resolve to the same port of the same type --
     /// so the chain is what an interconnection view needs.
-    fn reify_end(&mut self, connector: ElementId, segments: &[String], steps: &[usize]) {
+    fn reify_end(
+        &mut self,
+        connector: ElementId,
+        segments: &[String],
+        steps: &[usize],
+        cross: Option<ElementId>,
+    ) {
         let mut chain = Vec::new();
         // the full path already resolved, so every prefix normally does too
         for &depth in steps {
@@ -801,15 +917,42 @@ impl Workspace {
                 chain.push(step);
             }
         }
-        self.end_reaching(connector, chain);
+        self.end_reaching(connector, chain, cross);
     }
-    /// Stand a `Feature` for one connector end, reaching what it names.
+    /// The cross multiplicity written before an end: the `[1]` of `connect
+    /// [1] p1 to [0..*] p2`.
+    ///
+    /// The builder stands it up as the connector's, since the end it
+    /// counts is only made here; the clause it was built from says which
+    /// it is. Taken by its end on an earlier pass, it is under that end.
+    fn cross_multiplicity(&self, connector: ElementId, operand: &SyntaxNode) -> Option<ElementId> {
+        let clause = std::iter::successors(operand.prev_sibling_or_token(), |it| {
+            it.prev_sibling_or_token()
+        })
+        .find(|it| !it.kind().is_trivia())?
+        .into_node()
+        .filter(|it| it.kind() == SyntaxKind::MULTIPLICITY)?;
+        let owned = self.model.owned(connector);
+        owned
+            .iter()
+            .chain(owned.iter().flat_map(|&end| self.model.owned(end)))
+            .copied()
+            .find(|it| self.source.get(it) == Some(&clause))
+    }
+    /// Stand a feature for one connector end, reaching what it names: a
+    /// `ReferenceUsage` where SysML writes it and a `Feature` where KerML
+    /// does.
     ///
     /// One name is not a chain: `validateFeatureChainingFeatureNotOne`
     /// gives a feature either no chaining features or more than one, so
     /// an end naming a single feature refers to it through a subsetting
     /// instead. Read either way by [`sysml_model::end_reaches`].
-    fn end_reaching(&mut self, connector: ElementId, chain: Vec<ElementId>) {
+    fn end_reaching(
+        &mut self,
+        connector: ElementId,
+        chain: Vec<ElementId>,
+        cross: Option<ElementId>,
+    ) {
         // What a connector relates it relates through ends of its own:
         // `EndFeatureMembership` is how the standard owns one, which is also what
         // tells such a feature from a member the source wrote as a reference.
@@ -820,15 +963,30 @@ impl Workspace {
         // A flow relates its ends through `FlowEnd`s, where the last step of what
         // one names is not part of the path but the thing that flows.
         let flowing = self.model.kind(connector).is_a(ElementKind::Flow);
+        // And the two languages stand a different element for an end
+        // that is no flow's. KerML writes `ConnectorEnd : Feature`; SysML
+        // writes `ConnectorEnd : ReferenceUsage`, since what a usage owns
+        // is a usage, and an end refers to what it connects rather than
+        // being part of the connection. Which one is the file's to say,
+        // not the connector's: the grammar gives a SysML transition's
+        // `Succession` its target end through `ConnectorEndMember` too.
+        let sysml = Dialect::from_path(self.file_name(self.file_of(connector))) == Dialect::SysML;
         let end = self.reified(
             connector,
-            match flowing {
-                true => ElementKind::FlowEnd,
-                false => ElementKind::Feature,
+            match (flowing, sysml) {
+                (true, _) => ElementKind::FlowEnd,
+                (false, true) => ElementKind::ReferenceUsage,
+                (false, false) => ElementKind::Feature,
             },
             &[("isEnd", Value::Bool(true))],
         );
         self.counts_one(end);
+        // `ConnectorEnd = ( ownedRelationship +=
+        // OwnedCrossMultiplicityMember )? ...`: how many at the far end go
+        // with one here is the end's to say, through a feature of its own
+        if let Some(cross) = cross.filter(|&it| self.model.owner(it) != Some(end)) {
+            self.model.add_owned(end, cross);
+        }
         let chain = match flowing {
             // an end is reified only for an operand that resolved, so
             // there is always a last step to be the thing that flows
@@ -855,7 +1013,15 @@ impl Workspace {
                     ],
                 );
             }
-            _ => self.try_set(end, "chainingFeature", Value::RefList(chain)),
+            // `connect a.x to b;` is an end chained through `a` to `x`, and
+            // `chainingFeature` is derived from the `FeatureChaining`s the
+            // end owns. Kept alone, the model would say the end is a chain and
+            // hold none of the relationships that make one, and a document
+            // written from it would have no `ownedFeatureChaining` to read.
+            _ => {
+                self.try_set(end, "chainingFeature", Value::RefList(chain.clone()));
+                self.chainings(end, chain);
+            }
         }
     }
     /// Stand the last step of what a flow end names up as the feature that
@@ -865,8 +1031,16 @@ impl Workspace {
     /// flows is `fuelOut`. The standard keeps them apart -- the path is what
     /// the end refers to, the feature is the one thing it owns -- and
     /// [`sysml_model::end_reaches`] puts the two back together.
+    ///
+    /// Which element it is is the file's to say, as for an end: `FlowFeature
+    /// : ReferenceUsage` in SysML, where what a usage owns is a usage, and
+    /// `FlowFeature : Feature` in KerML.
     fn flowing_feature(&mut self, end: ElementId, flows: ElementId) {
-        let feature = self.reified(end, ElementKind::Feature, &[]);
+        let kind = match Dialect::from_path(self.file_name(self.file_of(end))) {
+            Dialect::SysML => ElementKind::ReferenceUsage,
+            Dialect::KerML => ElementKind::Feature,
+        };
+        let feature = self.reified(end, kind, &[]);
         self.reified(
             feature,
             ElementKind::Redefinition,
@@ -892,7 +1066,7 @@ impl Workspace {
     /// then it must have multiplicity 1..1" -- and the notation writes it
     /// nowhere. What stands before an end in `first [0..1] decide then [0..1]
     /// merge` is the cross multiplicity: how many at the far end go with one
-    /// here. Without the range, the four constraints counting what a control
+    /// here. Without the range, the constraints counting what a control
     /// node is joined by have nothing to read.
     fn counts_one(&mut self, end: ElementId) {
         let range = self.reified(end, ElementKind::MultiplicityRange, &[]);
@@ -917,6 +1091,14 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
+        // `for n : Integer in xs` types the loop variable, which is the
+        // first feature the loop owns and has no syntax of its own
+        if self.model.kind(transition) == ElementKind::ForLoopActionUsage {
+            if let Some(variable) = self.model.owned(transition).first().copied() {
+                self.type_where_written(transition, variable, relationship_parts(node), stats);
+            }
+            return;
+        }
         let declared = match self.model.maybe(transition, "triggerAction") {
             Some(Value::RefList(triggers)) => triggers.first().copied(),
             // `accept cl : CallGiveItems do action { ... }` is an accept
@@ -941,21 +1123,32 @@ impl Workspace {
         else {
             return;
         };
-        let file = self.elem_file.get(&transition).copied().unwrap_or(0);
-        let typings = relationship_parts(node)
+        self.type_where_written(transition, trigger, payload_parts(node), stats);
+    }
+    /// Type `typed` by what the typings among `parts` name, looked up from
+    /// `written`, the element whose statement writes them.
+    fn type_where_written(
+        &mut self,
+        written: ElementId,
+        typed: ElementId,
+        parts: Vec<(SyntaxKind, Vec<Target>)>,
+        stats: &mut ResolveStats,
+    ) {
+        let file = self.file_of(written);
+        let typings = parts
             .into_iter()
             .filter(|(part, _)| *part == SyntaxKind::TYPING);
         for (_, targets) in typings {
             for t in targets {
-                match self.resolve_written(transition, &t.segments, false, None) {
+                match self.resolve_written(written, &t.segments, false, None) {
                     Some(target) => {
                         stats.resolved += 1;
-                        self.record(transition, file, t.range, t.name_range, &t.at, target);
+                        self.record(written, file, t.range, t.name_range, &t.at, target);
                         self.reified(
-                            trigger,
+                            typed,
                             ElementKind::FeatureTyping,
                             &[
-                                ("typedFeature", Value::Ref(trigger)),
+                                ("typedFeature", Value::Ref(typed)),
                                 ("type", Value::Ref(target)),
                             ],
                         );
@@ -980,7 +1173,7 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         for (keyword, property) in [
             (SyntaxKind::SATISFY_KW, "satisfiedRequirement"),
             (SyntaxKind::BY_KW, "satisfyingFeature"),
@@ -1029,7 +1222,7 @@ impl Workspace {
         let Some(operand) = operand_after(node, SyntaxKind::VERIFY_KW) else {
             return;
         };
-        let file = self.elem_file.get(&id).copied().unwrap_or(0);
+        let file = self.file_of(id);
         let segments = operand_segments(&operand);
         let range = operand.text_range();
         let Some(target) = self.resolve_operand(id, &segments) else {
@@ -1062,5 +1255,91 @@ impl Workspace {
         if self.model.kind(id).feature(prop).is_some() {
             self.model.set(id, prop, value);
         }
+    }
+}
+
+/// The relationship a declaration clause writes, and which of its ends is
+/// the declaring element and which the one it names.
+fn relationship_for(
+    part: SyntaxKind,
+    is_definition: bool,
+) -> (ElementKind, &'static str, &'static str) {
+    match part {
+        SyntaxKind::SUBSETTING if is_definition => (
+            ElementKind::Subclassification,
+            "subclassifier",
+            "superclassifier",
+        ),
+        SyntaxKind::SUBSETTING => (
+            ElementKind::Subsetting,
+            "subsettingFeature",
+            "subsettedFeature",
+        ),
+        SyntaxKind::REDEFINITION => (
+            ElementKind::Redefinition,
+            "redefiningFeature",
+            "redefinedFeature",
+        ),
+        SyntaxKind::REFERENCES => (
+            ElementKind::ReferenceSubsetting,
+            "referencingFeature",
+            "referencedFeature",
+        ),
+        // `datatype N :> V, A intersects V, A;` -- a type written as
+        // the union, intersection or difference of others, and
+        // `feature chain chains source.target` a feature written as
+        // the chain through them
+        SyntaxKind::UNIONS_KW => (ElementKind::Unioning, "typeUnioned", "unioningType"),
+        SyntaxKind::INTERSECTS_KW => (
+            ElementKind::Intersecting,
+            "typeIntersected",
+            "intersectingType",
+        ),
+        SyntaxKind::DIFFERENCES_KW => (
+            ElementKind::Differencing,
+            "typeDifferenced",
+            "differencingType",
+        ),
+        SyntaxKind::CHAINS_KW => (
+            ElementKind::FeatureChaining,
+            "featureChained",
+            "chainingFeature",
+        ),
+        // `feature h2 ... disjoint from h1;` -- what a feature is
+        // declared not to overlap. Written this way there is no
+        // statement to hang it off, and until it was read the name
+        // after `from` was looked at by nothing: a typo in one was a
+        // model this toolchain called sound.
+        SyntaxKind::DISJOINT_KW => (ElementKind::Disjoining, "typeDisjoined", "disjoiningType"),
+        // `feature h inverse of g;` -- what `h` is the inverse of, which
+        // fell through to the typing below and was read as `h : g`
+        SyntaxKind::INVERSE_KW => (
+            ElementKind::FeatureInverting,
+            "featureInverted",
+            "invertingFeature",
+        ),
+        // A cross subsetting is a subsetting, so the end that
+        // declares it is its `subsettingFeature` like any other;
+        // what it crosses to is the narrower name. Its
+        // `crossingFeature` is derived from which feature owns it,
+        // so nothing is stored for that.
+        SyntaxKind::CROSSES_KW => (
+            ElementKind::CrossSubsetting,
+            "subsettingFeature",
+            "crossedFeature",
+        ),
+        // `class B conjugates A;` -- the conjugation is owned by the
+        // type that is conjugated, which is what tells it from
+        // `conjugation c conjugate B conjugates A;`, where the
+        // namespace owns it and B is not itself a conjugated type.
+        SyntaxKind::CONJUGATES_KW => (ElementKind::Conjugation, "conjugatedType", "originalType"),
+        // `member feature inCart : ShoppingCart featured by
+        // Product_Account;` -- what features a feature, written
+        // beside the declaration rather than as a statement of its
+        // own. Without it the feature is featured by whatever owns
+        // it, which is what it says the feature is *not*.
+        SyntaxKind::FEATURED_KW => (ElementKind::TypeFeaturing, "featureOfType", "featuringType"),
+        // relationship_parts only yields the kinds above plus TYPING
+        _ => (ElementKind::FeatureTyping, "typedFeature", "type"),
     }
 }

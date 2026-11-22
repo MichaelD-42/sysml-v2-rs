@@ -6,7 +6,7 @@
 //! reified with resolved targets by `sysml-semantics`; expression trees are
 //! not represented as elements.
 
-use sysml_syntax::{unquote, Parse, SyntaxKind, SyntaxNode};
+use sysml_syntax::{unquote, Parse, SyntaxKind, SyntaxNode, TextRange};
 
 use crate::{ElementId, ElementKind, Model, Role, Value, Vis};
 
@@ -88,7 +88,7 @@ fn build_node(
         IMPORT | EXPOSE => Some(import_kind(node)),
         // `dependency use from A to B;` -- a relationship in its own
         // right, with clients on one side of `to` and suppliers on the
-        // other, and nothing at all in the model until now
+        // other
         DEPENDENCY => Some(ElementKind::Dependency),
         // `flow f of Fuel from a to b` -- what the flow carries, which the
         // standard owns from the flow as a feature of its own
@@ -108,9 +108,9 @@ fn build_node(
         //
         // KerML writes the same thing and calls it a `MetadataFeature`, which is
         // what `MetadataUsage` specializes. Read as the usage, `#atom classifier
-        // MyBike;` was given the base the library states for a usage and so had a
-        // second metaclass among its types beside the one it names, since a
-        // `MetadataDefinition` is a `Metaclass`.
+        // MyBike;` would be given the base the library states for a usage and so
+        // have a second metaclass among its types beside the one it names, since
+        // a `MetadataDefinition` is a `Metaclass`.
         METADATA_ANNOTATION | PREFIX_METADATA => Some(match built.dialect {
             sysml_syntax::Dialect::KerML => ElementKind::MetadataFeature,
             sysml_syntax::Dialect::SysML => ElementKind::MetadataUsage,
@@ -139,6 +139,7 @@ fn build_node(
         // their own — their references are handled during name resolution
         return None;
     };
+    let kind = in_dialect(kind, built.dialect);
 
     // `EnumerationUsageMember : VariantMembership = MemberPrefix
     // ownedRelatedElement += EnumeratedValue` -- every value written in an
@@ -179,7 +180,7 @@ fn build_node(
         }
     }
 
-    if let Some(name) = declared_name(node).or_else(|| statement_declared_name(node)) {
+    if let Some(name) = declared_name(node) {
         model.set(id, "declaredName", Value::String(name));
     }
     if let Some(visibility) = member_visibility(node)
@@ -199,6 +200,15 @@ fn build_node(
                 model.set(id, "direction", Value::EnumLit(direction));
             }
         }
+    }
+    // `member feature g : B;` and the `[0..1]` of `end b2[0..1] feature b`
+    // are members of the type they are written in without being features
+    // of it: `TypeFeatureMember : OwningMembership` and
+    // `OwnedCrossFeatureMember : OwningMembership`. The `member` is the
+    // whole of the difference between the first and `feature g : B;`, so
+    // it is kept here or nowhere.
+    if crossed.is_some() || scope_has(node, MEMBER_KW) {
+        model.set_owning_member(id);
     }
     if let Some(direction) = declared_direction(node) {
         if kind.feature("direction").is_some() {
@@ -261,6 +271,13 @@ fn build_node(
     // opposite of what the drawing and the generated stub would say of
     // it otherwise. `assert not` negates in the same way.
     if scope_has(node, NOT_KW) && kind.feature("isNegated").is_some() {
+        model.set(id, "isNegated", Value::Bool(true));
+    }
+    // `inv false { ... }` says the invariant never holds: `Invariant =
+    // ... 'inv' ( 'true' | isNegated ?= 'false' )? ...`. Only the word
+    // straight under the declaration says so; a `false` in its result is
+    // an expression of its own.
+    if has_token(node, FALSE_KW) && has_token(node, INV_KW) && kind.feature("isNegated").is_some() {
         model.set(id, "isNegated", Value::Bool(true));
     }
     // `end #original r1 : Req1;` -- what a connector relates, as opposed to
@@ -339,12 +356,25 @@ fn build_node(
         // would leave the rest out of the drawing.
         let everything = has_token(node, ALL_KW) || kind.is_a(ElementKind::Expose);
         model.set(id, "isImportAll", Value::Bool(everything));
+        // `import Lib::*[@Meta];` is not an import of `Lib`: "a filtered
+        // import is equivalent to importing an implicit package that then
+        // both imports the given imported membership or namespace and has
+        // all the given filter conditions" (KerML 7.2.5.4). `FilterPackage
+        // : Package = ownedRelationship += FilterPackageImport (
+        // ownedRelationship += FilterPackageMember )+`, and the import
+        // written is a `NamespaceImport` of that package, which it owns.
+        // Written as the plain import of `Lib`, the export said every
+        // member of `Lib` arrives, whatever the brackets kept out.
+        let imports = match is_filtered(node) {
+            true => filter_package(model, node, id, everything, built),
+            false => id,
+        };
         if node
             .descendants_with_tokens()
             .filter_map(|part| part.into_token())
             .any(|token| token.kind() == STAR_STAR)
         {
-            model.set(id, "isRecursive", Value::Bool(true));
+            model.set(imports, "isRecursive", Value::Bool(true));
         }
     }
     if kind == ElementKind::TextualRepresentation {
@@ -386,6 +416,11 @@ fn build_node(
         model.set_member_role(id, Role::Result);
         if let Some(written) = node.children().next() {
             represent_textually(model, id, written.text().to_string().trim());
+            // and what it says, built the way a value is: `xs->forAll {in
+            // x : T; x > 0}` hands over a body that declares the `x` it
+            // names. Kept as text alone, the body declared nothing, and
+            // neither `x` nor its `T` was ever looked up.
+            builds_what_it_says(model, id, Some(written), built);
         }
     }
     if kind == ElementKind::TransitionUsage {
@@ -407,9 +442,11 @@ fn build_node(
             let trigger = model.create(ElementKind::AcceptActionUsage);
             model.add_owned(id, trigger);
             let payload = reify_accept_payload(model, node, trigger);
+            let window = crate::clause(node, ACCEPT_KW).unwrap_or_else(|| node.text_range());
             reify_action_arguments(
                 model,
                 node,
+                window,
                 trigger,
                 ElementKind::AcceptActionUsage,
                 payload,
@@ -423,7 +460,7 @@ fn build_node(
                 model.set(subsetting, "subsettedFeature", Value::Ref(payload));
             }
         }
-        reify_guard(model, node, id);
+        reify_guard(model, node, id, built);
         reify_effect(model, node, id, built);
         // A transition is not a connector: what it relates it relates
         // through a `Succession` of its own, which is what
@@ -435,7 +472,7 @@ fn build_node(
     let payload = (kind == ElementKind::AcceptActionUsage)
         .then(|| reify_accept_payload(model, node, id))
         .flatten();
-    reify_action_arguments(model, node, id, kind, payload, built);
+    reify_action_arguments(model, node, node.text_range(), id, kind, payload, built);
     // The condition is what an `if` or a loop node is about, and it was being
     // read and dropped.
     // A `for` loop's variable is written first and is the first feature the
@@ -445,10 +482,26 @@ fn build_node(
         reify_loop_variable(model, node, id);
     }
     if structured_node(kind) {
-        reify_condition(model, node, id);
+        reify_condition(model, node, id, built);
     }
-    if kind.feature("multiplicity").is_some() {
-        reify_multiplicity(model, node, id);
+    // `connect [1] lugNutPort ::> wheel.lugNutPort to ...` and `connect ([5]
+    // p1, [6] p2)` write the ends themselves, and what is in brackets is
+    // never the end's own: `ConnectorEnd = OwnedCrossMultiplicityMember? (
+    // declaredName = NAME REFERENCES )? ownedReferenceSubsetting` has no
+    // place for one. It is the cross multiplicity, as it is before an end
+    // written as a plain name, and the end is one thing like every other.
+    // Built as its own, the `[5]` said the end was five things, which no end
+    // may be.
+    if declares_an_end(model, node, owner) {
+        if let Some(clause) = crossing_clause(node) {
+            cross_multiplicity(model, id, &clause, built);
+        }
+        counts_one(model, id);
+    } else if kind.feature("multiplicity").is_some() {
+        reify_multiplicity(model, node, id, built);
+    }
+    if counts_its_ends(kind) {
+        reify_cross_multiplicities(model, node, id, built);
     }
     // every feature, not only the usages SysML layers on them: the
     // standard puts a `FeatureValue` on `Feature`, and KerML writes
@@ -456,8 +509,14 @@ fn build_node(
     //
     // An assignment is the exception: `assign x := 1;` gives the value to
     // `x`, and reading it as the assignment's own value says the action
-    // itself is one.
-    if kind.is_a(ElementKind::Feature) && !kind.is_a(ElementKind::AssignmentActionUsage) {
+    // itself is one. So is a binding: the `= a.m` of `bind w.h = a.m;` is
+    // the second of the two features it binds, which name resolution
+    // reifies as its end, and read as a value as well it gave the
+    // connector a third thing to relate.
+    if kind.is_a(ElementKind::Feature)
+        && !kind.is_a(ElementKind::AssignmentActionUsage)
+        && !kind.is_a(ElementKind::BindingConnector)
+    {
         reify_feature_value(model, node, id, built);
     }
 
@@ -480,7 +539,7 @@ fn build_node(
                     if let Some(repeats) =
                         loop_before(model, under).filter(|_| closes_a_loop(&member))
                     {
-                        reify_condition(model, &member, repeats);
+                        reify_condition(model, &member, repeats, built);
                         continue;
                     }
                     let made = build_node(model, &member, Some(under), built);
@@ -498,6 +557,16 @@ fn build_node(
             }
             PAYLOAD | PREFIX_METADATA => {
                 build_node(model, &child, Some(id), built);
+            }
+            // `if c { ... } else if d { ... }` hands the second `if` to the
+            // first as its else branch: `IfNodeParameterMember :
+            // ParameterMembership = ownedRelatedElement += IfNode`. It is the
+            // only statement the parser nests in another.
+            CONTROL_STMT if kind == ElementKind::IfActionUsage => {
+                if let Some(branch) = build_node(model, &child, Some(id), built) {
+                    model.set(branch, "direction", Value::EnumLit("in"));
+                    model.set(branch, "isComposite", Value::Bool(false));
+                }
             }
             // `then action b;` writes the declaration inside the
             // succession it starts, but what it declares belongs to the
@@ -521,12 +590,24 @@ fn build_node(
                 // structured node is handed belongs to it however it
                 // was written; a step of the flow does not.
                 let handed = handed_body(model.kind(id), &child);
-                let parent = if handed || node.kind() != CONTROL_STMT {
+                // `transition t first a do action beep : Beep then b;`
+                // declares what the transition does on the way across,
+                // and the transition owns it: `EffectBehaviorMember :
+                // TransitionFeatureMembership = kind = 'effect'
+                // ownedRelatedElement += EffectBehaviorUsage`. Hoisted
+                // with a step of the flow, it read as a `do` of the
+                // state around it, and two transitions doing `action D`
+                // declared two members of one name there.
+                let effect = kind == ElementKind::TransitionUsage && declares_effect(&child);
+                let parent = if handed || effect || node.kind() != CONTROL_STMT {
                     Some(id)
                 } else {
                     owner
                 };
                 let made = build_node(model, &child, parent, built);
+                if let Some(action) = made.filter(|_| effect) {
+                    model.set(id, "effectAction", Value::RefList(vec![action]));
+                }
                 // `connect [1] lugNutPort ::> wheel.lugNutPort to ...`
                 // writes the end itself: `ConnectorEnd : Feature = (
                 // OwnedCrossMultiplicityMember )? ( declaredName = NAME
@@ -575,36 +656,92 @@ fn closes_a_loop(node: &SyntaxNode) -> bool {
 /// A single bound is recorded as the range's `bound`, two as `lowerBound`
 /// and `upperBound` -- the shape the written text has, with the KerML
 /// reading left to the consumer.
-fn reify_multiplicity(model: &mut Model, node: &SyntaxNode, owner: ElementId) {
+fn reify_multiplicity(model: &mut Model, node: &SyntaxNode, owner: ElementId, built: &mut Built) {
     use SyntaxKind::*;
     // `part x [0..*]` writes the clause as a node of its own. A control
     // statement writes the same thing where an index would go -- `then
-    // timeslice ownership[0..*]` -- and a two-ended range arrives whole
-    // there rather than as bounds either side of a `..`, so it is opened
-    // up to be read the one way.
+    // timeslice ownership[0..*]`. Either way a two-ended range arrives
+    // whole, as one `..` expression rather than as bounds either side of
+    // it, so it is opened up to be read the one way; any other expression
+    // is one bound.
+    // A connector's own multiplicity is written with its declaration, and
+    // what follows the keyword that introduces its ends counts an end:
+    // `connect [1] p1 to [0..*] p2;` writes `ConnectorEnd = (
+    // ownedRelationship += OwnedCrossMultiplicityMember )? ...` twice and
+    // says nothing of how many connections there are. Read as the
+    // connector's, the `[1]` made the connection one of exactly one.
+    //
+    // Nor is the `[3]` of `interface [3] p1 to [4] p2;`, which writes no
+    // keyword before its first end: `InterfaceUsageDeclaration = ... |
+    // InterfacePart`, and KerML's `connector [1] a to b;` likewise. What
+    // stands right before an end's name counts that end.
+    let connector = model.kind(owner).is_a(ElementKind::Connector);
+    let counted = counts_its_ends(model.kind(owner));
+    let own_clause = node
+        .children_with_tokens()
+        .take_while(|part| !(connector && introduces_connector_end(part.kind())))
+        .filter_map(|part| part.into_node())
+        .filter(|child| !(counted && counts_an_end(child)))
+        .find(|child| child.kind() == MULTIPLICITY);
+    let written: Vec<sysml_syntax::SyntaxElement> = match own_clause {
+        Some(clause) => clause.children_with_tokens().collect(),
+        None if connector => return,
+        None if node.kind() == CONTROL_STMT => {
+            // what counts a step is an index on its name; the unit of
+            // `accept after 5 [s]`, and a bracket in a guard or a value,
+            // belong to the expression they are written in
+            let counts_a_step = |indexed: &SyntaxNode| {
+                let named = indexed
+                    .children()
+                    .next()
+                    .is_some_and(|base| base.kind() == NAME_REF);
+                let after = std::iter::successors(indexed.prev_sibling_or_token(), |it| {
+                    it.prev_sibling_or_token()
+                })
+                .find(|it| !it.kind().is_trivia())
+                .map(|it| it.kind());
+                named
+                    && !matches!(
+                        after,
+                        Some(AT_KW | AFTER_KW | WHEN_KW | IF_KW | VIA_KW | EQ | COLON_EQ | TO_KW)
+                    )
+            };
+            let Some(indexed) = node
+                .children()
+                .find(|child| child.kind() == INDEX_EXPR && counts_a_step(child))
+            else {
+                return;
+            };
+            indexed
+                .children_with_tokens()
+                .skip_while(|part| part.kind() != L_BRACKET)
+                .collect()
+        }
+        None => return,
+    };
+    reify_range(model, written, owner, built);
+}
+
+/// Stand up the range a multiplicity clause writes, as `owner`'s.
+fn reify_range(
+    model: &mut Model,
+    written: Vec<sysml_syntax::SyntaxElement>,
+    owner: ElementId,
+    built: &mut Built,
+) {
+    use SyntaxKind::*;
     let written: Vec<sysml_syntax::SyntaxElement> =
-        match node.children().find(|child| child.kind() == MULTIPLICITY) {
-            Some(clause) => clause.children_with_tokens().collect(),
-            None if node.kind() == CONTROL_STMT => {
-                let Some(indexed) = node.children().find(|child| child.kind() == INDEX_EXPR) else {
-                    return;
-                };
-                indexed
-                    .children_with_tokens()
-                    .skip_while(|part| part.kind() != L_BRACKET)
-                    .flat_map(|part| match part.as_node() {
-                        Some(range) if range.kind() == BINARY_EXPR => {
-                            range.children_with_tokens().collect::<Vec<_>>()
-                        }
-                        _ => vec![part],
-                    })
-                    .collect()
-            }
-            None => return,
-        };
-    let range = model.create(ElementKind::MultiplicityRange);
-    model.add_owned(owner, range);
-    model.set(owner, "multiplicity", Value::Ref(range));
+        written.into_iter().flat_map(opened_ranges).collect();
+    // `multiplicity mm [1..*];` declares the range the brackets write,
+    // which holds its bounds itself
+    let range = if model.kind(owner).is_a(ElementKind::MultiplicityRange) {
+        owner
+    } else {
+        let range = model.create(ElementKind::MultiplicityRange);
+        model.add_owned(owner, range);
+        model.set(owner, "multiplicity", Value::Ref(range));
+        range
+    };
 
     // How many bounds there are is what the brackets say, not how many
     // of them we could read. Dropping one changes what the others mean:
@@ -625,7 +762,7 @@ fn reify_multiplicity(model: &mut Model, node: &SyntaxNode, owner: ElementId) {
     } else {
         segments
             .iter()
-            .map(|segment| bound_expression(model, range, segment))
+            .map(|segment| bound_expression(model, range, segment, built))
             .collect()
     };
     match bounds.as_slice() {
@@ -640,22 +777,196 @@ fn reify_multiplicity(model: &mut Model, node: &SyntaxNode, owner: ElementId) {
     }
 }
 
+/// Whether a connector's ends may each be counted where they are written.
+///
+/// `ConnectorEnd = ( ownedRelationship += OwnedCrossMultiplicityMember )?
+/// ...` in either language; a flow's ends are `FlowEnd`s, which the grammar
+/// gives no multiplicity, so what a flow writes in brackets is its own.
+fn counts_its_ends(kind: ElementKind) -> bool {
+    kind.is_a(ElementKind::Connector) && !kind.is_a(ElementKind::Flow)
+}
+
+/// The end a multiplicity clause is written right before: the `p1` of
+/// `connect [1] p1 to [0..*] p2;`, or the declaration `lugNutPort ::>
+/// wheel.lugNutPort` of `connect [1] lugNutPort ::> wheel.lugNutPort to
+/// ...`.
+fn end_counted(clause: &SyntaxNode) -> Option<SyntaxNode> {
+    if clause.kind() != SyntaxKind::MULTIPLICITY {
+        return None;
+    }
+    std::iter::successors(clause.next_sibling_or_token(), |it| {
+        it.next_sibling_or_token()
+    })
+    .find(|it| !it.kind().is_trivia())?
+    .into_node()
+    .filter(|it| {
+        matches!(it.kind(), SyntaxKind::NAME_REF | SyntaxKind::PATH_EXPR) || writes_an_end(it)
+    })
+}
+
+/// Whether a multiplicity clause is written right before an end.
+fn counts_an_end(clause: &SyntaxNode) -> bool {
+    end_counted(clause).is_some()
+}
+
+/// Whether a declaration written among a connector's ends, rather than in
+/// its body, is one of them: `( declaredName = NAME REFERENCES )?
+/// ownedReferenceSubsetting`, which is the only declaration the grammar
+/// lets an end be. `[5] p1` in an n-ary list is one as well -- the
+/// subsetting written with no name before it.
+fn writes_an_end(node: &SyntaxNode) -> bool {
+    node.kind() == SyntaxKind::USAGE
+        && node
+            .parent()
+            .is_some_and(|it| it.kind() != SyntaxKind::BODY)
+        && node
+            .children()
+            .any(|it| it.kind() == SyntaxKind::REFERENCES)
+}
+
+/// Whether `node` declares one of the ends of the connector it is built
+/// under, counted where it is written.
+fn declares_an_end(model: &Model, node: &SyntaxNode, owner: Option<ElementId>) -> bool {
+    owner.is_some_and(|it| counts_its_ends(model.kind(it))) && writes_an_end(node)
+}
+
+/// The cross multiplicity written for an end its connector declares: inside
+/// the declaration where the n-ary list puts it (`([5] p1, ...)`), and in
+/// front of it where the binary form does (`connect [1] e ::> a to ...`).
+fn crossing_clause(end: &SyntaxNode) -> Option<SyntaxNode> {
+    end.children()
+        .find(|it| it.kind() == SyntaxKind::MULTIPLICITY)
+        .or_else(|| {
+            std::iter::successors(end.prev_sibling_or_token(), |it| it.prev_sibling_or_token())
+                .find(|it| !it.kind().is_trivia())?
+                .into_node()
+                .filter(|it| it.kind() == SyntaxKind::MULTIPLICITY)
+        })
+}
+
+/// Stand up one cross multiplicity under `holder`: a feature of no name
+/// owning the range, through a plain membership.
+fn cross_multiplicity(
+    model: &mut Model,
+    holder: ElementId,
+    clause: &SyntaxNode,
+    built: &mut Built,
+) {
+    let cross = model.create(ElementKind::Feature);
+    model.add_owned(holder, cross);
+    model.set_owning_member(cross);
+    built.source.push((cross, clause.clone()));
+    reify_range(model, clause.children_with_tokens().collect(), cross, built);
+}
+
+/// An end is one thing.
+///
+/// `validateFeatureEndMultiplicity` -- "if a Feature has isEnd = true, then
+/// it must have multiplicity 1..1" -- and the notation writes it nowhere.
+/// Name resolution gives the ends it makes for plain names the same range;
+/// an end written as a declaration is made here, and here is where it is
+/// given one.
+fn counts_one(model: &mut Model, end: ElementId) {
+    let range = model.create(ElementKind::MultiplicityRange);
+    model.add_owned(end, range);
+    let mut one = || {
+        let bound = model.create(ElementKind::LiteralInteger);
+        model.add_owned(range, bound);
+        model.set(bound, "value", Value::Int(1));
+        bound
+    };
+    let (lower, upper) = (one(), one());
+    model.set(range, "lowerBound", Value::Ref(lower));
+    model.set(range, "upperBound", Value::Ref(upper));
+    model.set(end, "multiplicity", Value::Ref(range));
+}
+
+/// Stand up the cross multiplicity written before each end a connector
+/// names: `connect [1] p1 to [0..*] p2;` says that one `p1` goes with any
+/// number of `p2`s, and nothing about how many connections there are.
+///
+/// `OwnedCrossMultiplicityMember : OwningMembership = ownedRelatedElement
+/// += OwnedCrossMultiplicity` and `OwnedCrossMultiplicity : Feature =
+/// ownedRelationship += OwnedMultiplicity`: a feature of no name that
+/// holds the range, owned by the end through a plain membership. The end
+/// it belongs to is only made once its name has resolved, so the feature
+/// is the connector's until then -- the clause it was built from is what
+/// says which end takes it.
+fn reify_cross_multiplicities(
+    model: &mut Model,
+    node: &SyntaxNode,
+    connector: ElementId,
+    built: &mut Built,
+) {
+    // an end written as a declaration is built with the connector, and
+    // takes the one written in front of it as it is built
+    for clause in node
+        .children()
+        .filter(|clause| end_counted(clause).is_some_and(|end| !writes_an_end(&end)))
+    {
+        cross_multiplicity(model, connector, &clause, built);
+    }
+}
+
+/// Whether a keyword written in a connector introduces the ends it
+/// relates: `connect a to b`, `bind a = b`, `allocate a to b`, KerML's
+/// `connector from a to b`, `succession first a then b`.
+fn introduces_connector_end(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        CONNECT_KW | BIND_KW | ALLOCATE_KW | FROM_KW | TO_KW | FIRST_KW | THEN_KW | EQ
+    )
+}
+
+/// A part of a multiplicity with every `..` in it laid out flat:
+/// `[1..2..3]` reads as `(1..2)..3`, and is three bounds all the same,
+/// which fit no range.
+fn opened_ranges(part: sysml_syntax::SyntaxElement) -> Vec<sysml_syntax::SyntaxElement> {
+    match part.as_node() {
+        Some(range)
+            if range.kind() == SyntaxKind::BINARY_EXPR && has_token(range, SyntaxKind::DOT_DOT) =>
+        {
+            range
+                .children_with_tokens()
+                .flat_map(opened_ranges)
+                .collect()
+        }
+        _ => vec![part],
+    }
+}
+
 /// One bound of a multiplicity range, as the element it denotes. A
-/// bound of one plain token is the literal it spells; anything else --
-/// `count + 1`, a number too large for the model's integers, a minus
-/// sign where a natural belongs, or nothing at all -- is an expression
-/// kept as the text it was written as.
+/// bound of one plain token is the literal it spells, and one that names
+/// something -- `count`, `count + 1` -- is the expression it is written
+/// as, built like any other value so that its names are looked up.
+/// Anything else -- a number too large for the model's integers, a
+/// minus sign where a natural belongs, or nothing at all -- is an
+/// expression kept as the text it was written as.
 fn bound_expression(
     model: &mut Model,
     range: ElementId,
     segment: &[sysml_syntax::SyntaxElement],
+    built: &mut Built,
 ) -> ElementId {
     use SyntaxKind::*;
     let written: String = segment.iter().map(|part| part.to_string()).collect();
-    let single = match segment {
-        [only] => only.as_token().map(|token| token.kind()),
+    let node = match segment {
+        [only] => only.as_node(),
         _ => None,
     };
+    let single = match (segment, node) {
+        ([only], None) => only.as_token().map(|token| token.kind()),
+        (_, Some(literal)) if literal.kind() == LITERAL => {
+            literal.first_token().map(|token| token.kind())
+        }
+        _ => None,
+    };
+    if let Some(expression) = node.filter(|_| single.is_none()) {
+        if expression.descendants().any(|it| it.kind() == NAME_REF) {
+            return value_expression(model, range, expression, built);
+        }
+    }
     let (kind, value) = match single {
         Some(DECIMAL) => match written.parse() {
             Ok(int) => (ElementKind::LiteralInteger, Value::Int(int)),
@@ -745,16 +1056,24 @@ fn value_expression(
         model.set(literal, "value", value);
         return literal;
     }
+    // `NullExpression = 'null' | '(' ')'` and `LiteralInfinity = '*'`
+    // are each the whole of what they mean, and have no value to hold.
+    // Falling through to the text-only expression at the end, they were
+    // an expression of nothing in particular.
+    if let Some(kind) = valueless_literal(written) {
+        let literal = model.create(kind);
+        model.add_owned(membership, literal);
+        return literal;
+    }
     // `( a + b )` is what is inside it and nothing more; `(a, b, c)` is a
     // sequence, and every element of it is kept
     if written.kind() == SyntaxKind::PAREN_EXPR {
         let items: Vec<SyntaxNode> = written.children().collect();
-        if items.len() > 1 {
-            return sequence_expression(model, membership, written, &items, built);
-        }
-        if let Some(inner) = items.into_iter().next() {
-            return value_expression(model, membership, &inner, built);
-        }
+        // the empty `()` was the null literal above
+        return match items.as_slice() {
+            [inner] => value_expression(model, membership, inner, built),
+            _ => sequence_expression(model, membership, written, &items, built),
+        };
     }
     // `= ledPinNumber` refers to a feature rather than computing
     // anything, and the standard has an expression kind for exactly
@@ -812,7 +1131,18 @@ fn value_expression(
                 // `x as T` hands over `x` and names `T`; the type is not
                 // an argument, and `BaseFunctions::as` takes one.
                 let handed = hands_over_only(written);
-                for (at, (named, operand)) in operands(written).into_iter().enumerate() {
+                let mut operands = operands(written);
+                // `IndexExpression = PrimaryArgumentMember '#' '('
+                // SequenceExpressionListMember ')'`, and a bracket the
+                // same: what is indexed and one sequence of indices,
+                // however many are written -- not an argument apiece
+                let indices: Vec<SyntaxNode> = match written.kind() {
+                    SyntaxKind::INDEX_EXPR if operands.len() > 2 => {
+                        operands.drain(1..).map(|(_, index)| index).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for (at, (named, operand)) in operands.into_iter().enumerate() {
                     match at < handed {
                         true => hands_over(model, expression, named, &operand, Some("in"), built),
                         false => {
@@ -822,6 +1152,9 @@ fn value_expression(
                             built.expressions.push(reference);
                         }
                     }
+                }
+                if !indices.is_empty() {
+                    hands_over_sequence(model, expression, written, &indices, built);
                 }
                 results_in(model, expression);
                 // `(that as SpatialItem).localClock` chains to a name,
@@ -840,6 +1173,38 @@ fn value_expression(
     }
     let expression = model.create(ElementKind::Expression);
     model.add_owned(membership, expression);
+    // `xs->select { in x; x > 0 }` -- a body expression declares the
+    // parameters it is handed, and what it says names them. Kept as text
+    // alone, `x` stood for nothing anywhere in the model.
+    if written.kind() == SyntaxKind::BODY_EXPR {
+        for member in written.children() {
+            // `{in x : T; ...}` declares a parameter; what else the body
+            // declares -- `private attribute lbcf = lugBolts#(i).frame;`
+            // -- and the expression it ends with are members like any
+            // other. Taken for parameters, they were handed in rather than
+            // worked out, and what `lbcf` is was nowhere to be found.
+            let direction = [
+                (SyntaxKind::IN_KW, "in"),
+                (SyntaxKind::OUT_KW, "out"),
+                (SyntaxKind::INOUT_KW, "inout"),
+            ]
+            .into_iter()
+            .find(|&(keyword, _)| has_token(&member, keyword))
+            .map(|(_, direction)| direction);
+            let declared = Some(member.clone())
+                .filter(|it| it.kind() == SyntaxKind::USAGE)
+                .and_then(|it| Some((declared_name(&it)?, direction?)));
+            let Some((name, direction)) = declared else {
+                build_node(model, &member, Some(expression), built);
+                continue;
+            };
+            let parameter = model.create(ElementKind::Feature);
+            model.add_owned(expression, parameter);
+            model.set(parameter, "declaredName", Value::String(name));
+            model.set(parameter, "direction", Value::EnumLit(direction));
+            built.source.push((parameter, member));
+        }
+    }
     represent_textually(model, expression, written.text().to_string().trim());
     expression
 }
@@ -860,21 +1225,34 @@ fn sequence_expression(
     built.expressions.push(expression);
     model.set(expression, "operator", Value::String(",".to_string()));
     hands_over(model, expression, None, &items[0], Some("in"), built);
-    // the rest has no node of its own to hand over, so it is built in place
+    hands_over_sequence(model, expression, written, &items[1..], built);
+    results_in(model, expression);
+    represent_textually(model, expression, written.text().to_string().trim());
+    expression
+}
+
+/// Hand `items` over as one argument: the one item where there is one,
+/// else the sequence of them. A sequence written without parentheses --
+/// the rest of `(a, b, c)`, the indices of `a#(1, 2)` -- has no node of
+/// its own to hand over, so it is built in place.
+fn hands_over_sequence(
+    model: &mut Model,
+    expression: ElementId,
+    written: &SyntaxNode,
+    items: &[SyntaxNode],
+    built: &mut Built,
+) {
     let parameter = model.create(ElementKind::Feature);
     model.add_owned(expression, parameter);
     model.set(parameter, "direction", Value::EnumLit("in"));
     let value = model.create(ElementKind::FeatureValue);
     model.add_owned(parameter, value);
     model.set(value, "featureWithValue", Value::Ref(parameter));
-    let rest = match &items[1..] {
-        [last] => value_expression(model, value, last, built),
+    let handed = match items {
+        [only] => value_expression(model, value, only, built),
         more => sequence_expression(model, value, written, more, built),
     };
-    model.set(value, "value", Value::Ref(rest));
-    results_in(model, expression);
-    represent_textually(model, expression, written.text().to_string().trim());
-    expression
+    model.set(value, "value", Value::Ref(handed));
 }
 
 /// Which kind of invocation an expression is written as, and the
@@ -904,6 +1282,16 @@ fn invoked(written: &SyntaxNode) -> Option<(ElementKind, Option<String>)> {
             true => Some((ElementKind::IndexExpression, Some("#".to_string()))),
             false => Some((ElementKind::OperatorExpression, Some("[".to_string()))),
         },
+        // `xs.{ in x; ... }` and `xs.?{ in x; ... }` are a collect and a
+        // select written short: `CollectExpression = PrimaryArgumentMember
+        // '.' BodyArgumentMember` and the same with `.?`. Read as a chain,
+        // the body was a name the chain went to, and was never built.
+        PATH_EXPR if written.children().any(|it| it.kind() == BODY_EXPR) => {
+            match has_token(written, DOT_QUESTION) {
+                true => Some((ElementKind::SelectExpression, Some("select".to_string()))),
+                false => Some((ElementKind::CollectExpression, Some("collect".to_string()))),
+            }
+        }
         // `a.b` where `a` is not a name is a chain through what the
         // expression in front of it comes to
         PATH_EXPR => Some((ElementKind::FeatureChainExpression, Some(".".to_string()))),
@@ -948,7 +1336,13 @@ fn invoked(written: &SyntaxNode) -> Option<(ElementKind, Option<String>)> {
 /// names the feature it reaches the same way, and `all T` names a type and
 /// hands over nothing.
 fn hands_over_only(written: &SyntaxNode) -> usize {
-    if written.kind() == SyntaxKind::PATH_EXPR {
+    // a chain hands over what it chains from; a collect or a select
+    // written with a dot hands over its body as well
+    if written.kind() == SyntaxKind::PATH_EXPR
+        && !written
+            .children()
+            .any(|it| it.kind() == SyntaxKind::BODY_EXPR)
+    {
         return 1;
     }
     let symbols: Vec<String> = written
@@ -1065,6 +1459,25 @@ fn results_in(model: &mut Model, expression: ElementId) -> ElementId {
     result
 }
 
+/// The literal a value clause holds when that literal has no value to
+/// hold: `null` and `()`, which are both the empty sequence, and `*`.
+fn valueless_literal(written: &SyntaxNode) -> Option<ElementKind> {
+    use SyntaxKind::*;
+    match written.kind() {
+        PAREN_EXPR => written
+            .children()
+            .next()
+            .is_none()
+            .then_some(ElementKind::NullExpression),
+        LITERAL => match written.first_token()?.kind() {
+            NULL_KW => Some(ElementKind::NullExpression),
+            STAR => Some(ElementKind::LiteralInfinity),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The literal a value clause holds, when it holds one this model reifies.
 /// `-2` arrives as a unary minus around the literal and is folded here.
 fn literal_value(written: &SyntaxNode) -> Option<(ElementKind, Value)> {
@@ -1127,6 +1540,56 @@ fn represent_textually(model: &mut Model, element: ElementId, text: &str) {
     model.set(written, "representedElement", Value::Ref(element));
 }
 
+/// The package a filtered import imports, built under `import`: the import
+/// of what the source named, and one `ElementFilterMembership` for each
+/// condition in brackets. Answers with the import the package owns, which
+/// is the one that names what the source wrote -- so it is the one the
+/// written text stands for, and the one a resolver reads it off.
+fn filter_package(
+    model: &mut Model,
+    node: &SyntaxNode,
+    import: ElementId,
+    everything: bool,
+    built: &mut Built,
+) -> ElementId {
+    let package = model.create(ElementKind::Package);
+    model.add_owned(import, package);
+    let named = model.create(filter_package_import_kind(node));
+    model.add_owned(package, named);
+    // `FilterPackageImport : Import = ImportDeclaration { visibility =
+    // 'public' }` -- what the package imports is what it shows -- and
+    // `import all A::*[@X]` still brings in what `A` keeps to itself
+    model.set_member_visibility(named, Vis::Public);
+    model.set(named, "isImportAll", Value::Bool(everything));
+    // the text names what the package imports, and the import written
+    // around it is reached through the package it owns
+    if let Some(entry) = built.source.iter_mut().find(|(id, _)| *id == import) {
+        entry.0 = named;
+    }
+    for filter in node
+        .children()
+        .filter(|child| child.kind() == SyntaxKind::FILTER)
+    {
+        // `FilterPackageMember : ElementFilterMembership = '['
+        // ownedRelatedElement += OwnedExpression ']'`, private as the
+        // pilot implementation has it: a condition is what the package
+        // filters by, not a member it shows
+        let membership = model.create(ElementKind::ElementFilterMembership);
+        model.add_owned(package, membership);
+        model.set_member_visibility(membership, Vis::Private);
+        let Some(written) = filter.children().next() else {
+            continue;
+        };
+        // kept as the text it was written as: what a bracketed condition
+        // names is resolved off the syntax, beside the import
+        let condition = model.create(ElementKind::Expression);
+        model.add_owned(membership, condition);
+        represent_textually(model, condition, written.text().to_string().trim());
+        model.set(membership, "condition", Value::Ref(condition));
+    }
+    named
+}
+
 /// Reify what an `accept x : T via p` clause waits for.
 ///
 /// The parser leaves the clause flat, so the payload has nothing standing
@@ -1140,29 +1603,38 @@ fn reify_accept_payload(
     node: &SyntaxNode,
     owner: ElementId,
 ) -> Option<ElementId> {
-    let mut after_accept = false;
-    let mut name = None;
-    for element in node.children_with_tokens() {
-        match element.as_token() {
-            Some(token) if token.kind().is_trivia() => {}
-            Some(token) if token.kind() == SyntaxKind::ACCEPT_KW => after_accept = true,
-            // any other keyword closes the slot the payload name sits in
-            Some(_) if after_accept => break,
-            Some(_) => {}
-            None => {
-                let child = element.into_node().expect("checked for a token above");
-                if after_accept && child.kind() == SyntaxKind::NAME_REF {
-                    name = child.first_token().map(|t| unquote(t.text()));
-                    break;
-                }
-            }
-        }
-    }
+    // `accept cmd : Cmd` names the payload; `accept Cmd` only types it,
+    // and the payload is there all the same, with no name. What stands
+    // after the `accept` up to the next keyword is where either is
+    // written; anything else the parser hands over there is not the
+    // payload and says nothing about it.
+    let written = node
+        .children_with_tokens()
+        .filter(|element| {
+            element
+                .as_token()
+                .is_none_or(|token| !token.kind().is_trivia())
+        })
+        .skip_while(|element| {
+            element
+                .as_token()
+                .is_none_or(|token| token.kind() != SyntaxKind::ACCEPT_KW)
+        })
+        .skip(1)
+        // any other keyword closes the slot the payload name sits in
+        .map_while(|element| element.into_node())
+        .find(|child| matches!(child.kind(), SyntaxKind::NAME | SyntaxKind::TYPING));
+    let name = written.map(|child| match child.kind() {
+        SyntaxKind::NAME => child.first_token().map(|t| unquote(t.text())),
+        _ => None,
+    });
     // no `accept` clause, nothing to stand for
     let name = name?;
     let payload = model.create(ElementKind::ReferenceUsage);
     model.add_owned(owner, payload);
-    model.set(payload, "declaredName", Value::String(name));
+    if let Some(name) = name {
+        model.set(payload, "declaredName", Value::String(name));
+    }
     Some(payload)
 }
 
@@ -1179,6 +1651,7 @@ fn reify_accept_payload(
 fn reify_action_arguments(
     model: &mut Model,
     node: &SyntaxNode,
+    window: TextRange,
     action: ElementId,
     kind: ElementKind,
     payload: Option<ElementId>,
@@ -1191,6 +1664,16 @@ fn reify_action_arguments(
     let slots: &[Option<SyntaxKind>] = match kind {
         ElementKind::SendActionUsage => &[None, Some(SyntaxKind::VIA_KW), Some(SyntaxKind::TO_KW)],
         ElementKind::AcceptActionUsage => &[None, Some(SyntaxKind::VIA_KW)],
+        // `terminate c1;` ends the occurrence it names, which the standard
+        // hands the node as its one parameter: `TerminateNode = ...
+        // 'terminate' ( ActionBodyParameterMember )?`. Without it what was
+        // terminated was nowhere in the model, and `terminate nope;` passed
+        ElementKind::TerminateActionUsage => &[Some(SyntaxKind::TERMINATE_KW)],
+        // `assign x := new T();` -- "the `targetArgument` ... is its first
+        // argument" and "the `valueExpression` ... is its second", the
+        // value written after `:=`. Without them what was assigned was
+        // nowhere in the model, and `new Nope()` passed.
+        ElementKind::AssignmentActionUsage => &[None, Some(SyntaxKind::COLON_EQ)],
         _ => return,
     };
     let mut waits_through = None;
@@ -1206,10 +1689,26 @@ fn reify_action_arguments(
             }
         };
         model.set(parameter, "direction", Value::EnumLit("in"));
-        if at == 0 {
+        if at == 0 && kind == ElementKind::AcceptActionUsage {
             waits_through = Some(parameter);
         }
-        let Some(written) = slot.and_then(|keyword| operand_after(node, keyword)) else {
+        // `send new Sig(1) to p` writes what it sends straight after the
+        // keyword, as any expression at all: `SendNode = ... 'send' (
+        // NodeParameterMember ...`. Left out, the payload parameter has no
+        // value and what is sent is in the model nowhere.
+        let written = match slot {
+            Some(SyntaxKind::COLON_EQ) => node
+                .children()
+                .find(|it| it.kind() == SyntaxKind::VALUE)
+                .and_then(|value| value.children().find(|it| it.kind().is_expression())),
+            Some(keyword) => operand_after_in(node, *keyword, window),
+            None if kind == ElementKind::SendActionUsage => {
+                node_after_in(node, SyntaxKind::SEND_KW, window)
+                    .filter(|it| it.kind().is_expression())
+            }
+            None => None,
+        };
+        let Some(written) = written else {
             continue;
         };
         let membership = model.create(ElementKind::FeatureValue);
@@ -1231,19 +1730,20 @@ fn reify_action_arguments(
 /// which is what `deriveAcceptActionUsagePayloadArgument` reads back.
 /// Which of the three functions in the library's `Triggers` package it
 /// invokes is what the `kind` says, so the keyword is the whole of it.
-fn reify_trigger(model: &mut Model, node: &SyntaxNode, payload: ElementId, built: &mut Built) {
-    let Some((keyword, kind)) = [
+fn reify_trigger(
+    model: &mut Model,
+    node: &SyntaxNode,
+    payload: ElementId,
+    built: &mut Built,
+) -> Option<()> {
+    let (keyword, kind) = [
         (SyntaxKind::AFTER_KW, "after"),
         (SyntaxKind::AT_KW, "at"),
         (SyntaxKind::WHEN_KW, "when"),
     ]
     .into_iter()
-    .find(|&(keyword, _)| has_token(node, keyword)) else {
-        return;
-    };
-    let Some(written) = node_after(node, keyword) else {
-        return;
-    };
+    .find(|&(keyword, _)| has_token(node, keyword))?;
+    let written = node_after(node, keyword)?;
     let membership = model.create(ElementKind::FeatureValue);
     model.add_owned(payload, membership);
     model.set(membership, "featureWithValue", Value::Ref(payload));
@@ -1282,17 +1782,26 @@ fn reify_trigger(model: &mut Model, node: &SyntaxNode, payload: ElementId, built
     model.set(value, "value", Value::Ref(held));
     results_in(model, trigger);
     model.set(membership, "value", Value::Ref(trigger));
+    Some(())
 }
 
 /// The first node written after `keyword`, whatever kind it is.
 ///
-/// `operand_after` takes only a name, since `via p` names a port and an
+/// `operand_after_in` takes only a name, since `via p` names a port and an
 /// expression there would be something else; what a trigger waits for is
 /// an expression of any shape -- `after 10[SI::s]`, `at new
 /// Time::Iso8601DateTime(...)`, `when senseTemperature.temp > Tmax`.
 fn node_after(node: &SyntaxNode, keyword: SyntaxKind) -> Option<SyntaxNode> {
+    node_after_in(node, keyword, node.text_range())
+}
+
+/// [`node_after`], among what is written within `window`.
+fn node_after_in(node: &SyntaxNode, keyword: SyntaxKind, window: TextRange) -> Option<SyntaxNode> {
     let mut after = false;
-    for element in node.children_with_tokens() {
+    for element in node
+        .children_with_tokens()
+        .filter(|part| window.contains_range(part.text_range()))
+    {
         match element.as_token() {
             Some(token) if token.kind().is_trivia() => {}
             Some(token) => after = token.kind() == keyword,
@@ -1313,8 +1822,14 @@ fn node_after(node: &SyntaxNode, keyword: SyntaxKind) -> Option<SyntaxNode> {
 /// The node has to be the one right after the keyword: any other keyword
 /// closes the slot the reference sits in, so a node that is not a name
 /// is an answer of `None` rather than a reason to keep looking.
-fn operand_after(node: &SyntaxNode, keyword: SyntaxKind) -> Option<SyntaxNode> {
-    node_after(node, keyword)
+///
+/// Only among what is written within `window`.
+fn operand_after_in(
+    node: &SyntaxNode,
+    keyword: SyntaxKind,
+    window: TextRange,
+) -> Option<SyntaxNode> {
+    node_after_in(node, keyword, window)
         .filter(|child| matches!(child.kind(), SyntaxKind::NAME_REF | SyntaxKind::PATH_EXPR))
 }
 
@@ -1324,14 +1839,27 @@ fn operand_after(node: &SyntaxNode, keyword: SyntaxKind) -> Option<SyntaxNode> {
 /// represent as elements, so what is kept is its source text -- recorded the
 /// way SysML records any element in a concrete syntax, as a textual
 /// representation of the guard.
-fn reify_guard(model: &mut Model, node: &SyntaxNode, transition: ElementId) {
-    let Some(condition) = node
+fn reify_guard(model: &mut Model, node: &SyntaxNode, transition: ElementId, built: &mut Built) {
+    // `transition first a if g then b;` writes the guard as one node, and
+    // `if g then b;` in an action body as the statement's own `if`:
+    // `GuardedTargetSuccession = 'if' GuardExpressionMember 'then' ...`.
+    // Looking only for the first, the guard of the second would be dropped
+    // and the branch read as taken whatever held.
+    let (text, asked) = match node
         .children()
         .find(|child| child.kind() == SyntaxKind::COND_EXPR)
-    else {
-        return;
+    {
+        Some(condition) => (condition.text().to_string(), first_expression(&condition)),
+        None if tokens(node).next() == Some(SyntaxKind::IF_KW) => (
+            node.children_with_tokens()
+                .skip(1)
+                .take_while(|part| part.kind() != SyntaxKind::THEN_KW)
+                .map(|part| part.to_string())
+                .collect(),
+            first_expression(node),
+        ),
+        None => return,
     };
-    let text = condition.text().to_string();
     let guard = model.create(ElementKind::Expression);
     model.add_owned(transition, guard);
     model.set(transition, "guardExpression", Value::RefList(vec![guard]));
@@ -1345,6 +1873,7 @@ fn reify_guard(model: &mut Model, node: &SyntaxNode, transition: ElementId) {
         Value::String(text.strip_prefix("if").unwrap_or(&text).trim().to_string()),
     );
     model.set(written, "representedElement", Value::Ref(guard));
+    builds_what_it_says(model, guard, asked, built);
 }
 
 /// Keep what an `if` or a loop asks, as the text the author wrote it as.
@@ -1352,7 +1881,7 @@ fn reify_guard(model: &mut Model, node: &SyntaxNode, transition: ElementId) {
 /// `if hot > 100 then cool;` and `while hot > 0 { ... }` are about their
 /// condition; a node holding only the body says a flow branches or
 /// repeats without saying on what.
-fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId) {
+fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId, built: &mut Built) {
     use SyntaxKind::*;
     // `for i in xs` asks for `xs`: what comes before `in` is the variable
     // it binds, which `reify_loop_variable` declares. Kept whole, the
@@ -1366,9 +1895,11 @@ fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId) {
     // expression a guard is written as, all of it in one node.
     if let Some(written) = node.children().find(|it| it.kind() == COND_EXPR) {
         let text = written.text().to_string();
-        return keep_condition(model, id, text.strip_prefix("if").unwrap_or(&text).trim());
+        let asked = text.strip_prefix("if").unwrap_or(&text).trim();
+        return keep_condition(model, id, asked, first_expression(&written), built);
     }
     let mut started = false;
+    let mut first = None;
     for part in node.children_with_tokens() {
         if !started {
             started = matches!(part.kind(), IN_KW | WHILE_KW | UNTIL_KW | LOOP_KW | IF_KW);
@@ -1383,7 +1914,10 @@ fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId) {
             _ => {}
         }
         let written = match part {
-            sysml_syntax::SyntaxElement::Node(node) => node.text().to_string(),
+            sysml_syntax::SyntaxElement::Node(node) => {
+                first = first.or_else(|| Some(node.clone()).filter(|it| it.kind().is_expression()));
+                node.text().to_string()
+            }
             sysml_syntax::SyntaxElement::Token(token) => token.text().to_string(),
         };
         if !asked.is_empty() {
@@ -1405,7 +1939,12 @@ fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId) {
         }
         return;
     }
-    keep_condition(model, id, asked);
+    keep_condition(model, id, asked, first, built);
+}
+
+/// The expression a condition is written as, inside the node that holds it.
+fn first_expression(node: &SyntaxNode) -> Option<SyntaxNode> {
+    node.children().find(|it| it.kind().is_expression())
 }
 
 /// Keep what a structured control node asks, as the text it was written
@@ -1414,7 +1953,17 @@ fn reify_condition(model: &mut Model, node: &SyntaxNode, id: ElementId) {
 /// `IfNode = 'if' ExpressionParameterMember ...` and its loop kin: what
 /// the node asks is handed to it, and `inputParameters()` is what the
 /// constraints about a structured control node count.
-fn keep_condition(model: &mut Model, id: ElementId, asked: &str) {
+///
+/// And what it asks, built the way a value is, under that text: `if
+/// xs->exists {in x; x > 0}` hands over a body that declares the `x` it
+/// names, and kept as text alone neither was in the model to be named.
+fn keep_condition(
+    model: &mut Model,
+    id: ElementId,
+    asked: &str,
+    written: Option<SyntaxNode>,
+    built: &mut Built,
+) {
     let condition = model.create(ElementKind::Expression);
     model.add_owned(id, condition);
     // `ExpressionParameterMember : ParameterMembership` -- what the
@@ -1424,6 +1973,21 @@ fn keep_condition(model: &mut Model, id: ElementId, asked: &str) {
     // `validateResultExpressionMembershipOwningType` says so.
     model.set(condition, "direction", Value::EnumLit("in"));
     represent_textually(model, condition, asked);
+    builds_what_it_says(model, condition, written, built);
+}
+
+/// Build what an expression kept as text says as the expression it results
+/// in, where it is written as one.
+fn builds_what_it_says(
+    model: &mut Model,
+    expression: ElementId,
+    written: Option<SyntaxNode>,
+    built: &mut Built,
+) {
+    if let Some(written) = written {
+        let result = value_expression(model, expression, &written, built);
+        model.set_member_role(result, Role::Result);
+    }
 }
 
 /// Declare the variable a `for` loop iterates with.
@@ -1474,7 +2038,9 @@ fn reify_effect(model: &mut Model, node: &SyntaxNode, transition: ElementId, bui
             _ => {}
         }
     }
-    if !after_do {
+    // `do action beep : Beep` declares the effect itself, and the
+    // transition takes that declaration as it is built
+    if !after_do || node.children().any(|child| declares_effect(&child)) {
         return;
     }
     let kind = if sends {
@@ -1489,7 +2055,19 @@ fn reify_effect(model: &mut Model, node: &SyntaxNode, transition: ElementId, bui
     // `do send 1 to p` is a send action like any other, and
     // `validateSendActionParameters` counts the three parameters it is
     // handed whether the statement wrote a clause for each or not.
-    reify_action_arguments(model, node, effect, kind, None, built);
+    let window = crate::clause(node, SyntaxKind::DO_KW).unwrap_or_else(|| node.text_range());
+    reify_action_arguments(model, node, window, effect, kind, None, built);
+}
+
+/// Whether a declaration written in a transition statement is the effect
+/// it carries across: the one written straight after its `do`.
+fn declares_effect(child: &SyntaxNode) -> bool {
+    matches!(child.kind(), SyntaxKind::DEFINITION | SyntaxKind::USAGE)
+        && std::iter::successors(child.prev_sibling_or_token(), |it| {
+            it.prev_sibling_or_token()
+        })
+        .find_map(|it| it.into_token().filter(|token| !token.kind().is_trivia()))
+        .is_some_and(|token| token.kind() == SyntaxKind::DO_KW)
 }
 
 /// The connector a `CONNECTOR_STMT` reifies, keyed on its leading keyword.
@@ -1571,14 +2149,6 @@ fn control_kind(node: &SyntaxNode) -> Option<ElementKind> {
                 Some(ElementKind::WhileLoopActionUsage)
             }
             SyntaxKind::FOR_KW => Some(ElementKind::ForLoopActionUsage),
-            // `then event server.publish_request[1];` declares the
-            // occurrence the flow runs into, and `then perform a;` and
-            // `then include u;` the same. Read as the succession alone,
-            // the step the source wrote is in the model nowhere and the
-            // succession runs into nothing.
-            SyntaxKind::EVENT_KW => Some(ElementKind::EventOccurrenceUsage),
-            SyntaxKind::PERFORM_KW => Some(ElementKind::PerformActionUsage),
-            SyntaxKind::INCLUDE_KW => Some(ElementKind::IncludeUseCaseUsage),
             _ => None,
         }) {
             return Some(declared);
@@ -1631,7 +2201,7 @@ fn control_kind(node: &SyntaxNode) -> Option<ElementKind> {
         // action itself, named as the one it performs
         // (`StatePerformActionUsage : PerformActionUsage`) rather than as
         // a wrapper around a declaration. Without this the subaction of
-        // every state written that way was dropped, body and all.
+        // every state written that way is dropped, body and all.
         let subaction = matches!(
             tokens(node).next(),
             Some(SyntaxKind::ENTRY_KW | SyntaxKind::DO_KW | SyntaxKind::EXIT_KW)
@@ -1679,6 +2249,30 @@ fn is_target_transition(node: &SyntaxNode) -> bool {
         .take_while(|token| *token != SyntaxKind::THEN_KW)
         .any(|token| matches!(token, SyntaxKind::ACCEPT_KW | SyntaxKind::IF_KW))
         && has_token(node, SyntaxKind::THEN_KW)
+        || is_guarded_succession(node)
+}
+
+/// Whether a `first a if g then b` -- with or without `succession S` in
+/// front -- guards the succession it writes, which makes it a transition:
+/// `GuardedSuccession : TransitionUsage = ( 'succession' UsageDeclaration
+/// )? 'first' FeatureChainMember GuardExpressionMember 'then'
+/// TransitionSuccessionMember UsageBody`. Read as a plain succession, the
+/// guard was in the model nowhere and the step ran unconditionally.
+fn is_guarded_succession(node: &SyntaxNode) -> bool {
+    let mut seen_first = false;
+    for it in node.children_with_tokens() {
+        match it.kind() {
+            SyntaxKind::FIRST_KW => seen_first = true,
+            SyntaxKind::THEN_KW => return false,
+            SyntaxKind::COND_EXPR if seen_first => {
+                return !it
+                    .as_node()
+                    .is_some_and(|cond| has_token(cond, SyntaxKind::QUESTION))
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The relationship a `RELATION_STMT` reifies, keyed on the keyword that
@@ -1729,8 +2323,12 @@ fn relation_tokens(node: &SyntaxNode) -> impl Iterator<Item = SyntaxKind> {
 /// isAbstract = true }` -- the specification has no metaclass of its own
 /// for a message and marks it this way instead, which is what tells
 /// `message m from a to b` from `flow f from a to b`.
-const KEYWORD_FLAGS: [(SyntaxKind, &str); 12] = [
+const KEYWORD_FLAGS: [(SyntaxKind, &str); 13] = [
     (SyntaxKind::ABSTRACT_KW, "isAbstract"),
+    // `class all C;`, `feature all f;`, `connector all from a to b;` --
+    // `isSufficient ?= 'all'`. The same word in `import all P::*;` is
+    // `isImportAll`, which an import carries and `isSufficient` it does not.
+    (SyntaxKind::ALL_KW, "isSufficient"),
     (SyntaxKind::MESSAGE_KW, "isAbstract"),
     (SyntaxKind::CONSTANT_KW, "isConstant"),
     (SyntaxKind::CONST_KW, "isConstant"),
@@ -1753,7 +2351,7 @@ const KEYWORD_FLAGS: [(SyntaxKind, &str); 12] = [
 /// so what the specification declares as the property's default is the
 /// answer. Any other property missing is this builder not building it,
 /// which says nothing about the model at all.
-pub const BUILT_FLAGS: [&str; 13] = [
+pub const BUILT_FLAGS: [&str; 14] = [
     "isAbstract",
     "isConstant",
     "isDerived",
@@ -1764,6 +2362,7 @@ pub const BUILT_FLAGS: [&str; 13] = [
     "isParallel",
     "isPortion",
     "isStandard",
+    "isSufficient",
     "isUnique",
     "isVariable",
     "isVariation",
@@ -1793,135 +2392,6 @@ fn control_node_kind(token: SyntaxKind) -> Option<ElementKind> {
     }
 }
 
-/// Some statements write their own name as a plain reference rather than
-/// the `NAME` node a declaration carries: `merge continue;`, `transition
-/// off_to_on first off then on`, `action engineStarted accept engineStart`,
-/// `action stop terminate;`.
-///
-/// The name is the reference before the keyword that introduces the
-/// statement's operands, so a bare `first x then y` stays unnamed. A usage
-/// only takes a name this way when such a keyword is present, leaving
-/// `perform pp.gt;` to the effective name resolution gives it.
-fn statement_declared_name(node: &SyntaxNode) -> Option<String> {
-    // the keywords a relationship statement writes between its name and
-    // the two things it relates
-    let relates = |kind| {
-        matches!(
-            kind,
-            SyntaxKind::SUBTYPE_KW
-                | SyntaxKind::SUBCLASSIFIER_KW
-                | SyntaxKind::SUBSET_KW
-                | SyntaxKind::REDEFINITION_KW
-                | SyntaxKind::TYPING_KW
-                | SyntaxKind::CONJUGATE_KW
-                | SyntaxKind::DISJOINT_KW
-                | SyntaxKind::INVERSE_KW
-                | SyntaxKind::OF_KW
-                | SyntaxKind::FROM_KW
-        )
-    };
-    let introduces_operands = |kind| {
-        matches!(
-            kind,
-            SyntaxKind::FIRST_KW
-                | SyntaxKind::THEN_KW
-                | SyntaxKind::ACCEPT_KW
-                | SyntaxKind::SEND_KW
-                | SyntaxKind::TERMINATE_KW
-                | SyntaxKind::ASSIGN_KW
-                // `do providePower;` performs the action it names; the
-                // name is what it is about, not what it is called
-                | SyntaxKind::ENTRY_KW
-                | SyntaxKind::DO_KW
-                | SyntaxKind::EXIT_KW
-        )
-    };
-    // `specialization s subtype A :> B;` and `featuring feat of f by A;`
-    // name themselves before the clause that says what they relate;
-    // `disjoint A from B;` leaves the place empty and stays unnamed.
-    if node.kind() == SyntaxKind::RELATION_STMT {
-        return node
-            .children_with_tokens()
-            .take_while(|part| !relates(part.kind()) && part.kind() != SyntaxKind::RELATION)
-            .filter_map(|part| part.into_node())
-            .find(|child| child.kind() == SyntaxKind::NAME_REF)
-            .and_then(|name| Some(unquote(name.first_token()?.text())));
-    }
-    // `dependency Use from A to B;` names itself before `from`, and
-    // `Dependency = 'dependency' ( Identification? 'from' )? ...` says a
-    // name is only there when `from` is: `dependency Z to A;` starts
-    // with a client.
-    if node.kind() == SyntaxKind::DEPENDENCY {
-        if !has_token(node, SyntaxKind::FROM_KW) {
-            return None;
-        }
-        return node
-            .children_with_tokens()
-            .take_while(|part| part.kind() != SyntaxKind::FROM_KW)
-            .filter_map(|part| part.into_node())
-            .find(|child| child.kind() == SyntaxKind::NAME_REF)
-            .and_then(|name| Some(unquote(name.first_token()?.text())));
-    }
-    // `for t in 1..3` and `if hot > 100 then cool` lead with the loop
-    // variable and the condition; taking either for a name would leave
-    // the statement saying nothing about what it asks
-    if tokens(node).any(|token| {
-        matches!(
-            token,
-            SyntaxKind::FOR_KW | SyntaxKind::IF_KW | SyntaxKind::WHILE_KW | SyntaxKind::UNTIL_KW
-        )
-    }) {
-        return None;
-    }
-    match node.kind() {
-        SyntaxKind::CONTROL_STMT => {}
-        SyntaxKind::USAGE if tokens(node).any(introduces_operands) => {}
-        _ => return None,
-    }
-    // `then merge continue;` names the node it declares, so the leading
-    // `then` does not end the search -- the declaration keyword restarts it
-    let declares = tokens(node).any(|t| control_node_kind(t).is_some());
-    // `a then b` takes an operand on each side of the keyword, unlike
-    // `first`, `accept` and the rest, which take only what follows. So
-    // the reference at the front of a bare `then` is where the flow
-    // comes from, and reading it as a name leaves the statement saying
-    // nothing about what it joins. A `first` puts the source after
-    // itself and leaves the front for a name again.
-    let bare_then =
-        !declares && has_token(node, SyntaxKind::THEN_KW) && !has_token(node, SyntaxKind::FIRST_KW);
-    let mut reached_declaration = !declares;
-    for element in node.children_with_tokens() {
-        if let Some(token) = element.as_token() {
-            if control_node_kind(token.kind()).is_some() {
-                reached_declaration = true;
-                continue;
-            }
-            // past that keyword every reference is an operand, not a name
-            if reached_declaration && introduces_operands(token.kind()) {
-                return None;
-            }
-            continue;
-        }
-        let child = element.into_node().expect("checked for a token above");
-        // `timeslice ownership[0..*]` writes the multiplicity where an
-        // index would go, so the name it declares is inside that
-        let named = match child.kind() {
-            SyntaxKind::NAME_REF => Some(child),
-            SyntaxKind::INDEX_EXPR => child
-                .children()
-                .find(|part| part.kind() == SyntaxKind::NAME_REF),
-            _ => None,
-        };
-        if let Some(named) = named.filter(|_| reached_declaration) {
-            if bare_then {
-                return None;
-            }
-            return Some(unquote(named.first_token()?.text()));
-        }
-    }
-    None
-}
-
 fn package_kind(node: &SyntaxNode) -> ElementKind {
     use SyntaxKind::*;
     if has_token(node, LIBRARY_KW) {
@@ -1933,15 +2403,48 @@ fn package_kind(node: &SyntaxNode) -> ElementKind {
     }
 }
 
+/// Does an import or an expose write filter conditions in brackets?
+fn is_filtered(node: &SyntaxNode) -> bool {
+    matches!(node.kind(), SyntaxKind::IMPORT | SyntaxKind::EXPOSE)
+        && node
+            .children()
+            .any(|child| child.kind() == SyntaxKind::FILTER)
+}
+
+/// What a filtered import is written as, once its brackets are taken
+/// off: the import its filter package owns.
+fn filter_package_import_kind(node: &SyntaxNode) -> ElementKind {
+    use SyntaxKind::*;
+    let wildcard = node
+        .children()
+        .filter(|child| child.kind() == QUALIFIED_NAME)
+        .flat_map(|qname| qname.descendants_with_tokens())
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == STAR);
+    match wildcard {
+        true => ElementKind::NamespaceImport,
+        false => ElementKind::MembershipImport,
+    }
+}
+
 fn import_kind(node: &SyntaxNode) -> ElementKind {
     use SyntaxKind::*;
+    // `ImportedNamespace = QualifiedName '::' '*' ( '::' isRecursive ?=
+    // '**' )?` and `ImportedMembership = QualifiedName ( '::' isRecursive
+    // ?= '**' )?`: the `*` is what imports a namespace's members. `import
+    // A::**;` imports `A` itself and everything under it; read as the
+    // import of `A`'s members, it was `A::*::**` and `A` did not arrive.
     let wildcard = node
         .descendants_with_tokens()
         .filter_map(|e| e.into_token())
-        .any(|t| matches!(t.kind(), STAR | STAR_STAR));
+        .any(|t| t.kind() == STAR);
     // `expose` is not an import: a view exposes what it shows, and the
     // standard has metaclasses of its own for it
     // (`exposes-compartment-element = MembershipExpose | NamespaceExpose`).
+    // `import A::Q[@Safety];` names one member and imports a namespace
+    // all the same: `NamespaceImport = ... | importedNamespace =
+    // FilterPackage`, the package that imports `A::Q` and filters it.
+    let wildcard = wildcard || is_filtered(node);
     match (node.kind() == EXPOSE, wildcard) {
         (true, true) => ElementKind::NamespaceExpose,
         (true, false) => ElementKind::MembershipExpose,
@@ -2001,8 +2504,8 @@ fn definition_kind(node: &SyntaxNode) -> ElementKind {
         // DefinitionExtensionKeyword* 'def' Definition` -- `individual
         // def IO1;` names no kind and is an occurrence definition all
         // the same, which is what `isIndividual` is declared on. Read as
-        // a definition of unspecified kind it was not individual at
-        // all, and the usages typed by it had no individual definition
+        // a definition of unspecified kind it would not be individual at
+        // all, and the usages typed by it would have no individual definition
         // to have.
         _ if has_token(node, INDIVIDUAL_KW) => "OccurrenceDefinition",
         // What is left is `#service def X`, which takes its kind from the
@@ -2134,6 +2637,7 @@ fn usage_kind(
         // bare `succession a then b` is a SuccessionAsUsage. The keyword
         // that follows is what tells them apart.
         Some(SUCCESSION_KW) if kws.get(1) == Some(&FLOW_KW) => "SuccessionFlowUsage",
+        Some(SUCCESSION_KW) if is_guarded_succession(node) => "TransitionUsage",
         Some(SUCCESSION_KW) => "SuccessionAsUsage",
         // KerML features
         Some(FEATURE_KW) => "Feature",
@@ -2143,6 +2647,14 @@ fn usage_kind(
         Some(INV_KW) => "Invariant",
         Some(CONNECTOR_KW) => "Connector",
         Some(BINDING_KW) => "BindingConnector",
+        // `MultiplicitySubset : Multiplicity = 'multiplicity' Identification
+        // Subsets TypeBody` and `MultiplicityRange = 'multiplicity'
+        // Identification MultiplicityBounds TypeBody`: written with bounds,
+        // the declaration is the range itself and not a multiplicity
+        // owning one.
+        Some(MULTIPLICITY_KW) if node.children().any(|it| it.kind() == MULTIPLICITY) => {
+            "MultiplicityRange"
+        }
         Some(MULTIPLICITY_KW) => "Multiplicity",
         // `EnumeratedValue : EnumerationUsage = 'enum'? Usage` -- a value
         // written in an enumeration body names no kind, and reading it as
@@ -2164,6 +2676,33 @@ fn usage_kind(
         _ => "ReferenceUsage",
     };
     kind_or(name, ElementKind::Usage)
+}
+
+/// The metaclass each notation gives the connectors both write alike.
+///
+/// KerML and SysML share `flow`, `succession flow`, `succession` and
+/// `binding`, and each builds its own metaclass from them: KerML's `Flow`,
+/// `SuccessionFlow`, `Succession` and `BindingConnector` are steps and
+/// features, and SysML's `FlowUsage`, `SuccessionFlowUsage`,
+/// `SuccessionAsUsage` and `BindingConnectorAsUsage` the usages that
+/// specialize them (`Flow : FlowUsage = ...`, `BindingConnector :
+/// BindingConnectorAsUsage = ...` in the SysML grammar). The keywords say
+/// which connector; the file says which of the pair. SysML's `bind` is
+/// no KerML keyword, so a KerML file writes no `BindingConnectorAsUsage`
+/// to be turned back.
+fn in_dialect(kind: ElementKind, dialect: sysml_syntax::Dialect) -> ElementKind {
+    match dialect {
+        sysml_syntax::Dialect::KerML => match kind {
+            ElementKind::FlowUsage => ElementKind::Flow,
+            ElementKind::SuccessionFlowUsage => ElementKind::SuccessionFlow,
+            ElementKind::SuccessionAsUsage => ElementKind::Succession,
+            other => other,
+        },
+        sysml_syntax::Dialect::SysML => match kind {
+            ElementKind::BindingConnector => ElementKind::BindingConnectorAsUsage,
+            other => other,
+        },
+    }
 }
 
 fn kind_or(name: &str, fallback: ElementKind) -> ElementKind {
@@ -2201,9 +2740,16 @@ fn member_role(node: &SyntaxNode) -> Option<Role> {
                 before = part.prev_sibling_or_token();
             }
             sysml_syntax::SyntaxElement::Token(token) => {
+                // ... unless the keyword sits in the middle of a
+                // statement: the `do` of `accept s do action D then S2`
+                // says what a transition does, not what the state does
+                let leads = node.parent().is_none_or(|parent| {
+                    parent.kind() != CONTROL_STMT
+                        || matches!(tokens(&parent).next(), Some(ENTRY_KW | DO_KW | EXIT_KW))
+                });
                 let role = match token.kind() {
                     ENTRY_KW => Some(Role::Entry),
-                    DO_KW => Some(Role::Do),
+                    DO_KW if leads => Some(Role::Do),
                     EXIT_KW => Some(Role::Exit),
                     _ => None,
                 };
@@ -2465,15 +3011,29 @@ fn leading_keywords(node: &SyntaxNode) -> impl Iterator<Item = SyntaxKind> {
 /// wrapper names nothing; what it says describes the declaration it wraps.
 /// A connector end really does own what it nests, so `end` is never a
 /// wrapper.
+///
+/// Nor is a declaration that says anything of its own besides:
+/// `connection : C connect x references t.a to y references w.b;` is
+/// nameless and nests its two ends, and taken for a wrapper the connection
+/// would be built as nothing -- its ends would become members of what owns
+/// it, and its type would never be looked up.
 fn is_prefix_wrapper(node: &SyntaxNode) -> bool {
     use SyntaxKind::*;
     matches!(node.kind(), DEFINITION | USAGE)
         && !has_token(node, END_KW)
         && declared_name(node).is_none()
-        && statement_declared_name(node).is_none()
         && node
             .children()
             .any(|child| matches!(child.kind(), DEFINITION | USAGE))
+        && node
+            .children()
+            .all(|child| matches!(child.kind(), DEFINITION | USAGE | BODY | PREFIX_METADATA))
+        && !tokens(node).any(|token| {
+            matches!(
+                token,
+                CONNECT_KW | ALLOCATE_KW | BIND_KW | FROM_KW | TO_KW | FIRST_KW | THEN_KW
+            )
+        })
 }
 
 /// The node and, when the node was hoisted out of an anonymous wrapper
@@ -2516,8 +3076,13 @@ fn declared_name(node: &SyntaxNode) -> Option<String> {
     if names_an_end(node) {
         return None;
     }
+    // `accept s : Sig;` and `for i in xs { ... }` declare a name, and it
+    // is the payload's and the loop variable's rather than the action's:
+    // past the keyword that opens either, a name is not the statement's
     let name = node
-        .children()
+        .children_with_tokens()
+        .take_while(|part| !matches!(part.kind(), SyntaxKind::ACCEPT_KW | SyntaxKind::FOR_KW))
+        .filter_map(|part| part.into_node())
         .find(|c| c.kind() == SyntaxKind::NAME)?
         .first_token()?;
     Some(unquote(name.text()))
@@ -2536,6 +3101,13 @@ fn names_an_end(node: &SyntaxNode) -> bool {
     has_token(node, SyntaxKind::CONNECTOR_KW)
         && has_token(node, SyntaxKind::TO_KW)
         && !has_token(node, SyntaxKind::FROM_KW)
+        // `InterfaceUsageDeclaration = UsageDeclaration ValuePart? (
+        // 'connect' InterfacePart )? | InterfacePart` -- a declaration
+        // only in front of a `connect`: `interface b to c;` connects `b`
+        // and `c`, and read as an interface called `b` it would have one end
+        || has_token(node, SyntaxKind::INTERFACE_KW)
+            && has_token(node, SyntaxKind::TO_KW)
+            && !has_token(node, SyntaxKind::CONNECT_KW)
         || has_token(node, SyntaxKind::BINDING_KW)
             && !has_token(node, SyntaxKind::BIND_KW)
             && !has_token(node, SyntaxKind::OF_KW)
@@ -2582,9 +3154,9 @@ mod tests {
     /// other.
     ///
     /// A declaration collects loose keywords -- a reserved word written
-    /// as a name is swept into it -- and the role used to be whichever
-    /// role keyword turned up anywhere among them. `part frame : R;`
-    /// came out as a framed concern, which the standard makes a kind of
+    /// as a name is swept into it -- so the role is not whichever role
+    /// keyword turns up anywhere among them. `part frame : R;` would
+    /// come out as a framed concern, which the standard makes a kind of
     /// requirement constraint, so two of the specification's constraints
     /// about requirements were violated by a file that declares none.
     #[test]
@@ -2648,11 +3220,97 @@ mod tests {
         );
     }
 
+    /// `[count * 2]` and `[1..count + 1]` are expressions over a name, and
+    /// are built as the invocations they are -- the name inside reified as
+    /// a reference -- rather than kept as text, which name resolution
+    /// could not look into.
+    #[test]
+    fn a_bound_over_a_name_is_built_as_the_expression_it_is() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "part def V {\n\tattribute count;\n\tpart wheels[count * 2];\n\tpart spares[1..count + 1];\n}\n",
+        ));
+        let operator = |id: ElementId| model.maybe(id, "operator").and_then(Value::as_str);
+        let wheels = model.owned(roots[0])[1];
+        let range = reference(&model, wheels, "multiplicity").unwrap();
+        let bound = reference(&model, range, "bound").unwrap();
+        assert_eq!(model.kind(bound), ElementKind::OperatorExpression);
+        assert_eq!(operator(bound), Some("*"));
+        let spares = model.owned(roots[0])[2];
+        let range = reference(&model, spares, "multiplicity").unwrap();
+        let lower = reference(&model, range, "lowerBound").unwrap();
+        let upper = reference(&model, range, "upperBound").unwrap();
+        assert_eq!(model.maybe(lower, "value"), Some(&Value::Int(1)));
+        assert_eq!(operator(upper), Some("+"));
+        let references = model
+            .descendants(upper)
+            .into_iter()
+            .filter(|&it| model.kind(it) == ElementKind::FeatureReferenceExpression)
+            .count();
+        assert_eq!(references, 1);
+    }
+
+    /// `null` and `()` are the empty sequence and `*` the infinite literal,
+    /// none of them with a value to hold. Left to the text-only expression
+    /// every unread value falls to, each was an expression of nothing in
+    /// particular, and `check` said nothing about it.
+    #[test]
+    fn null_the_empty_sequence_and_infinity_are_the_literals_they_are() {
+        for (written, kind) in [
+            ("null", ElementKind::NullExpression),
+            ("()", ElementKind::NullExpression),
+            ("*", ElementKind::LiteralInfinity),
+        ] {
+            let (model, roots) =
+                build_model(&sysml_syntax::parse(&format!("attribute x = {written};\n")));
+            let membership = model.owned(roots[0])[0];
+            let value = reference(&model, membership, "value").expect(written);
+            assert_eq!(model.kind(value), kind, "{written}");
+            assert!(model.owned(value).is_empty(), "{written}");
+        }
+
+        // a literal no reification exists for -- an integer too large
+        // for the model's -- stays an expression kept as text
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "attribute n = 99999999999999999999;\n",
+        ));
+        let membership = model.owned(roots[0])[0];
+        let kept = reference(&model, membership, "value").unwrap();
+        assert_eq!(model.kind(kept), ElementKind::Expression);
+    }
+
+    /// `a#(1, 2)` and `a[1, 2]` hand over what is indexed and one
+    /// sequence of indices -- two arguments, as the grammar has them --
+    /// rather than an argument apiece; `a#(1)` hands its one index over
+    /// as it is.
+    #[test]
+    fn an_index_of_several_is_one_sequence_of_them() {
+        for (written, arguments, commas) in
+            [("a#(1, 2)", 2, 1), ("a[1, 2, 3]", 2, 2), ("a#(1)", 2, 0)]
+        {
+            let (model, roots) =
+                build_model(&sysml_syntax::parse(&format!("attribute x = {written};\n")));
+            let membership = model.owned(roots[0])[0];
+            let index = reference(&model, membership, "value").expect(written);
+            let handed = model
+                .owned(index)
+                .iter()
+                .filter(|&&it| model.maybe(it, "direction") == Some(&Value::EnumLit("in")))
+                .count();
+            assert_eq!(handed, arguments, "{written}");
+            let sequences = model
+                .descendants(index)
+                .into_iter()
+                .filter(|&it| model.maybe(it, "operator").and_then(Value::as_str) == Some(","))
+                .count();
+            assert_eq!(sequences, commas, "{written}");
+        }
+    }
+
     /// How many bounds a multiplicity has is what the brackets say. A
     /// bound this builder cannot read must still take up its place: drop
     /// it and `[1..18446744073709551615]` arrives as a lone `1`, which
     /// every consumer reads as exactly one -- a wrong answer with
-    /// nothing to show that anything was lost.
+    /// nothing to show that anything is lost.
     #[test]
     fn a_bound_it_cannot_read_still_takes_up_its_place() {
         let cases = [
@@ -2848,11 +3506,12 @@ mod tests {
                 .collect()
         };
         let members = model.owned(roots[0]);
-        // the two branches are one parameter each, whatever they hold
+        // the two branches are one parameter each, whatever they hold; the
+        // condition holds its text and the expression it is built into
         let branch = ElementKind::ActionUsage;
         assert_eq!(
             shape(members[1]),
-            [(ElementKind::Expression, 1), (branch, 2), (branch, 1),]
+            [(ElementKind::Expression, 2), (branch, 2), (branch, 1),]
         );
         // and a bare loop is handed an empty parameter beside its body
         assert_eq!(
@@ -2959,7 +3618,7 @@ mod tests {
         let (model, roots) = build_model(&sysml_syntax::parse(
             "state def S {\n\
              \tstate off;\n\
-             \taccept go via q do send m via p then off;\n\
+             \taccept go : Go via q do send m via p then off;\n\
              }\n",
         ));
         let transition = model
@@ -3022,8 +3681,8 @@ mod tests {
     /// server.publish_request[1];`, and the keyword after the `then` is
     /// as much a declaration as the `send` of a `then send ...`. Read as
     /// the succession alone, the step the source wrote was in the model
-    /// nowhere and the succession ran into nothing -- thirty-five of the
-    /// corpus related fewer than the two things a concrete connector
+    /// nowhere and the succession ran into nothing -- many in the corpus
+    /// would relate fewer than the two things a concrete connector
     /// relates.
     #[test]
     fn a_then_before_a_declaring_keyword_still_declares() {
@@ -3473,14 +4132,6 @@ mod tests {
         let literal = reference(&model, model.owned(c)[0], "value").unwrap();
         assert_eq!(model.kind(literal), ElementKind::LiteralBoolean);
         assert_eq!(model.maybe(literal, "value"), Some(&Value::Bool(false)));
-
-        // a literal no reification exists for stays an expression as text
-        let (model, roots) = build_model(&sysml_syntax::parse(
-            "part def W {\n\tattribute n = null;\n}\n",
-        ));
-        let n = model.owned(roots[0])[0];
-        let kept = reference(&model, model.owned(n)[0], "value").unwrap();
-        assert_eq!(model.kind(kept), ElementKind::Expression);
     }
 
     #[test]
@@ -3726,7 +4377,7 @@ mod tests {
             "state def S {\n\
              \tstate off;\n\
              \tstate on;\n\
-             \taccept go if ready do send m via p then on;\n\
+             \taccept go : Go if ready do send m via p then on;\n\
              }\n",
         ));
         let transition = model.owned(roots[0])[2];
@@ -3749,6 +4400,24 @@ mod tests {
         );
         let effect = reference_list(&model, transition, "effectAction")[0];
         assert_eq!(model.kind(effect), ElementKind::SendActionUsage);
+        // and `accept Go` with no name of its own waits for a `Go`: the
+        // name is the payload's type, `OwnedFeatureTyping`, and the
+        // payload is there all the same with no name
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "state def S {\n\
+             \tstate on;\n\
+             \taccept Go then on;\n\
+             }\n",
+        ));
+        let transition = model
+            .owned(roots[0])
+            .iter()
+            .copied()
+            .find(|&it| model.kind(it) == ElementKind::TransitionUsage)
+            .expect("the accept before the then is a transition");
+        let trigger = reference_list(&model, transition, "triggerAction")[0];
+        let payload = crate::payload_parameter(&model, trigger).expect("a payload all the same");
+        assert_eq!(model.name(payload), None);
     }
 
     /// `StateActionUsage` is the action itself, not a wrapper around a
@@ -3921,6 +4590,106 @@ mod tests {
         );
     }
 
+    /// `else if q { ... }` is a branch that asks a question of its own:
+    /// `IfNodeParameterMember` hands the first `if` a second one as what it
+    /// does otherwise. Read as one statement, `q` was a loose expression and
+    /// the `else` after it the first branch's, so whatever `q` said the
+    /// action did `y` -- and never `z`.
+    #[test]
+    fn an_else_if_is_a_branch_that_asks_its_own_question() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "action def A {\n\
+             \tif p { action x; } else if q { action y; } else { action z; }\n\
+             }\n",
+        ));
+        let kinds = |id: ElementId| {
+            model
+                .owned(id)
+                .iter()
+                .map(|&c| model.kind(c))
+                .collect::<Vec<_>>()
+        };
+        let asks = |id: ElementId| {
+            let asked = model
+                .owned(id)
+                .iter()
+                .copied()
+                .find(|&c| model.kind(c) == ElementKind::Expression)
+                .expect("the branch says what it asks");
+            model
+                .maybe(model.owned(asked)[0], "body")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let first = model.owned(roots[0])[0];
+        assert_eq!(
+            kinds(first),
+            [
+                ElementKind::Expression,
+                ElementKind::ActionUsage,
+                ElementKind::IfActionUsage
+            ]
+        );
+        assert_eq!(asks(first).as_deref(), Some("p"));
+        let otherwise = model.owned(first)[2];
+        assert_eq!(
+            model.maybe(otherwise, "direction"),
+            Some(&Value::EnumLit("in"))
+        );
+        assert_eq!(
+            kinds(otherwise),
+            [
+                ElementKind::Expression,
+                ElementKind::ActionUsage,
+                ElementKind::ActionUsage
+            ]
+        );
+        assert_eq!(asks(otherwise).as_deref(), Some("q"));
+    }
+
+    /// `InterfaceUsageDeclaration = UsageDeclaration ValuePart? ( 'connect'
+    /// InterfacePart )? | InterfacePart` -- without a `connect` there is no
+    /// declaration, and the name after the keyword is the first end.
+    #[test]
+    fn an_interface_without_connect_names_its_ends() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "package P {\n\tinterface a to b;\n\tinterface i connect a to b;\n}\n",
+        ));
+        let interfaces = model.owned(roots[0]).to_vec();
+        assert_eq!(model.name(interfaces[0]), None);
+        assert_eq!(model.name(interfaces[1]), Some("i"));
+    }
+
+    /// `accept after 5 [s] then off;` waits five seconds; the bracket is
+    /// the unit of the time, and the transition counts nothing.
+    #[test]
+    fn the_unit_of_a_time_trigger_is_no_multiplicity() {
+        let (model, _) = build_model(&sysml_syntax::parse(
+            "state def S {\n\tstate off;\n\taccept after 5 [s] then off;\n\tthen timeslice t[0..*];\n}\n",
+        ));
+        let transition = model
+            .ids()
+            .find(|&id| model.kind(id) == ElementKind::TransitionUsage)
+            .expect("the accept is a transition");
+        assert_eq!(model.maybe(transition, "multiplicity"), None);
+        assert!(
+            !model
+                .owned(transition)
+                .iter()
+                .any(|&it| model.kind(it) == ElementKind::MultiplicityRange),
+            "the transition counts nothing"
+        );
+        // a step named in a statement still takes one
+        let portion = model
+            .ids()
+            .find(|&id| model.name(id) == Some("t"))
+            .expect("the timeslice is declared");
+        assert!(model
+            .owned(portion)
+            .iter()
+            .any(|&it| model.kind(it) == ElementKind::MultiplicityRange));
+    }
+
     /// `WhileLoopNode : WhileLoopActionUsage = ... ( 'until'
     /// ExpressionParameterMember ';' )?` -- the parser writes the `until`
     /// as a statement of its own, and a second loop standing for it says
@@ -3968,6 +4737,60 @@ mod tests {
             model.get(imports[1], "isRecursive"),
             Some(&Value::Bool(true))
         );
+        // `Q::**` imports `Q` and all under it; `Q::*::**` what is in it
+        assert_eq!(model.kind(imports[1]), ElementKind::MembershipImport);
+        let (model, roots) =
+            build_model(&sysml_syntax::parse("package P {\n\timport Q::*::**;\n}\n"));
+        assert_eq!(
+            model.kind(model.owned(roots[0])[0]),
+            ElementKind::NamespaceImport
+        );
+    }
+
+    /// `import Lib::**[@Meta];` imports a package that imports `Lib::**`
+    /// and filters by `@Meta` -- `NamespaceImport = ... | importedNamespace
+    /// = FilterPackage { ownedRelatedElement += importedNamespace }` -- and
+    /// was built as the plain import of `Lib`, its brackets lost.
+    #[test]
+    fn a_filtered_import_imports_the_package_that_filters() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "package P {\n\timport all Lib::**[@Meta][@Other];\n\timport Lib::Q[@Meta];\n}\n",
+        ));
+        let imports = model.owned(roots[0]).to_vec();
+        // `Lib::**` imports `Lib` and what is under it, as one membership
+        for (import, named) in imports
+            .iter()
+            .zip([ElementKind::MembershipImport, ElementKind::MembershipImport])
+        {
+            assert_eq!(model.kind(*import), ElementKind::NamespaceImport);
+            assert_eq!(model.owned(*import).len(), 1, "one filter package");
+            let package = &model.owned(*import)[0];
+            assert_eq!(model.kind(*package), ElementKind::Package);
+            let owned = model.owned(*package);
+            assert_eq!(model.kind(owned[0]), named);
+            assert_eq!(model.member_visibility(owned[0]), Some(Vis::Public));
+            for &filter in &owned[1..] {
+                assert_eq!(model.kind(filter), ElementKind::ElementFilterMembership);
+            }
+        }
+        let filtered = model.owned(model.owned(imports[0])[0]).to_vec();
+        let conditions: Vec<String> = filtered[1..]
+            .iter()
+            .map(|&filter| {
+                let condition = reference(&model, filter, "condition").unwrap();
+                crate::expression_text(&model, condition).unwrap()
+            })
+            .collect();
+        assert_eq!(conditions, ["@Meta", "@Other"]);
+        assert_eq!(
+            model.get(filtered[0], "isRecursive"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            model.get(filtered[0], "isImportAll"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(model.get(imports[0], "isRecursive"), None);
     }
 
     /// A string literal is what stands between its quotes with the
@@ -4147,5 +4970,334 @@ mod tests {
                 ElementKind::Feature,
             ]
         );
+    }
+
+    /// A body handed to an `if` or a `while` as a declaration, and an
+    /// invariant that says it never holds.
+    ///
+    /// `if c action t { } else action e { }` hands the node two named
+    /// bodies, as `if c { } else { }` hands it two nameless ones, and
+    /// `inv false` is `isNegated ?= 'false'`.
+    #[test]
+    fn a_body_handed_by_name_and_a_negated_invariant_are_what_they_say() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "action def A {\n\
+             \tif c action t { } else action e { }\n\
+             \twhile c action b { } until d;\n\
+             \taction z;\n\
+             }\n",
+        ));
+        let owned = |id: ElementId| {
+            model
+                .owned(id)
+                .iter()
+                .map(|&c| (model.kind(c), model.name(c).map(str::to_owned)))
+                .collect::<Vec<_>>()
+        };
+        let members = model.owned(roots[0]).to_vec();
+        assert_eq!(
+            members.iter().map(|&it| model.kind(it)).collect::<Vec<_>>(),
+            [
+                ElementKind::IfActionUsage,
+                ElementKind::WhileLoopActionUsage,
+                ElementKind::ActionUsage,
+            ]
+        );
+        assert_eq!(
+            owned(members[0]),
+            [
+                (ElementKind::Expression, None),
+                (ElementKind::ActionUsage, Some("t".to_owned())),
+                (ElementKind::ActionUsage, Some("e".to_owned())),
+            ]
+        );
+        assert_eq!(
+            owned(members[1]),
+            [
+                (ElementKind::Expression, None),
+                (ElementKind::ActionUsage, Some("b".to_owned())),
+                (ElementKind::Expression, None),
+            ]
+        );
+
+        let kerml = sysml_syntax::parse_dialect(
+            "class C {\n\
+             \tinv true held { true }\n\
+             \tinv false never { true }\n\
+             \tinv { false }\n\
+             }\n",
+            sysml_syntax::Dialect::KerML,
+        );
+        let (model, roots) = build_model(&kerml);
+        let negated: Vec<(Option<&str>, bool)> = model
+            .owned(roots[0])
+            .iter()
+            .filter(|&&it| model.kind(it) == ElementKind::Invariant)
+            .map(|&it| {
+                let said = model.get(it, "isNegated") == Some(&Value::Bool(true));
+                (model.name(it), said)
+            })
+            .collect();
+        assert_eq!(
+            negated,
+            [(Some("held"), false), (Some("never"), true), (None, false)]
+        );
+    }
+
+    /// The first element named `name`, of whatever kind.
+    fn named(model: &Model, name: &str) -> ElementId {
+        model
+            .ids()
+            .find(|&id| model.name(id) == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` is declared"))
+    }
+
+    fn kerml(text: &str) -> (Model, Vec<ElementId>) {
+        let parse = sysml_syntax::parse_dialect(text, sysml_syntax::Dialect::KerML);
+        assert!(parse.ok(), "{text} parses");
+        build_model(&parse)
+    }
+
+    /// What a type owns without its being a feature of it.
+    ///
+    /// The bounds of a multiplicity (`MultiplicityExpressionMember :
+    /// OwningMembership`), KerML's prefix metadata (`#M class Tagged;`
+    /// builds a `MetadataFeature`, which a check for the SysML
+    /// `MetadataUsage` alone would miss), a `member feature` (`TypeFeatureMember :
+    /// OwningMembership`) and a cross feature (`OwnedCrossFeatureMember :
+    /// OwningMembership`) must not come out behind a `FeatureMembership`,
+    /// as features of what they are written in.
+    #[test]
+    fn what_a_type_owns_as_a_member_is_not_its_feature() {
+        let (model, _) = kerml(
+            "metaclass M;\n\
+             class B;\n\
+             #M class Tagged;\n\
+             struct S {\n\
+             \tfeature f : B [1..2];\n\
+             \tmember feature g : B;\n\
+             \tfeature h : B;\n\
+             }\n\
+             assoc struct LS {\n\
+             \tend b2[0..1] feature b : B { feature c : B; }\n\
+             \tend feature a : B { feature d : B; }\n\
+             }\n",
+        );
+        let membership = |id| crate::membership_kind(&model, id);
+
+        let tagged = named(&model, "Tagged");
+        let metadata = model.owned(tagged)[0];
+        assert!(model.kind(metadata).is_a(ElementKind::MetadataFeature));
+        assert_eq!(membership(metadata), ElementKind::OwningMembership);
+
+        let f = named(&model, "f");
+        let range = reference(&model, f, "multiplicity").unwrap();
+        for &bound in model.owned(range) {
+            assert_eq!(membership(bound), ElementKind::OwningMembership);
+        }
+        assert_eq!(model.owned(range).len(), 2);
+
+        assert_eq!(
+            membership(named(&model, "g")),
+            ElementKind::OwningMembership
+        );
+        assert_eq!(
+            membership(named(&model, "h")),
+            ElementKind::FeatureMembership
+        );
+
+        let b = named(&model, "b");
+        let cross = named(&model, "b2");
+        assert_eq!(model.owner(cross), Some(b));
+        assert_eq!(membership(cross), ElementKind::OwningMembership);
+        assert_eq!(crate::owned_cross_feature(&model, b), Some(cross));
+        assert_eq!(
+            membership(named(&model, "c")),
+            ElementKind::FeatureMembership
+        );
+        // an end with no cross feature written has none, whatever it owns
+        let a = named(&model, "a");
+        assert_eq!(crate::owned_cross_feature(&model, a), None);
+    }
+
+    /// `bind w.h = a.m;` and KerML's `binding f = g;` write their second end
+    /// after an `=`, and the end is all it is: the connector owns no
+    /// `FeatureValue`, which would make the expression `a.m` its value.
+    #[test]
+    fn the_second_end_of_a_binding_is_not_its_value() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "part def C {\n\tpart w { port h; }\n\tpart a { port m; }\n\tbind w.h = a.m;\n\tbinding b bind w.h = a.m;\n\tattribute x = 1;\n}\n",
+        ));
+        let (kerml, _) = kerml("struct S {\n\tfeature f;\n\tfeature g;\n\tbinding f = g;\n}\n");
+        let valued = |model: &Model, id: ElementId| {
+            model
+                .owned(id)
+                .iter()
+                .any(|&it| model.kind(it) == ElementKind::FeatureValue)
+        };
+        let bindings: Vec<bool> = model
+            .owned(roots[0])
+            .iter()
+            .filter(|&&it| model.kind(it).is_a(ElementKind::BindingConnector))
+            .map(|&it| valued(&model, it))
+            .collect();
+        assert_eq!(bindings, [false, false]);
+        // an ordinary value is still kept
+        assert!(valued(&model, named(&model, "x")));
+        let binding = kerml
+            .ids()
+            .find(|&it| kerml.kind(it).is_a(ElementKind::BindingConnector))
+            .expect("the binding is built");
+        assert!(!valued(&kerml, binding));
+    }
+
+    /// `isSufficient ?= 'all'`: a type, a feature and a connector that say
+    /// `all` are sufficient, and were interchanged as not being.
+    #[test]
+    fn all_makes_a_type_sufficient() {
+        let (model, _) = kerml(
+            "class A;\n\
+             class all C specializes A;\n\
+             class N;\n\
+             struct S {\n\
+             \tfeature f;\n\
+             \tfeature g;\n\
+             \tfeature all suf : A;\n\
+             \tconnector all from f to g;\n\
+             \tconnector plain from f to g;\n\
+             }\n",
+        );
+        let sufficient = |id| model.get(id, "isSufficient") == Some(&Value::Bool(true));
+        assert!(sufficient(named(&model, "C")));
+        assert!(!sufficient(named(&model, "N")));
+        assert!(sufficient(named(&model, "suf")));
+        assert!(!sufficient(named(&model, "plain")));
+        let connectors: Vec<bool> = model
+            .ids()
+            .filter(|&it| model.kind(it) == ElementKind::Connector)
+            .map(sufficient)
+            .collect();
+        assert_eq!(connectors, [true, false]);
+        // and `import all` is an import of everything, not a sufficient one
+        let (model, roots) = build_model(&sysml_syntax::parse("package P { import all Q::*; }"));
+        let import = model.owned(roots[0])[0];
+        assert_eq!(model.maybe(import, "isSufficient"), None);
+        assert_eq!(model.get(import, "isImportAll"), Some(&Value::Bool(true)));
+    }
+
+    /// The connectors KerML and SysML both write build the metaclass of the
+    /// file's own notation: `flow`, `succession flow` and `succession` in a
+    /// `.kerml` file are KerML's `Flow`, `SuccessionFlow` and `Succession`,
+    /// not the SysML usages, and `binding` in a `.sysml` file is SysML's
+    /// `BindingConnectorAsUsage`, not KerML's `BindingConnector`.
+    #[test]
+    fn a_connector_is_of_the_notation_it_is_written_in() {
+        let (model, roots) = kerml(
+            "struct S {\n\
+             \tfeature f;\n\
+             \tfeature g;\n\
+             \tsuccession su first f then g;\n\
+             \tbinding bi of f = g;\n\
+             }\n\
+             flow fl of S from S::f to S::g;\n\
+             succession flow sfl from S::f to S::g;\n",
+        );
+        assert_eq!(model.kind(named(&model, "su")), ElementKind::Succession);
+        assert_eq!(
+            model.kind(named(&model, "bi")),
+            ElementKind::BindingConnector
+        );
+        assert_eq!(model.kind(named(&model, "fl")), ElementKind::Flow);
+        assert_eq!(
+            model.kind(named(&model, "sfl")),
+            ElementKind::SuccessionFlow
+        );
+        assert_eq!(roots.len(), 3);
+
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "part def A {\n\
+             \tport p1;\n\
+             \tport p2;\n\
+             \tbinding b1 bind p1 = p2;\n\
+             \tbinding bind p1 = p2;\n\
+             \tbind p1 = p2;\n\
+             \tsuccession s first p1 then p2;\n\
+             \tflow fl from p1 to p2;\n\
+             }\n",
+        ));
+        let kinds: Vec<ElementKind> = model
+            .owned(roots[0])
+            .iter()
+            .map(|&it| model.kind(it))
+            .filter(|kind| kind.is_a(ElementKind::Connector))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ElementKind::BindingConnectorAsUsage,
+                ElementKind::BindingConnectorAsUsage,
+                ElementKind::BindingConnectorAsUsage,
+                ElementKind::SuccessionAsUsage,
+                ElementKind::FlowUsage,
+            ]
+        );
+    }
+
+    /// `multiplicity mm [1..*];` is `MultiplicityRange = 'multiplicity'
+    /// Identification MultiplicityBounds TypeBody`: the range, named, and
+    /// owning its two bounds -- not a `Multiplicity` owning a nameless one.
+    #[test]
+    fn a_multiplicity_declared_with_bounds_is_the_range() {
+        let (model, roots) = kerml("multiplicity mm [1..*];\nmultiplicity m;\n");
+        let mm = roots[0];
+        assert_eq!(model.kind(mm), ElementKind::MultiplicityRange);
+        assert_eq!(model.name(mm), Some("mm"));
+        assert_eq!(model.maybe(mm, "multiplicity"), None);
+        let lower = reference(&model, mm, "lowerBound").expect("a lower bound");
+        let upper = reference(&model, mm, "upperBound").expect("an upper bound");
+        assert_eq!(model.owned(mm), [lower, upper]);
+        assert_eq!(model.kind(lower), ElementKind::LiteralInteger);
+        assert_eq!(model.kind(upper), ElementKind::LiteralInfinity);
+        assert_eq!(
+            crate::membership_kind(&model, lower),
+            ElementKind::OwningMembership
+        );
+        // and one with none is the multiplicity it always was
+        assert_eq!(model.kind(roots[1]), ElementKind::Multiplicity);
+    }
+
+    /// What stands after the keyword that introduces a connector's ends
+    /// counts an end, not the connector: `connect [1] p1 to [0..*] p2;`
+    /// declares a connection with no multiplicity of its own. Read as the
+    /// connector's, the `[1]` made it one of exactly one.
+    #[test]
+    fn an_end_multiplicity_is_not_the_connectors() {
+        let (model, roots) = build_model(&sysml_syntax::parse(
+            "part def A {\n\
+             \tport p1;\n\
+             \tport p2;\n\
+             \tconnect [1] p1 to [0..*] p2;\n\
+             \tconnection c2 [2] connect [3] p1 to [4] p2;\n\
+             \tsuccession s first [1] p1 then [1] p2;\n\
+             \tpart x [5];\n\
+             }\n",
+        ));
+        let (kerml, _) = kerml(
+            "struct S {\n\tfeature f;\n\tfeature g;\n\tconnector c [6] from [7] f to [8] g;\n}\n",
+        );
+        let bound = |model: &Model, id: ElementId| {
+            let range = reference(model, id, "multiplicity")?;
+            let bound = reference(model, range, "bound")?;
+            model.get(bound, "value").and_then(Value::as_int)
+        };
+        let members = model.owned(roots[0]);
+        let connectors: Vec<Option<i64>> = members
+            .iter()
+            .filter(|&&it| model.kind(it).is_a(ElementKind::Connector))
+            .map(|&it| bound(&model, it))
+            .collect();
+        assert_eq!(connectors, [None, Some(2), None]);
+        assert_eq!(bound(&model, named(&model, "x")), Some(5));
+        assert_eq!(bound(&kerml, named(&kerml, "c")), Some(6));
     }
 }

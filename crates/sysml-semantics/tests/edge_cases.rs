@@ -64,6 +64,35 @@ fn reference_and_definition_queries() {
     assert!(ws.definition_at(0, TextSize::from(0)).is_none());
 }
 
+/// A declaration is asked about at its short name as at its name, and
+/// one with only a short name is named by it rather than by the whole
+/// of what it declares.
+#[test]
+fn a_short_name_is_a_declared_name_too() {
+    let text = "part def <W> Wheel;\npart def <X>;\npart def Plain;\n";
+    let ws = ws(&[("m.sysml", text)]);
+    let spelled = |range: sysml_syntax::TextRange| {
+        text[usize::from(range.start())..usize::from(range.end())].to_string()
+    };
+
+    let wheel = ws.definition_at(0, offset_of(text, "W>")).unwrap();
+    assert_eq!(ws.model().name(wheel), Some("Wheel"));
+    assert_eq!(ws.short_name_range(wheel).map(spelled), Some("W".into()));
+    assert_eq!(
+        ws.element_ranges(wheel).map(|(_, name)| spelled(name)),
+        Some("Wheel".into())
+    );
+
+    let x = ws.definition_at(0, offset_of(text, "X>")).unwrap();
+    assert_eq!(
+        ws.element_ranges(x).map(|(_, name)| spelled(name)),
+        Some("X".into())
+    );
+
+    let plain = ws.definition_at(0, offset_of(text, "Plain")).unwrap();
+    assert_eq!(ws.short_name_range(plain), None);
+}
+
 #[test]
 fn callable_at_misses() {
     let mut ws = ws(&[(
@@ -213,8 +242,8 @@ fn visible_names_through_imports_and_ends() {
 
 /// `import Q::**` reaches what is nested in Q, and lookup has always
 /// followed it there. What may be written at a point is the same
-/// question asked a second way, and it used to stop at Q's own members
-/// -- so a name the model resolves was one the editor never offered.
+/// question asked a second way, and it must not stop at Q's own members
+/// -- or a name the model resolves would be one the editor never offers.
 #[test]
 fn a_recursive_import_offers_what_is_nested_in_it() {
     let text = "package Q {\n    class A;\n    package Q2 { class F; }\n}\npackage S {\n    public import Q::**;\n    class Z :> F;\n    class Y :> A;\n}\n";
@@ -280,8 +309,8 @@ fn the_most_redefined_supertype_member_wins() {
 }
 
 /// Five ways a model says "the thing you already have", each of which
-/// this resolver used to miss -- and miss quietly, because the feature
-/// doing the saying answered to the name it was asking about.
+/// this resolver must not miss -- and would miss quietly, because the feature
+/// doing the saying answers to the name it was asking about.
 #[test]
 fn what_a_model_means_by_naming_something_it_already_has() {
     // `include x[0..*]` — the brackets are how many times, not which one
@@ -341,6 +370,56 @@ fn what_a_model_means_by_naming_something_it_already_has() {
     );
 }
 
+/// A parameter of a behaviour stands for the parameter at the same
+/// position in what its owner specializes, whatever it is called:
+/// `checkFeatureParameterRedefinition` counts positions, not names. So
+/// `y` below is `A`'s `x` under a name of its own and has what a `T` has;
+/// the second parameter is the second, though the first is spelled like
+/// it; a type that declares no parameter of its own passes on the ones
+/// it inherits; and a result parameter stands for the result, wherever it
+/// is written. A port's directed feature is no parameter, and it is
+/// still read by its name.
+#[test]
+fn a_parameter_redefines_the_one_at_its_position_and_not_the_one_of_its_name() {
+    let text = "package X {\n\
+        \tpart def T { attribute m; }\n\
+        \tpart def U { attribute n; }\n\
+        \taction def A { in x : T; in w : U; }\n\
+        \taction a : A { in y; attribute q :> y.m; }\n\
+        \taction b : A { in w; in x; attribute q :> w.m; attribute r :> x.n; }\n\
+        \taction def B :> A;\n\
+        \taction c : B { in y; out z; attribute q :> y.m; attribute r :> z.n; }\n\
+        \tcalc def C { in x : T; return r : U; }\n\
+        \tcalc d : C { in y; return s; attribute q :> y.m; attribute r :> s.n; }\n\
+        \tport def P { in item x : T; }\n\
+        \tport p : P { in item x; attribute q :> x.m; }\n\
+        }\n";
+    let positional = ws(&[("m.sysml", text)]);
+    assert!(
+        positional.unresolved().is_empty(),
+        "{:?}",
+        positional.unresolved()
+    );
+
+    // and read by position, the name it shares with another parameter
+    // brings nothing of that one's
+    let swapped = ws(&[(
+        "n.sysml",
+        "package X {\n\
+         \tpart def T { attribute m; }\n\
+         \tpart def U { attribute n; }\n\
+         \taction def A { in x : T; in w : U; }\n\
+         \taction b : A { in w; attribute q :> w.n; }\n\
+         }\n",
+    )]);
+    let names: Vec<&str> = swapped
+        .unresolved()
+        .iter()
+        .map(|u| u.name.as_str())
+        .collect();
+    assert_eq!(names, ["w.n"]);
+}
+
 /// A keyword whose base type is chosen by a condition names both, and
 /// which one an element gets is decided by an expression this resolver
 /// does not evaluate. A name either of them declares is one the model
@@ -355,9 +434,9 @@ fn a_base_type_behind_a_condition_offers_every_side_of_it() {
 }
 
 /// What is wrong with a model is worked out once, and the command line,
-/// the language server and the MCP server each render that. They used to
-/// work it out for themselves, and one of them left out the syntax half,
-/// so `sysml check` called a file that does not parse sound.
+/// the language server and the MCP server each render that. Were each to
+/// work it out for itself, one could leave out the syntax half, and
+/// `sysml check` would call a file that does not parse sound.
 #[test]
 fn what_is_wrong_is_said_once_and_kept_apart() {
     let mut ws = ws(&[
@@ -455,7 +534,7 @@ fn a_search_puts_what_was_asked_for_first() {
 /// once into the model, once again by the resolver -- and they looked at
 /// different parts of it. The model saw a `private` written on the
 /// wrapper of a declaration; the resolver, which only read the
-/// declaration's own first few tokens, did not. Now the resolver reads
+/// declaration's own first few tokens, would not. So the resolver reads
 /// what the model recorded, and adds only the rule that is its own: an
 /// import with nothing written keeps to itself.
 #[test]
@@ -488,6 +567,232 @@ fn broken_aliases_and_redefinitions_do_not_block_lookup() {
     let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
     assert!(names.contains(&"broken"), "{names:?}");
     assert!(!names.contains(&"good"), "{names:?}");
+}
+
+/// A redefined feature is looked up in the supertypes of the owning
+/// type, not in the owning type (KerML 7.3.4.5, 8.2.3.5.1), so a named
+/// redefinition whose name no supertype has redefines nothing. It used
+/// to answer with itself, and the model was reported sound.
+#[test]
+fn a_named_redefinition_of_nothing_is_not_its_own_answer() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+    part def V;
+    part def C :> V { part engine :>> engine; attribute m :>> m = 1; }
+    part c : V { part e :>> e; }
+    part def W { part x; }
+    part def D :> W { part x :>> x; part x2 :>> x; }
+}
+",
+    )]);
+    let mut names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    names.sort();
+    // the ones that redefine something a supertype has still resolve
+    assert_eq!(names, ["e", "engine", "m"]);
+}
+
+/// `do action D` in a transition declares what the transition does on
+/// the way across, and the transition owns it as its effect
+/// (`EffectBehaviorMember : TransitionFeatureMembership`). It is not
+/// hoisted into the state around it as that state's own `do`, which
+/// would give the state two members called `D` for two transitions each
+/// doing `action D`.
+#[test]
+fn a_transition_owns_the_effect_it_declares() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+    attribute def Sig;
+    state def S {
+        entry; then S1;
+        state S1;
+        state S2;
+        transition first S1 accept Sig do action D then S2;
+        transition first S2 accept Sig do action D then S1;
+        action beep;
+        transition first S2 accept Sig do beep then S1;
+    }
+}
+",
+    )]);
+    let model = ws.model();
+    // `do beep` declares nothing: what the transition does is an action
+    // of its own, which the library calls `effect`
+    let made: Vec<_> = model
+        .ids()
+        .filter(|&id| model.name(id) == Some("effect"))
+        .collect();
+    assert_eq!(made.len(), 1);
+    assert_eq!(
+        model.kind(model.owner(made[0]).unwrap()),
+        ElementKind::TransitionUsage
+    );
+    let effects: Vec<_> = model
+        .ids()
+        .filter(|&id| model.name(id) == Some("D"))
+        .collect();
+    assert_eq!(effects.len(), 2);
+    for effect in effects {
+        let transition = model.owner(effect).expect("it is owned");
+        assert_eq!(model.kind(transition), ElementKind::TransitionUsage);
+        assert_eq!(
+            model.maybe(transition, "effectAction"),
+            Some(&sysml_model::Value::RefList(vec![effect]))
+        );
+        assert_eq!(sysml_model::transition_role(model, effect), Some("effect"));
+        // and the transition carries no second one beside it
+        let names: Vec<_> = model
+            .owned(transition)
+            .iter()
+            .map(|&it| model.name(it))
+            .collect();
+        assert!(!names.contains(&Some("effect")), "{names:?}");
+    }
+}
+
+/// `first a if g then b` guards the succession it writes, with or without
+/// `succession s` in front of it: `GuardedSuccession : TransitionUsage`.
+/// Built as a plain succession, the guard was in the model nowhere and the
+/// step ran unconditionally.
+#[test]
+fn a_guarded_succession_is_a_transition_with_its_guard() {
+    let guarded = ws(&[(
+        "m.sysml",
+        "package P {
+    action def W {
+        attribute x;
+        action A1; action A2;
+        succession S first A1 if x == 0 then A2;
+        first A2 if x == 1 then A1;
+    }
+}
+",
+    )]);
+    assert!(
+        guarded.unresolved().is_empty(),
+        "{:?}",
+        guarded.unresolved()
+    );
+    let model = guarded.model();
+    let named = |name: &str| {
+        model
+            .ids()
+            .find(|&id| model.name(id) == Some(name))
+            .unwrap()
+    };
+    let transitions: Vec<_> = model
+        .ids()
+        .filter(|&id| model.kind(id) == ElementKind::TransitionUsage)
+        .collect();
+    assert_eq!(transitions.len(), 2);
+    for (transition, ends) in transitions.into_iter().zip([["A1", "A2"], ["A2", "A1"]]) {
+        assert!(
+            model.maybe(transition, "guardExpression").is_some(),
+            "{transition:?} has no guard"
+        );
+        let succession = model
+            .owned(transition)
+            .iter()
+            .copied()
+            .find(|&it| model.kind(it) == ElementKind::SuccessionAsUsage)
+            .expect("a transition relates through a succession of its own");
+        assert_eq!(
+            model.maybe(succession, "relatedFeature"),
+            Some(&sysml_model::Value::RefList(vec![
+                named(ends[0]),
+                named(ends[1])
+            ]))
+        );
+    }
+    // a succession with no guard is still the succession it was
+    let plain = ws(&[(
+        "p.sysml",
+        "package P { action a; action b; succession s first a then b; }",
+    )]);
+    let model = plain.model();
+    assert!(model
+        .ids()
+        .all(|id| model.kind(id) != ElementKind::TransitionUsage));
+}
+
+/// `event m.sourceEvent;` is the event of that message: what it references
+/// is the chain through `m`, not the library's `sourceEvent` of any message
+/// (here, without the library, `m.e` stands in for it).
+/// Kept as the last feature alone, which message the event belonged to was
+/// nowhere in the model, and a sequence view could not draw it.
+#[test]
+fn an_event_written_through_a_message_references_the_chain() {
+    let events = ws(&[(
+        "m.sysml",
+        "package P {
+    occurrence def O { event occurrence e; }
+    part def S {
+        part m : O;
+        part c { event m.e; }
+    }
+}
+",
+    )]);
+    let model = events.model();
+    let m = model.ids().find(|&id| model.name(id) == Some("m")).unwrap();
+    let chained = model
+        .ids()
+        .filter(|&id| model.kind(id) == ElementKind::ReferenceSubsetting)
+        .filter_map(|id| match model.maybe(id, "referencedFeature") {
+            Some(sysml_model::Value::Ref(it)) => Some(*it),
+            _ => None,
+        })
+        .find_map(|it| match model.maybe(it, "chainingFeature") {
+            Some(sysml_model::Value::RefList(chain)) => Some(chain.clone()),
+            _ => None,
+        })
+        .expect("the event references a chain");
+    assert_eq!(chained.len(), 2);
+    assert_eq!(chained[0], m);
+    // and the event still answers to the name of the feature the chain
+    // ends at, as a reference to `e` alone did
+    let event = model
+        .ids()
+        .find(|&id| model.kind(id) == ElementKind::EventOccurrenceUsage && model.name(id).is_none())
+        .unwrap();
+    assert_eq!(model.effective_name(event), Some("e"));
+}
+
+/// `self` and `that` stand for the type an expression is written in --
+/// unless the model declares a feature of that name where it is written,
+/// which is then what the name means. It is not passed over: inside
+/// a definition the name would otherwise be read as the definition, and
+/// at a package's top level it would resolve to nothing.
+#[test]
+fn a_feature_the_model_calls_self_or_that_is_what_the_name_means() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+    part def A { attribute that = 1; attribute b = that; attribute x = self; }
+    attribute self = 2;
+    attribute c = self;
+}
+",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let named: Vec<(String, String)> = ws
+        .references()
+        .iter()
+        .map(|r| (ws.qualified_name_of(r.from), ws.qualified_name_of(r.target)))
+        .filter(|(_, to)| to.ends_with("that") || to.ends_with("self") || to == "P::A")
+        .collect();
+    let to = |from: &str| {
+        named
+            .iter()
+            .filter(|(at, _)| at.starts_with(from))
+            .map(|(_, to)| to.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(to("P::A::b"), ["P::A::that"], "{named:?}");
+    assert_eq!(to("P::c"), ["P::self"], "{named:?}");
+    // with none declared, `self` is still the type it is written in
+    assert_eq!(to("P::A::x"), ["P::A"], "{named:?}");
 }
 
 #[test]
@@ -558,10 +863,16 @@ fn degenerate_semantic_metadata_values() {
     )]);
     // The self-referential base is skipped and the degenerate value
     // yields no base, so what those two usages redefine is nowhere to be
-    // found -- which they now say. What matters is that both
-    // semantic_base edge branches executed.
+    // found -- which they say. What matters is that both
+    // semantic_base edge branches executed. And `meta X` asks about an
+    // `X` this workspace does not have, which is a name like any other.
     let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
-    assert_eq!(names, ["nowhere", "nothere"], "{:?}", ws.unresolved());
+    assert_eq!(
+        names,
+        ["nowhere", "nothere", "X", "X", "X"],
+        "{:?}",
+        ws.unresolved()
+    );
 }
 
 #[test]
@@ -839,7 +1150,7 @@ fn resolving_what_is_reached_says_the_same_as_resolving_everything() {
 
 #[test]
 fn a_connector_relates_what_it_is_written_with() {
-    // Six spellings, each of which used to relate nothing: the ends of
+    // Spellings that each must relate something: the ends of
     // a `bind` sit around its `=`, an `interface` may name its first
     // end before `to` rather than after `connect`, a count may stand
     // between the keyword and the end, a list may be parenthesised, and
@@ -988,7 +1299,7 @@ fn an_unresolvable_satisfaction_is_reported() {
          satisfy p by that;\n",
     )]);
     let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
-    assert_eq!(names, ["nowhere::deep", "that"]);
+    assert_eq!(names, ["nowhere.deep", "that"]);
 }
 
 #[test]
@@ -1187,12 +1498,15 @@ fn a_flow_relates_flow_ends_that_own_what_flows() {
         );
         // exactly one owned feature: the one that flows. The
         // multiplicity beside it is owned through an `OwningMembership`
-        // and is not one -- `validateFlowEndNestedFeature`
+        // and is not one -- `validateFlowEndNestedFeature`. In SysML it
+        // is a reference: `FlowFeature : ReferenceUsage =
+        // ownedRelationship += FlowFeatureRedefinition`, where KerML
+        // writes `FlowFeature : Feature`.
         let owned: Vec<sysml_model::ElementId> = model
             .owned(end)
             .iter()
             .copied()
-            .filter(|&it| model.kind(it) == sysml_model::ElementKind::Feature)
+            .filter(|&it| model.kind(it) == sysml_model::ElementKind::ReferenceUsage)
             .collect();
         assert_eq!(owned.len(), 1, "one feature flows: {owned:?}");
         let redefines = model
@@ -1237,10 +1551,41 @@ fn a_flow_relates_flow_ends_that_own_what_flows() {
             .owned(end)
             .iter()
             .copied()
-            .find(|&it| model.kind(it) == sysml_model::ElementKind::Feature)
+            .find(|&it| model.kind(it) == sysml_model::ElementKind::ReferenceUsage)
             .expect("one feature flows");
         assert_eq!(model.maybe(flows, "direction"), None);
         assert_eq!(sysml_model::end_reaches(model, end).len(), 1);
+    }
+
+    // and KerML's `FlowFeature : Feature` is a feature and no usage
+    let mut ws = sysml_semantics::Workspace::new();
+    ws.add_file(
+        "plain.kerml",
+        "classifier P {
+	feature a { feature x; }
+	feature b { feature y; }
+         	flow a.x to b.y;
+}
+",
+    );
+    let stats = ws.resolve_all();
+    assert_eq!(stats.unresolved, 0, "{stats:?}");
+    let model = ws.model();
+    let ends: Vec<sysml_model::ElementId> = model
+        .ids()
+        .filter(|&it| model.kind(it) == sysml_model::ElementKind::FlowEnd)
+        .collect();
+    assert_eq!(ends.len(), 2);
+    for end in ends {
+        let flows: Vec<sysml_model::ElementKind> = model
+            .owned(end)
+            .iter()
+            .map(|&it| model.kind(it))
+            .filter(|kind| !kind.is_a(sysml_model::ElementKind::Multiplicity))
+            .filter(|kind| kind.is_a(sysml_model::ElementKind::Feature))
+            .collect();
+        assert_eq!(flows, [sysml_model::ElementKind::Feature]);
+        assert_eq!(sysml_model::end_reaches(model, end).len(), 2);
     }
 }
 
@@ -1457,7 +1802,7 @@ fn implied_specializations_are_materialized_once() {
             .unwrap()
     };
 
-    // Vehicle gained an implied subclassification of Parts::Part...
+    // Vehicle has an implied subclassification of Parts::Part...
     let vehicle = named("Vehicle");
     let implied: Vec<_> = model
         .owned(vehicle)
@@ -1504,7 +1849,7 @@ fn implied_specializations_are_materialized_once() {
             && model.maybe(child, "isImplied") == Some(&sysml_model::Value::Bool(true))
     }));
 
-    // running the pass again writes nothing: everything is reachable now
+    // running the pass again writes nothing: everything is reachable already
     assert_eq!(ws.materialize_implied(), 0);
 }
 
@@ -1697,8 +2042,8 @@ fn a_name_missing_when_it_was_first_looked_up_is_found_once_its_file_arrives() {
     let b = ws.add_file("b.sysml", "package B { part def Vehicle; }");
     let c = ws.add_file("c.sysml", "package C { part v : A::Vehicle; }");
     ws.resolve_files(&[b, c]);
-    // `A::Vehicle` is found through the re-export, which is what the
-    // cached failure used to stop. What `a.sysml` was told about its own
+    // `A::Vehicle` is found through the re-export, which a
+    // cached failure must not stop. What `a.sysml` was told about its own
     // import while `B` was missing stands until `a.sysml` is resolved
     // again -- a pass reports the files it was given -- so the test is
     // about the file that was.
@@ -1734,6 +2079,25 @@ fn a_root_package_named_after_a_library_one_is_reported_and_read_from_its_own_si
         );
         // and the collision is reported in the file it is written in
         assert!(ws.findings(&[0]).collisions.len() + ws.findings(&[1]).collisions.len() == 1);
+    }
+}
+
+/// What an action specializes without saying so is the library's
+/// `Actions::Action`, and a model's own root package called `Actions`
+/// does not stand in for it: the implied base is the library's name, not
+/// one the model wrote, so it is read in the library. Read from the
+/// model's side of the boundary, the model's `Actions` held no `Action`,
+/// and every action in the workspace lost `start` and `done`.
+#[test]
+fn a_root_package_named_after_a_library_one_does_not_take_its_implied_bases() {
+    let library = "standard library package Actions {\n    abstract action def Action {\n        action start;\n        action done;\n    }\n}\n";
+    let mine = "package Actions {\n    action def Go;\n    action go : Go {\n        first start then done;\n    }\n}\npackage M {\n    action def Run {\n        first start then done;\n    }\n}\n";
+    for order in [
+        [("lib.sysml", library), ("m.sysml", mine)],
+        [("m.sysml", mine), ("lib.sysml", library)],
+    ] {
+        let ws = ws(&order);
+        assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
     }
 }
 
@@ -1829,9 +2193,9 @@ fn a_cursor_past_the_end_of_the_file_is_not_inside_a_call() {
     assert!(ws.definition_at(0, past).is_none());
 }
 
-/// Looking a name up used to scan every member of the namespace, so a
-/// package of n parts cost n scans of n members to resolve. Ten
-/// thousand of them is a real model, and it took minutes.
+/// Looking a name up must not scan every member of the namespace, or a
+/// package of n parts would cost n scans of n members to resolve. A
+/// package of thousands is a real model, and that would take minutes.
 #[test]
 fn a_package_of_thousands_of_members_resolves_without_scanning_them_all() {
     let n = 8000;
@@ -2049,7 +2413,7 @@ fn only_a_subsetting_may_name_the_declaration_that_writes_it() {
 }
 
 /// A model can specialize deeper than a stack goes. Walking what it
-/// inherits took the process down with it; now the walk stops and the
+/// inherits must not take the process down with it; the walk stops and the
 /// name is reported as one that resolves to nothing.
 #[test]
 fn a_specialization_chain_deeper_than_the_stack_is_a_finding() {
@@ -2115,6 +2479,9 @@ package R {
         part def Other { attribute fromOther; }
     }
 }
+package SysML {
+    metadata def Usage;
+}
 ",
     )]);
     // `P::A::Nothing` is the path that walks back into the type, and it
@@ -2162,8 +2529,10 @@ fn a_succession_records_what_it_follows() {
         ),
         ["e", "f"]
     );
-    // where the one before it is another succession, the answer is
-    // where that one went: `then b; then c;` runs b to c
+    // where the one before it is another succession, that one is passed
+    // over: a succession is no occurrence, so `then b; then c;` both
+    // leave what stands before them (SysML 7.17.4, "The two successions
+    // following fork1 both have fork1 as their source")
     let all = |source: &str| {
         let mut ws = sysml_semantics::Workspace::new();
         ws.add_file("test.sysml", source);
@@ -2184,7 +2553,24 @@ fn a_succession_records_what_it_follows() {
     };
     assert_eq!(
         all("action def A {\n\taction a;\n\tthen b;\n\tthen c;\n\taction b;\n\taction c;\n}\n"),
-        ["a-b", "b-c"]
+        ["a-b", "a-c"]
+    );
+    // which is what a fork is written for
+    assert_eq!(
+        all(
+            "action def A {\n\taction s;\n\tthen fork f;\n\t\tthen a;\n\t\tthen b;\n\
+             \taction a;\n\taction b;\n}\n"
+        ),
+        ["s-f", "f-a", "f-b"]
+    );
+    // and a conditional succession is passed over too: every branch
+    // written under a `decide` leaves the decision
+    assert_eq!(
+        all(
+            "action def A {\n\tattribute x = 1;\n\taction a;\n\taction b;\n\taction c;\n\
+             \tdecide d;\n\t\tif x > 1 then a;\n\t\tif x < 0 then c;\n\t\telse b;\n}\n"
+        ),
+        ["d-a", "d-c", "d-b"]
     );
 
     // a connector before it that relates nothing is stepped over: it is
@@ -2200,7 +2586,7 @@ fn a_succession_records_what_it_follows() {
 
     // `then merge m;` writes the node and the succession into it as one
     // statement, so the succession's other end is the sibling that
-    // statement also became -- not an operand anywhere in the text
+    // statement also is -- not an operand anywhere in the text
     assert_eq!(
         related("action def A {\n\taction a;\n\tthen merge m;\n}\n"),
         ["a", "m"]
@@ -2262,7 +2648,7 @@ fn what_a_send_an_accept_and_an_assign_name_is_looked_up() {
         "attribute def S;\npart def P { port p; }\n\
          action def A {\n\tattribute v;\n\tpart hub : P;\n\taction x;\n\
          \tthen assign v := 1;\n\tthen send new S() via hub.p to x;\n\
-         \tthen accept s via hub.p;\n}\n",
+         \tthen accept S via hub.p;\n}\n",
     );
     ws.resolve_all();
     assert_eq!(ws.unresolved().len(), 0, "{:?}", ws.unresolved());
@@ -2340,8 +2726,8 @@ fn what_a_send_an_accept_and_an_assign_name_is_looked_up() {
 /// redefines that one's.
 ///
 /// Without it the specializing function has two result parameters, and "a
-/// function has exactly one" is true of none of the five hundred in the
-/// corpus that declare one. The walk carries on past a general type that
+/// function has exactly one" is true of none of the corpus's functions
+/// that declare one. The walk carries on past a general type that
 /// declares no result of its own, since one may be inherited in turn.
 #[test]
 fn a_result_parameter_redefines_the_one_the_general_function_declares() {
@@ -2466,9 +2852,9 @@ fn a_conjugated_port_is_typed_by_the_conjugate_and_has_what_it_conjugates() {
 /// `end cart : ShoppingCart crosses selectedProduct.inCart` says which
 /// feature of the other end this one is reached across, and the standard
 /// makes a `CrossSubsetting` of it. Written in the same shape as
-/// `subsets`, it was arriving as a plain subsetting -- so no model built
-/// here had one, and the constraint about owning at most one could not be
-/// asked. What an end crosses to is reached through the ends of the
+/// `subsets`, it must not arrive as a plain subsetting -- or no model built
+/// here would have one, and the constraint about owning at most one could
+/// not be asked. What an end crosses to is reached through the ends of the
 /// association, this one included, so the path may start with the name
 /// being declared.
 #[test]
@@ -2544,7 +2930,7 @@ fn an_end_that_crosses_says_so_with_a_cross_subsetting() {
 ///
 /// `classifier U unions A, B;` narrows an extent; it does not
 /// specialize, and nothing is inherited through it. Read as a
-/// specialization, a connector typed by a union of two associations had
+/// specialization, a connector typed by a union of two associations would have
 /// the ends of both -- four where it relates two -- and
 /// `validateConnectorBinarySpecialization` says a connector with more
 /// than two ends does not specialize the binary link.
@@ -2578,7 +2964,7 @@ fn a_union_is_not_a_specialization() {
 /// the answer is its neighbour in the same body. That neighbour was
 /// kept as a related feature and not as an end, so
 /// `connectorEnd->at(1)` reached past it to the one that was written --
-/// and the four constraints that count what a control node is joined by
+/// and the constraints that count what a control node is joined by
 /// read the ends in the order the connector relates them.
 #[test]
 fn a_succession_that_names_one_end_reifies_both() {
@@ -2815,8 +3201,8 @@ fn an_else_and_a_list_of_ends_say_what_they_relate() {
 ///
 /// "A TransitionUsage is not a Connector: what it relates it relates
 /// through a Succession of its own" -- read as the transition's, the
-/// succession related nothing and the constraints counting what a control
-/// node is joined by had no ends to read. And `connect ( cause1 ::>
+/// succession would relate nothing and the constraints counting what a control
+/// node is joined by would have no ends to read. And `connect ( cause1 ::>
 /// causer1, ... )` writes each end in the list, named and referring.
 #[test]
 fn a_transition_relates_through_its_succession_and_a_list_writes_ends() {
@@ -2895,7 +3281,7 @@ fn a_transition_relates_through_its_succession_and_a_list_writes_ends() {
 /// `interface i : WHI connect [1] lugNutPort ::> wheel.lugNutPort to ...`
 /// -- what stands after `connect` is the end, and what it refers to is
 /// what the connector relates. Read as a member of the interface,
-/// twenty-one of the corpus related nothing at all.
+/// many in the corpus would relate nothing at all.
 #[test]
 fn a_named_declaration_with_a_reference_is_the_end() {
     let mut ws = Workspace::new();
@@ -3066,9 +3452,9 @@ fn a_connector_end_is_one_thing() {
 /// stands only in front of the keyword that introduces the first end,
 /// so without a `bind` or an `of` the name after `binding` is that end
 /// -- and a binding that writes no `=` at all declares a name and
-/// nothing else. Eighty-eight of the library's bindings were binding
-/// nothing, and the `=` was being read a second time as a value, which
-/// wrote two edits over the one name on a rename.
+/// nothing else. Reading the `=` a second time as a value would make
+/// the library's bindings bind nothing and write two edits over the one
+/// name on a rename.
 #[test]
 fn a_binding_binds_what_was_written_around_its_equals() {
     let mut ws = Workspace::new();
@@ -3383,9 +3769,8 @@ fn a_feature_that_redefines_an_end_is_an_end_and_is_not_composite() {
 /// is one succession and not two.
 ///
 /// Read as a succession as well, the `first` took the flow its `then`
-/// writes and left that one relating its own declaration to itself: the
-/// corpus had merge and fork nodes with a succession from themselves to
-/// themselves.
+/// writes and left that one relating its own declaration to itself, giving
+/// merge and fork nodes a succession from themselves to themselves.
 #[test]
 fn a_first_names_the_step_that_comes_first_and_writes_no_flow() {
     let mut ws = Workspace::new();
@@ -3612,4 +3997,1380 @@ fn both_ends_of_a_disjointness_are_looked_at() {
         })
         .collect();
     assert_eq!(steps, [2, 2], "both ends are chains of two");
+}
+
+/// A filter that names what only it could bring in.
+///
+/// `@Safety` is resolved where the import is written, and the only
+/// `Safety` there is would come in through `vehicle::**` -- through the
+/// import the condition filters. Answering whether it admits `Safety`
+/// meant resolving `Safety`, which meant asking the same filter again,
+/// each round with a fresh cycle guard: the search branched at every
+/// level down to the depth limit and did not come back. A model an
+/// editor holds halfway through moving a definition is this model, and
+/// the language server stopped answering.
+///
+/// Run on a thread of its own, so that the regression is a failure
+/// rather than a test that never ends.
+#[test]
+fn a_filter_that_names_what_only_it_brings_in_still_finishes() {
+    const MODEL: &str = "package P {\n\
+        \tprivate import Tree::*;\n\
+        \tpackage Tree {\n\
+        \t\tpart vehicle {\n\
+        \t\t\tmetadata def Safety;\n\
+        \t\t\tpart bumper { @Safety; }\n\
+        \t\t}\n\
+        \t}\n\
+        \tpackage Features {\n\
+        \t\tpublic import vehicle::**[@Safety];\n\
+        \t}\n\
+        }\n";
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ws = ws(&[("p.sysml", MODEL)]);
+        sent.send(ws.unresolved().len()).unwrap();
+    });
+    let unresolved = received
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("resolving a self-referring filter finishes");
+    // and the names the model does bring into scope still resolve
+    assert_eq!(unresolved, 0);
+}
+
+/// A bound that names something is a reference like any other. Read as
+/// the tokens between the brackets, `[count]` was never looked up, so a
+/// bound that named nothing at all -- a typo, a feature since renamed --
+/// passed `check` as a multiplicity nobody could read.
+#[test]
+fn a_name_written_as_a_bound_is_looked_up() {
+    const MODEL: &str = "package P {\n\
+        \tattribute count = 4;\n\
+        \tpart wheels[count];\n\
+        \tpart spares[1..count + 1];\n\
+        \tpart axles[count * 2];\n\
+        \tpart seats[0..*];\n\
+        \tpart nuts[nope];\n\
+        \tpart bolts[2..nope * 2];\n\
+        }\n";
+    let mut ws = ws(&[("p.sysml", MODEL)]);
+    let count = ws.named_globally("P::count").expect("declared");
+    let named: Vec<&str> = ws
+        .references()
+        .iter()
+        .filter(|it| it.target == count)
+        .map(|it| &MODEL[it.range])
+        .collect();
+    assert_eq!(named, ["count", "count", "count"]);
+    let missing: Vec<(&str, u32)> = ws
+        .unresolved()
+        .iter()
+        .map(|it| (it.name.as_str(), u32::from(it.range.start())))
+        .collect();
+    let at = |line: &str| (MODEL.find(line).unwrap() + line.find("nope").unwrap()) as u32;
+    assert_eq!(
+        missing,
+        [
+            ("nope", at("part nuts[nope]")),
+            ("nope", at("part bolts[2..nope * 2]")),
+        ]
+    );
+}
+
+/// `(@A)` is the condition inside the parentheses, and `(@A, @B)` is a
+/// sequence, which is no condition at all. Read by its first element
+/// alone, the sequence filtered by `@A` and hid `b` behind a filter the
+/// model never wrote; a condition that cannot be evaluated keeps every
+/// name, like any other this cannot answer.
+#[test]
+fn a_sequence_written_as_a_filter_is_not_its_first_element() {
+    const MODEL: &str = "package P {\n\
+        \tprivate import Tree::*;\n\
+        \tpackage Tree {\n\
+        \t\tmetadata def A;\n\
+        \t\tmetadata def B;\n\
+        \t\tpart a { @A; }\n\
+        \t\tpart b { @B; }\n\
+        \t}\n\
+        \tpackage One { public import Tree::*[(@A)]; }\n\
+        \tpackage Both { public import Tree::*[(@A, @B)]; }\n\
+        \tpart oneA :> One::a;\n\
+        \tpart oneB :> One::b;\n\
+        \tpart bothA :> Both::a;\n\
+        \tpart bothB :> Both::b;\n\
+        }\n";
+    let ws = ws(&[("p.sysml", MODEL)]);
+    let missing: Vec<&str> = ws.unresolved().iter().map(|it| it.name.as_str()).collect();
+    assert_eq!(missing, ["One::b"]);
+}
+
+/// Every place the grammar writes a reference is looked up, and a name
+/// that resolves to nothing there is reported.
+///
+/// Each of these was a position nothing looked at: the summary said
+/// every name resolved because the misspelt one was never counted, so a
+/// model that performed, filtered by or branched on nothing passed as
+/// sound. Paired with the same model spelt right, which must resolve.
+#[test]
+fn a_name_resolves_to_nothing_wherever_it_is_written() {
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "a performed action",
+            "action a { action ok; perform ok; }",
+            "action a { action ok; perform NOPE; }",
+        ),
+        (
+            "an exhibited state",
+            "part p { state ok; exhibit ok; }",
+            "part p { state ok; exhibit NOPE; }",
+        ),
+        (
+            "an included use case",
+            "use case u { use case ok; include ok; }",
+            "use case u { use case ok; include NOPE; }",
+        ),
+        (
+            "a framed concern",
+            "concern def C; viewpoint def vp { concern ok : C; frame ok; }",
+            "concern def C; viewpoint def vp { concern ok : C; frame NOPE; }",
+        ),
+        (
+            "what a state does",
+            "action ok; state def S { do ok; exit ok; }",
+            "action ok; state def S { do ok; exit NOPE; }",
+        ),
+        (
+            "a variant named rather than declared",
+            "part def W; part ok : W; variation part v : W { variant ok; }",
+            "part def W; part ok : W; variation part v : W { variant NOPE; }",
+        ),
+        (
+            "prefix metadata",
+            "metadata def ok; #ok part x;",
+            "metadata def ok; #NOPE part x;",
+        ),
+        (
+            "a bracketed import filter",
+            "metadata def ok; package Q { part x; } package R { private import Q::*[@ok]; }",
+            "metadata def ok; package Q { part x; } package R { private import Q::*[@NOPE]; }",
+        ),
+        (
+            "an if, a while, an until and a for",
+            "action a { attribute ok; if ok { } while ok { } loop { } until ok; for i in ok { } }",
+            "action a { attribute ok; if ok { } while ok { } loop { } until NOPE; for i in ok { } }",
+        ),
+        (
+            "a guard written as the statement's own if",
+            "action a { attribute ok; action b; first b; if ok then b; }",
+            "action a { attribute ok; action b; first b; if NOPE then b; }",
+        ),
+        (
+            "what is sent and what is assigned",
+            "action a { attribute ok; attribute v; send ok; assign v := ok; }",
+            "action a { attribute ok; attribute v; send ok; assign v := NOPE; }",
+        ),
+        (
+            "what a trigger waits for",
+            "attribute ok; action a { accept when ok; }",
+            "attribute ok; action a { accept when NOPE; }",
+        ),
+        (
+            "the type an accept waits for",
+            "attribute def Ok; action a { accept Ok; }",
+            "attribute def Ok; action a { accept NOPE; }",
+        ),
+        (
+            "the type a test asks about",
+            "part def Ok; attribute xs; attribute v = xs istype Ok;",
+            "part def Ok; attribute xs; attribute v = xs istype NOPE;",
+        ),
+        (
+            "the type a binary @ asks about",
+            "part def Ok; attribute xs; attribute v = xs @ Ok;",
+            "part def Ok; attribute xs; attribute v = xs @ NOPE;",
+        ),
+        (
+            "what an extent ranges over",
+            "part def Ok; attribute v = all Ok;",
+            "part def Ok; attribute v = all NOPE;",
+        ),
+        (
+            "what is constructed",
+            "part def Ok; attribute v = new Ok();",
+            "part def Ok; attribute v = new NOPE();",
+        ),
+        (
+            "what a flow's payload references",
+            "part def W { part ok; } part w : W; flow f of p ::> w.ok from w.ok to w.ok;",
+            "part def W { part ok; } part w : W; flow f of p ::> w.NOPE from w.ok to w.ok;",
+        ),
+        (
+            "what an arrow invokes and the function it hands over",
+            "calc def f { in a; in b; } calc def ok { in a; in b; } attribute xs; attribute v = xs->f ok;",
+            "calc def f { in a; in b; } calc def ok { in a; in b; } attribute xs; attribute v = xs->f NOPE;",
+        ),
+        (
+            "a feature a metadata body gives a value",
+            "metadata def M { attribute ok; } part q { @M { ok = 1; } }",
+            "metadata def M { attribute ok; } part q { @M { NOPE = 1; } }",
+        ),
+        (
+            "an end an n-ary connector names",
+            "part def W { part ok; } part w : W; connection c connect ([1] w.ok, [1] w.ok, [2] w.ok);",
+            "part def W { part ok; } part w : W; connection c connect ([1] w.ok, [1] w.ok, [2] w.NOPE);",
+        ),
+        (
+            "what is sent, constructed where it is sent",
+            "item def Ok; action a { send new Ok(); }",
+            "item def Ok; action a { send new NOPE(); }",
+        ),
+        (
+            "what is terminated",
+            "action a { action ok; terminate ok; }",
+            "action a { action ok; terminate NOPE; }",
+        ),
+        (
+            "the event a flow runs into",
+            "occurrence def O { event occurrence ok; } occurrence o : O; occurrence u { event occurrence e; then event o.ok[1]; }",
+            "occurrence def O { event occurrence ok; } occurrence o : O; occurrence u { event occurrence e; then event o.NOPE[1]; }",
+        ),
+        (
+            "the action a flow runs into and performs",
+            "action ok; action a { action b; first b; then perform ok; }",
+            "action ok; action a { action b; first b; then perform NOPE; }",
+        ),
+        (
+            "the port a transition's trigger waits through",
+            "port def P; item def S; port ok : P; state def M { state s1; state s2; transition first s1 accept S via ok then s2; }",
+            "port def P; item def S; port ok : P; state def M { state s1; state s2; transition first s1 accept S via NOPE then s2; }",
+        ),
+        (
+            "where a transition's effect sends",
+            "port def P; item def S; port ok : P; state def M { state s1; state s2; transition first s1 accept S do send new S() to ok then s2; }",
+            "port def P; item def S; port ok : P; state def M { state s1; state s2; transition first s1 accept S do send new S() to NOPE then s2; }",
+        ),
+        (
+            "what is assigned, constructed where it is assigned",
+            "part def Ok; action a { attribute v; assign v := new Ok(); }",
+            "part def Ok; action a { attribute v; assign v := new NOPE(); }",
+        ),
+        (
+            "the parameter an argument names",
+            "calc def F { in ok; } attribute v = F(ok = 1);",
+            "calc def F { in ok; } attribute v = F(NOPE = 1);",
+        ),
+        (
+            "the feature a constructor's argument names",
+            "attribute def A { attribute ok; } attribute v = new A(ok = 1);",
+            "attribute def A { attribute ok; } attribute v = new A(NOPE = 1);",
+        ),
+        (
+            "the type of a loop variable",
+            "attribute def Ok; action a { for n : Ok in 1 { } }",
+            "attribute def Ok; action a { for n : NOPE in 1 { } }",
+        ),
+        (
+            "the type of a body's parameter and the value of its member",
+            "attribute def Ok; calc def f { in xs; in b; } attribute xs; constraint c { xs->f {in n : Ok; private attribute m = n; m} }",
+            "attribute def Ok; calc def f { in xs; in b; } attribute xs; constraint c { xs->f {in n : NOPE; private attribute m = n; m} }",
+        ),
+        (
+            "the type of a nameless connection whose ends are named",
+            "part def W { part a; } part w : W; connection def Ok { end x; end y; } part q { connection : Ok connect x references w.a to y references w.a; }",
+            "part def W { part a; } part w : W; connection def Ok { end x; end y; } part q { connection : NOPE connect x references w.a to y references w.a; }",
+        ),
+        (
+            "what a body asks of its parameter, in what an if, a while and a guard ask",
+            "attribute def Ok { attribute ok; } calc def f { in xs; in b; } attribute xs; action a { if xs->f {in x : Ok; x.ok} { } while xs->f {in y : Ok; y.ok} { } } transition t first a if xs->f {in z : Ok; z.ok} then a;",
+            "attribute def Ok { attribute ok; } calc def f { in xs; in b; } attribute xs; action a { if xs->f {in x : Ok; x.ok} { } while xs->f {in y : Ok; y.NOPE} { } } transition t first a if xs->f {in z : Ok; z.ok} then a;",
+        ),
+        (
+            "the type of the payload an accept action declares",
+            "item def Ok; action a { action t accept s : Ok; }",
+            "item def Ok; action a { action t accept s : NOPE; }",
+        ),
+    ];
+    for (what, right, wrong) in CASES {
+        let unresolved = |body: &str| -> Vec<String> {
+            let mut ws = Workspace::default();
+            ws.add_file("m.sysml", &format!("package P {{ {body} }}"));
+            ws.resolve_all();
+            ws.unresolved()
+                .iter()
+                .filter(|it| it.file == 0)
+                .map(|it| it.name.clone())
+                .collect()
+        };
+        assert_eq!(unresolved(right), Vec::<String>::new(), "{what}: {right}");
+        let missed = unresolved(wrong);
+        assert!(
+            missed.iter().any(|name| name.ends_with("NOPE")),
+            "{what}: {wrong} reported {missed:?}"
+        );
+    }
+}
+
+/// What a supertype imports publicly or protectedly it gives its
+/// subtypes, as `inheritableMemberships` takes its `nonPrivateMemberships`
+/// -- and a namespace met once on the way up is still searched again when
+/// an import asks for more of it.
+#[test]
+fn a_subtype_inherits_what_its_supertype_imports() {
+    let unresolved = |body: &str| -> Vec<String> {
+        let ws = ws(&[(
+            "m.sysml",
+            &format!("package P {{ package Lib {{ part def Engine; }} {body} }}"),
+        )]);
+        ws.unresolved().iter().map(|it| it.name.clone()).collect()
+    };
+    let none: Vec<String> = Vec::new();
+    // public: inherited, and seen from outside through the subtype
+    assert_eq!(
+        unresolved("part def A { public import Lib::*; } part def B :> A { part e : Engine; } part d : B::Engine;"),
+        none
+    );
+    // protected: inherited, but not seen from outside
+    assert_eq!(
+        unresolved("part def A { protected import Lib::*; } part def B :> A { part e : Engine; } part d : B::Engine;"),
+        ["B::Engine"]
+    );
+    // private: neither
+    assert_eq!(
+        unresolved("part def A { private import Lib::*; } part def B :> A { part e : Engine; }"),
+        ["Engine"]
+    );
+    // the walk up through `A` sees what a subtype may; the `import all`
+    // of the same `A` asks for its private members too
+    assert_eq!(
+        unresolved("part def A { private part def Secret; } part def B :> A { import all A::*; part e : Secret; }"),
+        none
+    );
+}
+
+/// Where a name is the thing referred to and where it is the one being
+/// declared, read as the grammar says.
+#[test]
+fn a_name_is_declared_only_where_the_grammar_declares_it() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+            attribute def Sig;
+            metadata def M { attribute x; }
+            part def W;
+            part w : W;
+            action def A {
+                action a1; action a2;
+                decide; if true then a1; else a2;
+                accept Sig;
+            }
+            variation part v : W { variant w; }
+            part q { @M { x = 1; } }
+            part def B { part p; }
+            part def D :> B { y subsets p; }
+            part s { exhibit state st parallel { } }
+        }",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let model = ws.model();
+    let named = |name: &str| {
+        model
+            .ids()
+            .filter(|&id| {
+                model
+                    .get(id, "declaredName")
+                    .and_then(sysml_model::Value::as_str)
+                    == Some(name)
+            })
+            .count()
+    };
+    // `else a2;` goes to the `a2` there is rather than declaring another
+    assert_eq!(named("a2"), 1);
+    // `accept Sig;` waits for a `Sig` rather than calling the payload that
+    assert_eq!(named("Sig"), 1);
+    // `variant w;` is the `w` there is
+    assert_eq!(named("w"), 1);
+    // `x = 1;` in a metadata body gives `M::x` a value
+    assert_eq!(named("x"), 1);
+    // `y subsets p;` declares `y`, as `y :> p;` does
+    assert_eq!(named("y"), 1);
+    // and `exhibit state st parallel` declares `st`
+    assert_eq!(named("st"), 1);
+}
+
+/// `connector c (a, b, c);` connects three features: it does not
+/// declare three more beside its ends.
+#[test]
+fn an_nary_connector_lists_ends_and_declares_nothing_else() {
+    let ws = ws(&[(
+        "k.kerml",
+        "package P { classifier X { feature a; feature b; } feature x : X; feature a; feature b; \
+         connector c (a, b, x.a); connector ([1] x.a, e ::> b, a); }",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let model = ws.model();
+    for connector in model
+        .ids()
+        .filter(|&id| model.kind(id) == ElementKind::Connector)
+    {
+        let owned: Vec<_> = model
+            .owned(connector)
+            .iter()
+            .copied()
+            .filter(|&it| model.kind(it).is_a(ElementKind::Feature))
+            .collect();
+        assert_eq!(owned.len(), 3, "three ends");
+        assert!(owned.iter().all(|&it| model.flag(it, "isEnd")));
+        assert_eq!(
+            model
+                .get(connector, "relatedFeature")
+                .and_then(sysml_model::Value::as_ids)
+                .map(|it| it.len()),
+            Some(3)
+        );
+    }
+}
+
+/// `feature h inverse of g;`, `inverting i inverse h of g;` and
+/// `featuring f of g by T;` relate two features, and both ends are names
+/// that are looked up -- a symmetric relation being its own inverse.
+#[test]
+fn inverting_and_featuring_relate_what_they_name() {
+    let ws = ws(&[(
+        "k.kerml",
+        "package P { feature g; feature h inverse of g; feature s inverse of s; \
+         inverting i inverse h of g; classifier A; feature f; featuring of f by A; \
+         feature k inverse of nope1; featuring of f by nope2; }",
+    )]);
+    let missing: Vec<&str> = ws.unresolved().iter().map(|it| it.name.as_str()).collect();
+    assert_eq!(missing, ["nope1", "nope2"]);
+    let model = ws.model();
+    let name = |id: Option<&sysml_model::Value>| {
+        id.and_then(sysml_model::Value::as_id)
+            .and_then(|it| model.name(it))
+            .map(str::to_string)
+    };
+    let pairs =
+        |kind: ElementKind, from: &str, to: &str| -> Vec<(Option<String>, Option<String>)> {
+            model
+                .ids()
+                .filter(|&id| model.kind(id) == kind)
+                .map(|id| (name(model.get(id, from)), name(model.get(id, to))))
+                .collect()
+        };
+    let some = |a: &str, b: &str| (Some(a.to_string()), Some(b.to_string()));
+    let inverted = pairs(
+        ElementKind::FeatureInverting,
+        "featureInverted",
+        "invertingFeature",
+    );
+    assert!(inverted.contains(&some("h", "g")), "{inverted:?}");
+    assert!(inverted.contains(&some("s", "s")), "{inverted:?}");
+    let featured = pairs(ElementKind::TypeFeaturing, "featureOfType", "featuringType");
+    assert!(featured.contains(&some("f", "A")), "{featured:?}");
+}
+
+/// A package imports what a public import of the package it imports
+/// re-exports -- what a name written there resolves to, and what the
+/// model then says it imported.
+#[test]
+fn what_is_imported_includes_what_is_re_exported() {
+    let mut ws = ws(&[(
+        "m.sysml",
+        "package Lib { part def Engine; } package Q { public import Lib::*; part def Wheel; } \
+         package R { import Q::*; part e : Engine; } \
+         package S { private import Lib::*; } package T { import S::*; }",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let named = |ws: &mut Workspace, package: &str| -> Vec<String> {
+        let id = ws.named_globally(package).expect("declared");
+        let members = ws.imported_members(id);
+        members
+            .iter()
+            .filter_map(|&it| ws.model().name(it).map(str::to_string))
+            .collect()
+    };
+    assert_eq!(named(&mut ws, "R"), ["Wheel", "Engine"]);
+    // a private import re-exports nothing
+    assert_eq!(named(&mut ws, "T"), Vec::<String>::new());
+}
+
+/// Only a parameter stands for the one it shares a name with: the
+/// standard implies that redefinition for what a behaviour is handed. A
+/// `part m;` that happens to share an inherited name is a feature of its
+/// own, and reading it as the one it shadows walked a specialization the
+/// model does not have.
+#[test]
+fn sharing_a_name_redefines_only_a_parameter() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P { item def Fuel { attribute grade; } \
+         part def A { item m : Fuel; } part def B :> A { part m; } \
+         part b : B; attribute g = b.m.grade; \
+         action def X { in p : Fuel; } action def Y :> X { in p; } \
+         action y : Y { attribute h = p.grade; } }",
+    )]);
+    let missing: Vec<&str> = ws.unresolved().iter().map(|it| it.name.as_str()).collect();
+    assert_eq!(missing, ["b.m.grade"]);
+}
+
+/// A filter condition written as a literal says outright what passes,
+/// and `and`/`or` are decided by one side where that side settles them.
+#[test]
+fn a_filter_says_what_passes_as_far_as_it_can_be_read() {
+    let unresolved = |filter: &str| -> Vec<String> {
+        let ws = ws(&[(
+            "m.sysml",
+            &format!(
+                "package P {{ metadata def Safety; package Q {{ part x; #Safety part y; }} \
+                 package R {{ private import Q::*[{filter}]; part a :> x; part b :> y; }} }}"
+            ),
+        )]);
+        ws.unresolved().iter().map(|it| it.name.clone()).collect()
+    };
+    let none: Vec<String> = Vec::new();
+    assert_eq!(unresolved("true"), none);
+    assert_eq!(unresolved("false"), ["x", "y"]);
+    // what is no condition at all is not evaluated, and keeps every name
+    assert_eq!(unresolved("1"), none);
+    // `@Safety and ...` holds for no member that is not annotated, whatever
+    // the other side is; `@Safety or ...` for every member that is
+    assert_eq!(unresolved("@Safety and 1 == 1"), ["x"]);
+    assert_eq!(unresolved("@Safety or false"), ["x"]);
+    assert_eq!(unresolved("@Safety xor true"), ["y"]);
+}
+
+/// A recursive import that has nothing by the name asked for hands the
+/// search on to the imports after it.
+#[test]
+fn a_recursive_import_that_has_nothing_passes_the_name_on() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package Q { package Deep { part def Inner; } } package S { part def There; } \
+         package R { private import Q::**; private import S::*; part z : There; part y : Inner; }",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+}
+
+/// The KerML corpus wrote names in places nothing looked at: the ends of a
+/// conjugation statement, the parameters and names of a body expression,
+/// what `->` invokes, a member reached through a call or a cast, a filter
+/// statement's condition, a cast in a bracketed filter. Each is looked
+/// up, so a name that is not there is reported -- and a relationship
+/// statement's own name is declared rather than looked up.
+#[test]
+fn every_name_a_kerml_model_writes_is_looked_up() {
+    let model = |nope: &str| -> String {
+        format!(
+            "package N {{
+                private import ControlFunctions::*;
+                private import ScalarValues::*;
+                class Original; class C1;
+                conjugation c1 conjugate C1 conjugates {nope}1;
+                conjugation c2 conjugate C1 ~ {nope}7;
+                feature x : Integer[*];
+                feature a = x->select {{in y; y > {nope}2}};
+                feature b = x.{{in y; {nope}3 + y}};
+                feature c = x->{nope}4 {{in y; y}};
+                behavior A {{ out y; }}
+                feature d = A().{nope}5;
+                metaclass M {{ feature level : Integer; }}
+                package Q {{ feature f; }}
+                package R {{ private import Q::*[(as M).{nope}6 > 1]; }}
+                specialization Gen subtype C1 specializes Original;
+                dependency Use from C1 to Original;
+            }}"
+        )
+    };
+    let missing = |text: &str| -> Vec<String> {
+        let mut ws = Workspace::default();
+        ws.add_file("n.kerml", text);
+        ws.load_dir(std::path::Path::new("../sysml-stdlib/library"))
+            .expect("the library loads");
+        ws.resolve_all();
+        let mut names: Vec<String> = ws
+            .unresolved()
+            .iter()
+            .filter(|it| it.file == 0)
+            .map(|it| it.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    // spelled right, with the names the model declares standing in
+    let right = model("x")
+        .replace("x1", "Original")
+        .replace("x7", "Original")
+        .replace("x2", "0")
+        .replace("x3", "1")
+        .replace("x4", "collect")
+        .replace("x5", "y")
+        .replace("x6", "level");
+    assert_eq!(missing(&right), Vec::<String>::new(), "{right}");
+    assert_eq!(
+        missing(&model("nope")),
+        ["nope1", "nope2", "nope3", "nope4", "nope5", "nope6", "nope7"]
+    );
+}
+
+/// A name written where the grammar declares one is the name of what it
+/// declares, however the statement goes on: each of these came out with
+/// no name at all, or as a reference to nothing.
+#[test]
+fn a_statement_names_what_it_declares() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+            item def Sig { attribute x; }
+            part def T;
+            connection def C { end [*] ref cause : T; end [1] in ordered part effect : T; }
+            state ps parallel { }
+            action def A {
+                action aa accept s : Sig;
+                action stop terminate;
+                action s2 send new Sig() via p;
+                port p;
+                then merge m;
+                then action aLoop while true { }
+            }
+            state def S {
+                state S1; state S2;
+                accept s : Sig do action D then S2;
+            }
+            action def B :> A {
+                ref r1 = aa; ref r2 = stop; ref r3 = s2; ref r4 = m; ref r5 = aLoop;
+                ref r6 = aa.s.x;
+            }
+            part q { ref r7 = ps; ref r8 = C::cause; ref r9 = C::effect; }
+        }",
+    )]);
+    assert_eq!(
+        ws.unresolved()
+            .iter()
+            .map(|it| it.name.clone())
+            .collect::<Vec<_>>(),
+        Vec::<String>::new()
+    );
+    // `accept s : Sig do action D then S2` goes on to `S2`: the effect
+    // declares `D` and stops where the transition's `then` begins
+    let s2 = ws
+        .named_elements()
+        .find(|(_, name)| *name == "S2")
+        .map(|(id, _)| id)
+        .expect("the state is declared");
+    assert!(ws.references().iter().any(|it| it.target == s2));
+}
+
+/// What an accept waits for is typed where the statement writes it, and
+/// a name reaching through it resolves wherever it is written -- not only
+/// below the transition that declares it.
+#[test]
+fn a_payload_is_typed_wherever_it_is_reached() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+            attribute def Sig { attribute x; }
+            port def Q;
+            state def S {
+                state S1 { attribute early = T.s.x; }
+                state S2;
+                transition T first S1 accept s : Sig via p then S2;
+                port p : Q;
+                attribute late = T.s.x;
+            }
+            action def A {
+                attribute early = a.s.x;
+                action a accept s : Sig;
+                for n : Sig in 1 { attribute y = n.x; }
+            }
+        }",
+    )]);
+    assert_eq!(
+        ws.unresolved()
+            .iter()
+            .map(|it| it.name.clone())
+            .collect::<Vec<_>>(),
+        Vec::<String>::new()
+    );
+}
+
+/// Each name is recorded once, however many elements a statement or an
+/// expression is built into: `then assign i := i + 1` is a succession and
+/// an assignment, and `{in n; private attribute m = n; m}` a body whose
+/// member reads its own value. A name recorded twice is a rename that
+/// edits it twice.
+#[test]
+fn a_name_is_recorded_once() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {
+            calc def f { in xs; in b; }
+            attribute xs;
+            action a {
+                attribute i;
+                assign i := 1;
+                then assign i := i + 1;
+            }
+            constraint c { xs->f {in n; private attribute m = n; m->f {in k; k + n} } }
+        }",
+    )]);
+    let mut seen = std::collections::HashSet::new();
+    for reference in ws.references() {
+        assert!(
+            seen.insert((reference.file, reference.range)),
+            "recorded twice: {:?}",
+            reference.range
+        );
+    }
+}
+
+/// After `P::` what is offered is what `P` holds -- its public members --
+/// and after `x.` the features of `x`, not the names around the cursor.
+/// `import P::|` is not offered `P` and `Q` and nothing in `P`.
+#[test]
+fn what_is_offered_after_a_qualifier_is_what_the_qualifier_holds() {
+    let text = "package P {\n\
+                \tpart def Wheel;\n\
+                \tprivate part def Hidden;\n\
+                \tpackage Inner { part def Deep; }\n\
+                }\n\
+                package Q {\n\
+                \tpart def Car { part w : P::Wheel { attribute rim; } }\n\
+                \tpart c : Car;\n\
+                \tpart z :> c.w;\n\
+                \timport P::Inner::De;\n\
+                \timport 'P'::;\n\
+                \timport Nope::;\n\
+                }\n";
+    let mut ws = ws(&[("m.sysml", text)]);
+    let at = |needle: &str| TextSize::from((text.find(needle).unwrap() + needle.len()) as u32);
+    let mut offered = |needle: &str| {
+        let mut names: Vec<String> = ws
+            .visible_names(0, at(needle))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(offered("import P::Inner::"), ["Deep"]);
+    assert_eq!(offered("import 'P'::"), ["Inner", "Wheel"]);
+    assert_eq!(offered("import Nope::"), Vec::<String>::new());
+    // through a feature, its own features and those of its type
+    assert!(offered("part z :> c.").contains(&"w".to_string()));
+    // and with no qualifier, the names around the cursor as before
+    assert!(offered("part c : ").contains(&"Car".to_string()));
+}
+
+/// An alias is a member of the namespace it is written in, and `import
+/// A::**` brings in every visible member nested anywhere below `A`. The
+/// walk below stepped over every relationship, and an alias membership is
+/// one, so an alias in `A::N` was the only thing there the import missed.
+#[test]
+fn a_recursive_import_brings_in_a_nested_alias() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package A { package N { part def D; alias AL for D; private alias Hidden for D; } }\n\
+         package B { import A::**; part e : AL; part f : Hidden; }\n",
+    )]);
+    let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    // and one kept private there stays out of reach, as a declaration would
+    assert_eq!(names, ["Hidden"]);
+}
+
+/// `part y : Lib { @Md; }` names its metadata from inside `y`, where `Md`
+/// is had only through `Lib`. Finding it asks for `y`'s supertypes while
+/// they are being worked out; answered with none, `Md` went unfound and
+/// `y` was left without the base type its metadata gives it -- though
+/// `#Md part w` in front of a declaration, looked up the same way from one
+/// scope further out, always found it.
+#[test]
+fn metadata_inside_a_body_is_found_through_what_the_body_is_typed_by() {
+    let ws = ws(&[(
+        "m.sysml",
+        "package P {\n\
+         \tmetadata def SemanticMetadata { attribute baseType; }\n\
+         \tmetadata def X;\n\
+         \tpart def Lib {\n\
+         \t\tmetadata def Md :> SemanticMetadata { :>> baseType = things meta X; }\n\
+         \t\tpart things { attribute special; }\n\
+         \t}\n\
+         \tpart y : Lib { @Md; attribute q :> special; }\n\
+         \tpart y3 : Lib { #Md part w { attribute q :> special; } }\n\
+         }\n",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+}
+
+/// `[@Step]` asks what an element is only where `Step` is the reflective
+/// model's own metaclass. A model's `metadata def Step;` is a keyword of
+/// its own that shares the name, and filtering by it admits what carries
+/// it -- not every step in the package, which is what reading it by its
+/// name did.
+#[test]
+fn a_filter_by_a_keyword_named_like_a_metaclass_asks_for_the_keyword() {
+    let ws = ws(&[
+        (
+            "lib.kerml",
+            "standard library package KerML { metaclass Step; }\n",
+        ),
+        (
+            "m.sysml",
+            "package G {\n\
+             \tmetadata def Step;\n\
+             \tpackage Src { #Step part def Stepped; action plainAction; }\n\
+             \tpackage Mine { import Src::*[@Step]; part a : Stepped; action b :> plainAction; }\n\
+             \tpackage Its { import Src::*[@KerML::Step]; action b :> plainAction; }\n\
+             }\n",
+        ),
+    ]);
+    let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    assert_eq!(names, ["plainAction"]);
+}
+
+/// An alias chain resolves whichever way round it is written. Written
+/// front to back -- `alias A0 for A1; ... alias A1999 for X;` -- each link
+/// is worked out inside the one before it, and the walk must not run out
+/// of depth, leaving all but the last links naming nothing, at a cost
+/// that grows with the square of the chain. A chain that closes on itself
+/// still names nothing, however long it is.
+#[test]
+fn an_alias_chain_resolves_in_whatever_order_it_is_written() {
+    let n = 2000;
+    let mut text = String::from("package D {\n\tpart def X;\n");
+    for i in 0..n {
+        text.push_str(&format!("\talias A{i} for A{};\n", i + 1));
+    }
+    text.push_str(&format!("\talias A{n} for X;\n\tpart first : A0;\n"));
+    let ring = 2000;
+    for i in 0..ring {
+        text.push_str(&format!("\talias R{i} for R{};\n", (i + 1) % ring));
+    }
+    text.push_str("\talias S for T;\n\talias T for S;\n\tpart lost : R0;\n}\n");
+    let started = std::time::Instant::now();
+    let ws = ws(&[("m.sysml", &text)]);
+    let mut names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut expected: Vec<String> = (0..ring).map(|i| format!("R{i}")).collect();
+    expected.extend(["S".to_string(), "T".to_string()]);
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+/// `disjoint from` says a type is not the other, so nothing of the
+/// other's is inherited through it. Read as a specialization, every
+/// occurrence would have the `self` of a data value beside its own, because the
+/// library writes `class Occurrence specializes Anything disjoint from
+/// DataValue`.
+#[test]
+fn a_disjoint_type_inherits_nothing_of_what_it_is_disjoint_from() {
+    let ws = ws(&[(
+        "m.kerml",
+        "package K {\n\
+         \tclassifier A { feature a; }\n\
+         \tclassifier B { feature b; }\n\
+         \tclassifier C specializes B disjoint from A { feature p subsets b; feature q subsets a; }\n\
+         }\n",
+    )]);
+    let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    assert_eq!(names, ["a"]);
+}
+
+/// `featured by` says whose feature a feature is and `inverse of` that it
+/// runs the other way along the same pairs; neither says it is one of the
+/// other. Read as specializations, `fb` below would have the
+/// `b` of a `B` and `h` the `a` of an `A`, and a name only the featuring
+/// type or the inverted feature's type declares would resolve inside it.
+#[test]
+fn featuring_and_inverting_types_are_not_inherited_from() {
+    let ws = ws(&[(
+        "m.kerml",
+        "package K {\n\
+         \tclassifier A { feature a; }\n\
+         \tclassifier B { feature b; }\n\
+         \tfeature g : A;\n\
+         \tfeature fb : A featured by B { feature p subsets a; feature q subsets b; }\n\
+         \tfeature h : B inverse of g { feature r subsets b; feature s subsets a; }\n\
+         }\n",
+    )]);
+    let names: Vec<&str> = ws.unresolved().iter().map(|u| u.name.as_str()).collect();
+    assert_eq!(names, ["b", "a"]);
+}
+
+/// What a connector relates it relates through ends, and the two
+/// languages stand a different element for one. SysML writes
+/// `ConnectorEnd : ReferenceUsage` -- an end refers to what it connects
+/// and is not part of the connection -- and KerML `ConnectorEnd :
+/// Feature`. Built as a plain `Feature` in either, a SysML end was an
+/// element its own grammar never writes, and exported as one.
+#[test]
+fn a_connector_end_is_the_element_its_language_writes() {
+    let ends_of = |name: &str, text: &str| {
+        let ws = ws(&[(name, text)]);
+        let model = ws.model();
+        let mut kinds: Vec<ElementKind> = model
+            .ids()
+            .filter(|&id| {
+                model.kind(id).is_a(ElementKind::Connector)
+                    && model
+                        .owner(id)
+                        .is_some_and(|it| model.name(it) == Some("s"))
+            })
+            .flat_map(|connector| model.owned(connector).to_vec())
+            .filter(|&it| model.maybe(it, "isEnd") == Some(&sysml_model::Value::Bool(true)))
+            .map(|it| model.kind(it))
+            .collect();
+        kinds.sort_by_key(|kind| kind.name());
+        kinds
+    };
+    // `connect`, `bind`, `first ... then` and a chain end alike
+    assert_eq!(
+        ends_of(
+            "m.sysml",
+            "part def P { part a { part x; } part b; }\n\
+             part s : P {\n\
+             \tconnect a.x to b;\n\
+             \tbind a = b;\n\
+             \tfirst a then b;\n\
+             }\n",
+        ),
+        [ElementKind::ReferenceUsage; 6]
+    );
+    assert_eq!(
+        ends_of(
+            "m.kerml",
+            "classifier P { feature a { feature x; } feature b; }\n\
+             feature s : P {\n\
+             \tconnector a.x to b;\n\
+             \tbinding a = b;\n\
+             \tsuccession a then b;\n\
+             }\n",
+        ),
+        [ElementKind::Feature; 6]
+    );
+}
+
+/// A connector whose end resolved to nothing is not judged by how many
+/// ends it has.
+///
+/// `succession step1 then camera.focusedState;` relates two features as
+/// written. Where `camera.focusedState` names nothing -- the official
+/// KerML and SysML corpora loaded into one workspace each declare a
+/// `Camera`, and the KerML one is shadowed -- the unresolved name is
+/// already reported, and counting what was found said the succession
+/// related one feature, a violation of `validateConnectorRelatedFeatures`
+/// no model ever wrote.
+#[test]
+fn a_connector_with_an_end_that_resolves_to_nothing_is_not_counted_short() {
+    let mut ws = ws(&[(
+        "s.kerml",
+        "behavior B {\n\tstep s1;\n\tsuccession s1 then nowhere.nothing;\n}\n",
+    )]);
+    assert_eq!(ws.unresolved().len(), 1, "{:?}", ws.unresolved());
+    let checked = ws.check_rules(&[0]);
+    let fired: Vec<&str> = checked.violations.iter().map(|it| it.rule).collect();
+    assert!(
+        !fired.contains(&"validateConnectorRelatedFeatures"),
+        "{fired:?}"
+    );
+}
+
+/// `port pt : ~PD;` types the port by the conjugate of `PD`, and the
+/// grammar gives that typing a metaclass of its own: `ConjugatedPortTyping
+/// : ConjugatedPortTyping = '~' originalPortDefinition = ~[QualifiedName]`.
+/// Built as a plain `FeatureTyping`, the model said nothing a reader of
+/// the abstract syntax could tell from `port pt : PD;` but the name of
+/// the type. It is still a typing, so whatever reads the type of one --
+/// [`sysml_model::Model::types_of`], and what `pt.x` resolves through --
+/// reads this one too.
+#[test]
+fn a_port_typed_by_a_conjugate_is_typed_by_a_conjugated_port_typing() {
+    let ws = ws(&[(
+        "p.sysml",
+        "package P {\n\
+         \tattribute def V;\n\
+         \tport def PD { out attribute x : V; }\n\
+         \tpart def A {\n\
+         \t\tport pt : ~PD;\n\
+         \t\tattribute y = pt.x;\n\
+         \t}\n\
+         }\n",
+    )]);
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let model = ws.model();
+    let pt = model
+        .ids()
+        .find(|&id| model.name(id) == Some("pt"))
+        .expect("`pt` is declared");
+    let conjugate = model
+        .ids()
+        .find(|&id| model.kind(id) == ElementKind::ConjugatedPortDefinition)
+        .expect("`PD` owns its conjugate");
+    let typings: Vec<sysml_model::ElementId> = model
+        .owned(pt)
+        .iter()
+        .copied()
+        .filter(|&it| model.kind(it).is_a(ElementKind::FeatureTyping))
+        .filter(|&it| model.maybe(it, "isImplied") != Some(&sysml_model::Value::Bool(true)))
+        .collect();
+    assert_eq!(typings.len(), 1, "one typing is written");
+    let typing = typings[0];
+    assert_eq!(model.kind(typing), ElementKind::ConjugatedPortTyping);
+    for (property, want) in [
+        ("typedFeature", pt),
+        ("type", conjugate),
+        ("conjugatedPortDefinition", conjugate),
+    ] {
+        assert_eq!(
+            model.maybe(typing, property).and_then(|v| v.as_id()),
+            Some(want),
+            "`{property}`"
+        );
+    }
+    // and it is a typing for whatever reads one
+    assert!(model.types_of(pt).any(|it| it == conjugate));
+    let x = model
+        .ids()
+        .find(|&id| model.name(id) == Some("x"))
+        .expect("`x` is declared");
+    assert!(
+        ws.references_to(x).count() >= 1,
+        "`pt.x` reaches the `x` of `PD`"
+    );
+}
+
+/// `feature sub subsets f.x;` names a chain, and the grammar has it as the
+/// relationship's own: `ownedRelatedElement += OwnedFeatureChain`, with
+/// each step a `FeatureChaining` under it, as `chains f.x` writes them.
+/// Stood up before the relationship, the chain was owned by `sub` through a
+/// `FeatureMembership` -- so `sub` would have a feature named `x` among its
+/// `ownedFeature`s that nothing wrote -- and no chainings at all.
+#[test]
+fn a_chain_written_in_a_declaration_is_owned_by_the_relationship() {
+    for (file, text, kind, target) in [
+        (
+            "c.kerml",
+            "package P {\n\
+             \tclassifier A { feature x; }\n\
+             \tfeature f : A;\n\
+             \tfeature sub subsets f.x;\n\
+             }\n",
+            ElementKind::Subsetting,
+            "subsettedFeature",
+        ),
+        (
+            "c.sysml",
+            "package P {\n\
+             \tpart def A { part x; }\n\
+             \tpart f : A;\n\
+             \tref sub ::> f.x;\n\
+             }\n",
+            ElementKind::ReferenceSubsetting,
+            "referencedFeature",
+        ),
+    ] {
+        let mut ws = ws(&[(file, text)]);
+        // and a second pass does the same work over without doubling it
+        ws.resolve_all();
+        assert!(ws.unresolved().is_empty(), "{file}: {:?}", ws.unresolved());
+        let model = ws.model();
+        let named = |want: &str| {
+            model
+                .ids()
+                .find(|&id| model.name(id) == Some(want))
+                .unwrap_or_else(|| panic!("`{want}` is declared"))
+        };
+        let (sub, f, x) = (named("sub"), named("f"), named("x"));
+        let features: Vec<sysml_model::ElementId> = model
+            .owned(sub)
+            .iter()
+            .copied()
+            .filter(|&it| model.kind(it).is_a(ElementKind::Feature))
+            .collect();
+        assert!(
+            features.is_empty(),
+            "{file}: `sub` owns no feature: {features:?}"
+        );
+        let relationships: Vec<sysml_model::ElementId> = model
+            .owned(sub)
+            .iter()
+            .copied()
+            .filter(|&it| model.kind(it) == kind)
+            .collect();
+        assert_eq!(relationships.len(), 1, "{file}: one {kind:?}");
+        let relationship = relationships[0];
+        let chain = model
+            .maybe(relationship, target)
+            .and_then(|v| v.as_id())
+            .expect("the relationship names the chain");
+        assert_eq!(model.kind(chain), ElementKind::Feature, "{file}");
+        assert_eq!(model.owner(chain), Some(relationship), "{file}");
+        assert_eq!(model.chaining_feature(chain), [f, x], "{file}");
+        let chainings: Vec<(
+            Option<sysml_model::ElementId>,
+            Option<sysml_model::ElementId>,
+        )> = model
+            .owned(chain)
+            .iter()
+            .copied()
+            .filter(|&it| model.kind(it) == ElementKind::FeatureChaining)
+            .map(|it| {
+                (
+                    model.maybe(it, "featureChained").and_then(|v| v.as_id()),
+                    model.maybe(it, "chainingFeature").and_then(|v| v.as_id()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chainings,
+            [(Some(chain), Some(f)), (Some(chain), Some(x))],
+            "{file}: a chaining for each step"
+        );
+    }
+}
+
+/// `connect [1] p1 to [0..*] p2;` counts each end where it is written:
+/// `ConnectorEnd = ( ownedRelationship += OwnedCrossMultiplicityMember )?
+/// ...`, and `OwnedCrossMultiplicity : Feature = ownedRelationship +=
+/// OwnedMultiplicity` -- a feature of no name holding the range, owned by
+/// the end through a plain `OwningMembership`. The connection itself is
+/// counted by none of them, and `interface [3] p1 to [4] p2;`, which writes
+/// no keyword before its first end, counts that end as well.
+#[test]
+fn what_is_written_before_an_end_counts_that_end() {
+    let bounds = |model: &sysml_model::Model, holder: sysml_model::ElementId| {
+        let range = model
+            .maybe(holder, "multiplicity")
+            .and_then(|v| v.as_id())
+            .expect("a range");
+        ["bound", "lowerBound", "upperBound"]
+            .iter()
+            .filter_map(|it| model.maybe(range, it).and_then(|v| v.as_id()))
+            .map(|bound| match model.maybe(bound, "value") {
+                Some(sysml_model::Value::Int(n)) => n.to_string(),
+                _ => match model.kind(bound) {
+                    ElementKind::LiteralInfinity => "*".to_string(),
+                    other => format!("{other:?}"),
+                },
+            })
+            .collect::<Vec<String>>()
+            .join("..")
+    };
+    let mut ws = ws(&[(
+        "c.sysml",
+        "part def A {\n\
+         \tattribute n;\n\
+         \tpart p1;\n\
+         \tpart p2;\n\
+         \tconnection c connect [1] p1 to [0..*] p2;\n\
+         \tinterface i : I [2] connect [n] p1 to p2;\n\
+         \tinterface [3] p1 to [4] p2;\n\
+         }\n\
+         interface def I;\n",
+    )]);
+    // and a second pass does the same work over without doubling it
+    ws.resolve_all();
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let model = ws.model();
+    let connectors: Vec<sysml_model::ElementId> = model
+        .ids()
+        .filter(|&id| model.kind(id).is_a(ElementKind::ConnectionUsage))
+        .filter(|&id| ws.element_file(id) == Some(0))
+        .collect();
+    let mut seen = Vec::new();
+    for connector in connectors {
+        let own = model
+            .maybe(connector, "multiplicity")
+            .map(|_| bounds(model, connector));
+        let ends: Vec<Option<String>> = model
+            .owned(connector)
+            .iter()
+            .copied()
+            .filter(|&it| model.flag(it, "isEnd"))
+            .map(|end| {
+                let crossing: Vec<sysml_model::ElementId> = model
+                    .owned(end)
+                    .iter()
+                    .copied()
+                    .filter(|&it| model.kind(it) == ElementKind::Feature)
+                    .collect();
+                assert!(crossing.len() <= 1, "one cross multiplicity at most");
+                crossing.first().map(|&cross| {
+                    assert_eq!(
+                        sysml_model::membership_kind(model, cross),
+                        ElementKind::OwningMembership,
+                        "`OwnedCrossMultiplicityMember : OwningMembership`"
+                    );
+                    bounds(model, cross)
+                })
+            })
+            .collect();
+        // nothing counts the end that writes no `[n]`, and the builder
+        // leaves no cross multiplicity unclaimed beside the ends
+        assert!(model
+            .owned(connector)
+            .iter()
+            .all(|&it| model.kind(it) != ElementKind::Feature));
+        seen.push((model.name(connector).map(str::to_string), own, ends));
+    }
+    let expected = |name: Option<&str>, own: Option<&str>, ends: [Option<&str>; 2]| {
+        (
+            name.map(str::to_string),
+            own.map(str::to_string),
+            ends.iter()
+                .map(|it| it.map(str::to_string))
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        seen,
+        [
+            expected(Some("c"), None, [Some("1"), Some("0..*")]),
+            expected(
+                Some("i"),
+                Some("2"),
+                [Some("FeatureReferenceExpression"), None]
+            ),
+            expected(None, None, [Some("3"), Some("4")]),
+        ]
+    );
+    // and the name a bound writes is a reference like any other
+    let n = model
+        .ids()
+        .find(|&id| model.name(id) == Some("n"))
+        .expect("`n` is declared");
+    assert_eq!(ws.references_to(n).count(), 1, "`[n]` names `n`");
+}
+
+/// An end the connector writes as a declaration is counted the same way as
+/// one written as a plain name. `ConnectorEnd = OwnedCrossMultiplicityMember?
+/// ( declaredName = NAME REFERENCES )? ownedReferenceSubsetting` gives the
+/// end no multiplicity of its own to write, so the `[5]` of `connect ([5]
+/// p1, [6] p2)` and the `[1]` of `connect [1] e ::> p1.q to ...` are cross
+/// multiplicities, and the end itself is one thing like any other --
+/// `validateFeatureEndMultiplicity`. Kept as the end's own, `[5]` said the
+/// end was five things; written in front of a named end, the `[1]` was not
+/// kept at all. And the plain `p2` written beside a declared end is an end
+/// of its own, not a second name for the declared one.
+#[test]
+fn an_end_written_as_a_declaration_is_counted_where_it_is_written() {
+    let bounds = |model: &sysml_model::Model, holder: sysml_model::ElementId| {
+        let range = model
+            .maybe(holder, "multiplicity")
+            .and_then(|v| v.as_id())
+            .expect("a range");
+        ["bound", "lowerBound", "upperBound"]
+            .iter()
+            .filter_map(|it| model.maybe(range, it).and_then(|v| v.as_id()))
+            .map(|bound| match model.maybe(bound, "value") {
+                Some(sysml_model::Value::Int(n)) => n.to_string(),
+                _ => match model.kind(bound) {
+                    ElementKind::LiteralInfinity => "*".to_string(),
+                    other => format!("{other:?}"),
+                },
+            })
+            .collect::<Vec<String>>()
+            .join("..")
+    };
+    let mut ws = ws(&[
+        (
+            "c.sysml",
+            "part def A {\n\
+             \tpart p1 { port q; }\n\
+             \tpart p2;\n\
+             \tconnection c connect ([5] p1, [6] p2);\n\
+             \tconnection d connect [1] e ::> p1.q to [2] p2;\n\
+             \tconnection f connect [0..*] g ::> p2 to p1;\n\
+             }\n",
+        ),
+        (
+            "k.kerml",
+            "classifier K {\n\
+             \tfeature p1;\n\
+             \tfeature p2;\n\
+             \tconnector h from [3] y references p1 to [4] z references p2;\n\
+             \tconnector i ([7] x ::> p1, p2);\n\
+             }\n",
+        ),
+    ]);
+    // and a second pass does the same work over without doubling it
+    ws.resolve_all();
+    assert!(ws.unresolved().is_empty(), "{:?}", ws.unresolved());
+    let model = ws.model();
+    let mut seen = Vec::new();
+    for connector in model
+        .ids()
+        .filter(|&id| model.kind(id).is_a(ElementKind::Connector))
+        .filter(|&id| ws.element_file(id).is_some())
+    {
+        let own = model
+            .maybe(connector, "multiplicity")
+            .map(|_| bounds(model, connector));
+        assert_eq!(own, None, "nothing written counts the connection itself");
+        let ends: Vec<(String, Option<String>)> = model
+            .owned(connector)
+            .iter()
+            .copied()
+            .filter(|&it| model.flag(it, "isEnd"))
+            .map(|end| {
+                let crossing: Vec<sysml_model::ElementId> = model
+                    .owned(end)
+                    .iter()
+                    .copied()
+                    .filter(|&it| model.kind(it) == ElementKind::Feature)
+                    .filter(|&it| {
+                        sysml_model::membership_kind(model, it) == ElementKind::OwningMembership
+                    })
+                    .collect();
+                assert!(crossing.len() <= 1, "one cross multiplicity at most");
+                (
+                    bounds(model, end),
+                    crossing.first().map(|&it| bounds(model, it)),
+                )
+            })
+            .collect();
+        seen.push((model.name(connector).map(str::to_string), ends));
+    }
+    let one = || "1..1".to_string();
+    let cross = |it: &str| Some(it.to_string());
+    let named = |it: &str| Some(it.to_string());
+    assert_eq!(
+        seen,
+        [
+            (named("c"), vec![(one(), cross("5")), (one(), cross("6"))]),
+            (named("d"), vec![(one(), cross("1")), (one(), cross("2"))]),
+            (named("f"), vec![(one(), cross("0..*")), (one(), None)]),
+            (named("h"), vec![(one(), cross("3")), (one(), cross("4"))]),
+            (named("i"), vec![(one(), cross("7")), (one(), None)]),
+        ]
+    );
+}
+
+/// Two functions that specialize each other hand back no result between
+/// them, and an invocation of one is typed by it without going round the
+/// two for ever.
+#[test]
+fn functions_that_specialize_each_other_hand_back_nothing() {
+    let text =
+        "package P {\n    calc def F :> G;\n    calc def G :> F;\n    attribute x = F();\n}\n";
+    let ws = ws(&[("m.sysml", text)]);
+    let names: Vec<&str> = ws.unresolved().iter().map(|it| it.name.as_str()).collect();
+    assert!(names.is_empty(), "{names:?}");
+}
+
+/// An alias reached through `A::**` stands for what it names, and one
+/// that names nothing is passed over as though it were not there, rather
+/// than taken for what was asked.
+#[test]
+fn an_alias_reached_below_that_names_nothing_is_passed_over() {
+    let text = "package P {\n    package A { package B { alias X for Nope; } }\n    package C {\n        import A::**;\n        attribute y : X;\n    }\n}\n";
+    let ws = ws(&[("m.sysml", text)]);
+    let mut names: Vec<&str> = ws.unresolved().iter().map(|it| it.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Nope", "X"]);
 }

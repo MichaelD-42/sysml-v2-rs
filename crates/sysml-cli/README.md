@@ -1,7 +1,8 @@
 # sysmlv2-cli
 
 `sysml` command-line tool (`parse`, `fmt`, `check`, `stats`, `export`,
-`diagram`, `import-rust`, `rustgen`, `api`, `mcp`, `corpus`); `mcp`
+`import`, `diagram`, `plan`, `codegen`, `rustgen`, `import-rust`,
+`import-code`, `api`, `mcp`, `corpus`); `mcp`
 speaks the Model Context Protocol over stdio, so an AI agent can ask
 whether a model parses and resolves, what names are legal at a point,
 what shape a definition has once it is resolved, and what the standard
@@ -43,12 +44,25 @@ help: did you mean `Cars::Wheel`?
 To a program, under `--format json`, which every subcommand takes: each
 finding placed by `offset`, `line` and `column` and by where it *ends*,
 so the span can be underlined again without lexing the line, and each
-unresolved name carrying `declaredAs` and `didYouMean`. `check` also
+unresolved name carrying `declared_as` and `did_you_mean`. Every key this
+tool names is in `snake_case`, here and in what `sysml mcp` answers; only
+the standard JSON of `export` keeps the metamodel's own names
+(`declaredName`, `@id`). `check` also
 says which standard library answered it, since without one every
 reference into the library reads as unresolved.
 
 `--color auto|always|never` decides the colour; `auto` is what a
 terminal gets, and `NO_COLOR` is honoured.
+
+`sysml import-code` takes code in any language the way Doxygen takes a
+language it has never heard of: through a program that writes what the
+tool already reads. That is a surface -- what the code declares, as
+JSON, in no language in particular -- or the SysML itself; the importer
+is `sysml-import-<lang>` on `PATH`, named after the inputs' extension
+unless `--lang` or `--via` says otherwise, and what it writes is checked
+against the standard library before it is written out. `--schema` prints
+what a surface is, and `import-rust --surface` writes the one the Rust
+importer reads off a crate.
 
 `sysml plan` says what a model implies for code, in no language in
 particular: every definition's shape, its features with their

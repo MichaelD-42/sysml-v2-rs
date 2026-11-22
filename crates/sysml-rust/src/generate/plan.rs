@@ -32,6 +32,16 @@ impl<'a> Generator<'a> {
                     ElementKind::CalculationDefinition => Shape::Calculation,
                     ElementKind::ConstraintDefinition => Shape::Calculation,
                     ElementKind::ActionDefinition => Shape::Action,
+                    // and so is one that specializes a primitive: `attribute
+                    // def Kg :> Real;` is a number, and as a struct with no
+                    // fields it was a `Kg {}` that `= 1.0` did not compile
+                    // against
+                    ElementKind::AttributeDefinition
+                        if crate::quantity::is_scalar_quantity(model, id)
+                            || sysml_model::library_primitive(model, id).is_some() =>
+                    {
+                        Shape::Quantity
+                    }
                     // an interface or a connection definition is a pair
                     // of ends and whatever they carry -- a struct like
                     // any other definition with features
@@ -232,7 +242,7 @@ impl<'a> Generator<'a> {
 
         // the struct's own API ports come first
         let mut at = 0;
-        for &child in self.model.owned(def) {
+        for child in self.members(def) {
             if self.model.kind(child) != ElementKind::PortUsage {
                 continue;
             }
@@ -432,9 +442,7 @@ impl<'a> Generator<'a> {
     /// Whether the type of `field` says it already has `trait_name`.
     /// Only a bound type is asked: what this generator wrote, it knows.
     fn field_type_claims(&self, field: &Field, trait_name: &str) -> bool {
-        self.model
-            .type_of(field.usage)
-            .or_else(|| self.model.type_of(redefined(self.model, field.usage)?))
+        held_type(self.model, field.usage)
             .and_then(|ty| binding(self.model, ty))
             .is_some_and(|bound| binding::claims(&bound, trait_name))
     }
@@ -454,8 +462,7 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let ports = self
-                    .model
-                    .owned(def)
+                    .members(def)
                     .iter()
                     .any(|&child| self.model.kind(child) == ElementKind::PortUsage);
                 let fields_fine = self.fields(def).is_some_and(|fields| {
@@ -480,7 +487,14 @@ impl<'a> Generator<'a> {
         }
     }
     fn field_defaultable(&self, field: &Field) -> bool {
-        if field.default.is_some() {
+        // a declared value starts the field only where its container
+        // holds one value; `[3]` holds three, and starts as its element
+        if field.default.is_some()
+            && matches!(
+                field.container,
+                Container::One | Container::Optional | Container::Many | Container::Array(1)
+            )
+        {
             return true;
         }
         match field.container {

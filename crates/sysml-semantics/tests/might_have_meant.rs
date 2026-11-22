@@ -135,7 +135,7 @@ fn a_qualified_name_is_answered_by_its_last_segment() {
 }
 
 /// Several names at once, because the walk over every declared name is
-/// what costs -- sixty thousand of them with the standard library
+/// what costs -- very many of them with the standard library
 /// loaded, once rather than once per name.
 #[test]
 fn several_names_are_answered_in_one_walk() {
@@ -231,4 +231,109 @@ fn a_short_name_is_not_near_every_other_short_name() {
         panic!("one name, one answer");
     };
     assert!(about.near.is_empty(), "{:?}", about.near);
+}
+
+/// Names are case-sensitive, so "declared as" -- the very name, wanting
+/// only an import -- is the exact spelling alone. `B` is not "declared
+/// as" the `b` being declared on the same line, or the quick fix would
+/// write `part b : b;`. Another case is a near miss, and the nearest.
+#[test]
+fn another_case_is_a_near_miss_not_the_name() {
+    let ws = resolved("part def A;\npart a : A;\npart b : B;\n");
+    let [about] = &ws.suggestions(&["B".to_string()])[..] else {
+        panic!("one name, one answer");
+    };
+    assert!(about.elsewhere.is_empty(), "{about:?}");
+    assert_eq!(
+        about.near.first().map(String::as_str),
+        Some("b"),
+        "{about:?}"
+    );
+}
+
+/// What no qualified name can reach is no answer: a member of something
+/// that has no name, or a private one, which no import brings in.
+#[test]
+fn what_cannot_be_named_from_outside_is_not_offered() {
+    let ws = resolved(
+        "package P {\n\
+         \tprivate part def Hidden;\n\
+         \tpart { part def Inside; }\n\
+         }\n\
+         part h : Hidden;\n\
+         part i : Inside;\n",
+    );
+    for (name, about) in ["Hidden", "Inside"]
+        .iter()
+        .zip(ws.suggestions(&["Hidden".to_string(), "Inside".to_string()]))
+    {
+        assert!(about.elsewhere.is_empty(), "{name}: {about:?}");
+        assert!(about.near.is_empty(), "{name}: {about:?}");
+    }
+}
+
+/// A name that reaches the wrong kind of thing is spelt right and in
+/// scope, so neither "declared as ... an import would" nor "did you mean"
+/// is the answer; what it names is. A definition specializes a classifier
+/// (`Subclassification::superclassifier : Classifier`), so `part def B :>
+/// a;` naming a part usage names nothing -- though a name resolves -- and a
+/// usage subsets a feature.
+#[test]
+fn a_name_of_the_wrong_kind_of_thing_says_what_it_names() {
+    let ws = resolved(
+        "package P {\n\
+         \tpart a;\n\
+         \tpart def A;\n\
+         \tpart def B :> a;\n\
+         \tpart b :> A;\n\
+         \tpart def C :> A;\n\
+         }\n",
+    );
+    let missed: Vec<(&str, Option<sysml_model::ElementKind>)> = ws
+        .unresolved()
+        .iter()
+        .map(|it| (it.name.as_str(), it.wrong_kind.map(|(_, kind)| kind)))
+        .collect();
+    assert_eq!(
+        missed,
+        [
+            ("a", Some(sysml_model::ElementKind::Classifier)),
+            ("A", Some(sysml_model::ElementKind::Feature)),
+        ]
+    );
+    let said = ws
+        .wrong_kind_at(ws.unresolved()[0].file, ws.unresolved()[0].range)
+        .unwrap();
+    assert_eq!(
+        said,
+        "it names `P::a`, a `PartUsage`, where only a `Classifier` can stand"
+    );
+    // and a name that is merely missing has nothing of the kind to say
+    let ws = resolved("part x : Nope;\n");
+    let nope = &ws.unresolved()[0];
+    assert!(nope.wrong_kind.is_none());
+    assert_eq!(ws.wrong_kind_at(nope.file, nope.range), None);
+}
+
+/// A feature chain is reported as written, `a.cc` and not `a::cc`, and
+/// what is offered for it is written the same way: `a.c`. Spelled from
+/// the root, `A::c` put in its place subsets the definition's feature
+/// rather than `a`'s.
+#[test]
+fn a_chain_is_reported_and_mended_as_a_chain() {
+    let ws = resolved("part def A { part c; }\npart a : A;\npart z :> a.cc;\n");
+    let missed: Vec<String> = ws.unresolved().iter().map(|u| u.name.clone()).collect();
+    assert_eq!(missed, ["a.cc"]);
+    let [about] = &ws.suggestions(&missed)[..] else {
+        panic!("one name, one answer");
+    };
+    assert_eq!(
+        about.near.first().map(String::as_str),
+        Some("a.c"),
+        "{about:?}"
+    );
+    assert!(about.elsewhere.is_empty(), "{about:?}");
+    // a qualified name is still one
+    let ws = resolved("package P { part def C; }\npart x : P::Cc;\n");
+    assert_eq!(ws.unresolved()[0].name, "P::Cc");
 }

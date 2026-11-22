@@ -27,9 +27,9 @@ fn named(ws: &Workspace, qualified: &str) -> sysml_model::ElementId {
 /// that: the answer is the whole chain and not the first step of it.
 ///
 /// This is the part that has to be walked rather than scanned for. It
-/// used to be walked by scanning the whole model once per step, which on
-/// a model with the standard library in it cost a millisecond and a
-/// quarter per step -- in the rename an editor is waiting on.
+/// must not be walked by scanning the whole model once per step, which on
+/// a model with the standard library in it is costly per step -- in the
+/// rename an editor is waiting on.
 #[test]
 fn a_chain_of_redefinitions_all_answer_to_the_one_name() {
     let ws = resolved(
@@ -41,13 +41,11 @@ fn a_chain_of_redefinitions_all_answer_to_the_one_name() {
     );
     let base = named(&ws, "P::Base::component");
     let heirs = ws.named_after(base);
-    // They declare no name, so what tells them apart is what owns them.
-    // `?` is how a nameless element is spelled, and both of these are
-    // one -- which is the whole reason they answer to somebody else's
-    // name.
+    // They declare no name, so what tells them apart is what owns them:
+    // each is spelled by the name it borrows, under its own owner.
     let mut spelled: Vec<String> = heirs.iter().map(|&it| ws.qualified_name_of(it)).collect();
     spelled.sort();
-    assert_eq!(spelled, ["P::Leaf::?", "P::Middle::?"]);
+    assert_eq!(spelled, ["P::Leaf::component", "P::Middle::component"]);
 }
 
 /// A redefinition that declares a name of its own is its own name from

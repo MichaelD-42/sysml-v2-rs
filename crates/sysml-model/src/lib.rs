@@ -1,6 +1,6 @@
 //! In-memory element model (abstract syntax) for SysML v2 / KerML.
 //!
-//! The metamodel — [`ElementKind`] (175 metaclasses), their inheritance
+//! The metamodel — [`ElementKind`] (every metaclass), their inheritance
 //! hierarchy, feature metadata and enumerations — is generated from the
 //! official Ecore definition (see `vendor/metamodel/`, regenerate with
 //! `cargo run -p sysmlv2-model --features codegen --bin sysml-codegen`).
@@ -34,9 +34,9 @@ pub mod generated;
 ///
 /// Written from the keyword that declared it, so that the resolver and
 /// the interchange read one answer rather than each working it out from
-/// the syntax again -- they used to, and looked at different parts of
-/// it: one saw a `private` on the wrapper of a declaration, the other
-/// only on the declaration itself.
+/// the syntax again, since each would look at different parts of it:
+/// one sees a `private` on the wrapper of a declaration, the other only
+/// on the declaration itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Vis {
     /// `public`, and what nothing written means for a member
@@ -76,8 +76,8 @@ impl Vis {
 /// the ones their type declares, and the interchange, to write the
 /// membership metaclass the standard names for each. It is an enum
 /// rather than a string so that adding one is a compile error in both
-/// until they say what it means -- the three used to spell the same
-/// dozen words separately.
+/// until they say what it means -- spelling the same words separately
+/// in each would let them drift apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     /// `subject x;` -- what a requirement, use case or verification is about
@@ -190,10 +190,19 @@ pub fn membership_kind(model: &Model, owned: ElementId) -> ElementKind {
     // `validateDefinitionVariationOwnedFeatureMembership` -- "a
     // variation owns no feature membership" -- says of `#Security enum
     // def C` and of `variation part x[1]`.
+    //
+    // The check is on `MetadataFeature`, which `MetadataUsage` specializes:
+    // KerML's `#M class Tagged;` builds the former, and checked against the
+    // SysML one only it came out a feature of the class it annotates.
+    //
+    // The bounds of a multiplicity are its members and not its features
+    // either: `MultiplicityExpressionMember : OwningMembership`.
     if !model.kind(owned).is_a(ElementKind::Feature)
         || model.kind(owned).is_a(ElementKind::Multiplicity)
-        || model.kind(owned).is_a(ElementKind::MetadataUsage)
+        || model.kind(owned).is_a(ElementKind::MetadataFeature)
         || !owner_kind.is_a(ElementKind::Type)
+        || model.owning_member(owned)
+        || is_bound_of(model, owned)
     {
         return ElementKind::OwningMembership;
     }
@@ -222,15 +231,25 @@ pub fn membership_kind(model: &Model, owned: ElementId) -> ElementKind {
     ElementKind::FeatureMembership
 }
 
+/// Whether `owned` is a bound of the multiplicity range that owns it.
+fn is_bound_of(model: &Model, owned: ElementId) -> bool {
+    // what this is asked of is owned, so it has an owner
+    model.owner(owned).is_some_and(|range| {
+        model.kind(range).is_a(ElementKind::MultiplicityRange)
+            && ["bound", "lowerBound", "upperBound"]
+                .iter()
+                .any(|end| model.maybe(range, end) == Some(&Value::Ref(owned)))
+    })
+}
+
 /// The cross feature an end feature owns, where the notation wrote one.
 ///
 /// `ownedCrossFeature()` is "the first ownedMember of the Feature that is
 /// a Feature, but not a Multiplicity or a MetadataFeature, and whose
-/// owningMembership is not a FeatureMembership". This model works the
-/// memberships out from shape, so the last test has nothing to read -- but
-/// `end [1] part bead : TireBead;` writes the cross feature between the
-/// `end` and the declaration, so where one was written it is always the
-/// first member owned.
+/// owningMembership is not a FeatureMembership". The builder records which
+/// those are -- the `[1]` of `end [1] part bead : TireBead;`, and a
+/// `member feature` written in the end's body -- so a feature the end owns
+/// as one of its own, `end feature b { feature c; }`, is not taken for one.
 pub fn owned_cross_feature(model: &Model, end: ElementId) -> Option<ElementId> {
     if !model.flag(end, "isEnd") {
         return None;
@@ -238,8 +257,38 @@ pub fn owned_cross_feature(model: &Model, end: ElementId) -> Option<ElementId> {
     model.owned(end).iter().copied().find(|&it| {
         model.kind(it).is_a(ElementKind::Feature)
             && !model.kind(it).is_a(ElementKind::Multiplicity)
-            && !model.kind(it).is_a(ElementKind::MetadataUsage)
+            && !model.kind(it).is_a(ElementKind::MetadataFeature)
+            && !membership_kind(model, it).is_a(ElementKind::FeatureMembership)
     })
+}
+
+/// The stretch of a statement one of the actions it carries is written
+/// in, from the keyword that opens it: `accept` for a transition's
+/// trigger, `do` for its effect.
+///
+/// `transition first a accept s via p do send x via q then b;` writes two
+/// `via`s, and which action each belongs to is where it stands. Read off
+/// the whole statement, a trigger with no `via` of its own took the one
+/// the effect sends through.
+pub fn clause(
+    node: &sysml_syntax::SyntaxNode,
+    opens: sysml_syntax::SyntaxKind,
+) -> Option<sysml_syntax::TextRange> {
+    use sysml_syntax::SyntaxKind::*;
+    let mut parts = node
+        .children_with_tokens()
+        .skip_while(|part| part.kind() != opens);
+    let start = parts.next()?.text_range().start();
+    let end = parts
+        .find(|part| {
+            part.kind() != opens
+                && matches!(
+                    part.kind(),
+                    IF_KW | DO_KW | THEN_KW | ELSE_KW | COND_EXPR | BODY
+                )
+        })
+        .map_or(node.text_range().end(), |part| part.text_range().start());
+    Some(sysml_syntax::TextRange::new(start, end))
 }
 
 /// What an accept node waits for.
@@ -389,9 +438,9 @@ pub struct Multiplicity {
 /// The declared multiplicity of a usage, or nothing where none was
 /// written -- which the specification reads as one of the thing.
 ///
-/// Every generator asks this and each used to walk it for itself, and
-/// what a bound that is not a literal means was decided differently in
-/// each. It is read once here and interpreted by whoever asks.
+/// Every generator asks this; walking it separately in each would
+/// decide differently what a bound that is not a literal means. It is
+/// read once here and interpreted by whoever asks.
 pub fn declared_multiplicity(model: &Model, usage: ElementId) -> Option<Multiplicity> {
     let Some(Value::Ref(range)) = model.get(usage, "multiplicity") else {
         return None;
@@ -430,6 +479,46 @@ pub fn primitive(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The standard library primitive `ty` is, or specializes: the one of
+/// [`primitive`]'s names that `ScalarValues` declares.
+///
+/// By name alone, a model's own `Q::Real` with a real and an imaginary
+/// part was a `f64`, and a `part def String` the primitive string --
+/// what decides it is which package declares it. And `attribute def Kg
+/// :> Real;` is a `Real` as much as `Real` is, which reading the type's
+/// own name missed.
+pub fn library_primitive(model: &Model, ty: ElementId) -> Option<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([ty]);
+    while let Some(next) = queue.pop_front() {
+        if !seen.insert(next) {
+            continue;
+        }
+        let declared_by_the_library = model.owner(next).is_some_and(|package| {
+            model.name(package) == Some("ScalarValues")
+                && model
+                    .owner(package)
+                    .is_none_or(|root| model.owner(root).is_none())
+        });
+        if let Some(found) = model.name(next).and_then(primitive) {
+            if declared_by_the_library {
+                return Some(found);
+            }
+        }
+        for &owned in model.owned(next) {
+            if model.kind(owned).is_a(ElementKind::Specialization) {
+                queue.extend(
+                    model
+                        .maybe(owned, "superclassifier")
+                        .or_else(|| model.maybe(owned, "general"))
+                        .and_then(Value::as_id),
+                );
+            }
+        }
+    }
+    None
+}
+
 /// What a connector end reaches, in the order it reaches it.
 ///
 /// An end written as a chain -- `connect w.hub to a.mount` -- holds the
@@ -451,13 +540,18 @@ pub fn end_reaches(model: &Model, end: ElementId) -> Vec<ElementId> {
     // A flow end keeps the path to what it relates and the feature that
     // flows through it apart -- `FlowEnd = ( OwnedReferenceSubsetting
     // '.' )? FlowFeatureMember` -- and the notation wrote them as one
-    // name, which is what a reader of an end wants back.
+    // name, which is what a reader of an end wants back. What flows is a
+    // `Feature` in KerML and a `ReferenceUsage` in SysML, and the range
+    // counting the end one is a feature too.
     if model.kind(end) == ElementKind::FlowEnd {
         reached.extend(
             model
                 .owned(end)
                 .iter()
-                .filter(|&&child| model.kind(child) == ElementKind::Feature)
+                .filter(|&&child| {
+                    model.kind(child).is_a(ElementKind::Feature)
+                        && !model.kind(child).is_a(ElementKind::Multiplicity)
+                })
                 .flat_map(|&child| model.owned(child))
                 .filter(|&&it| model.kind(it) == ElementKind::Redefinition)
                 .filter_map(|&it| model.maybe(it, "redefinedFeature")?.as_id()),
@@ -538,6 +632,30 @@ impl Value {
         }
     }
 
+    /// The truth value, if this is one.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(it) => Some(*it),
+            _ => None,
+        }
+    }
+
+    /// The integer, if this is one.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(it) => Some(*it),
+            _ => None,
+        }
+    }
+
+    /// The real number, if this is one.
+    pub fn as_real(&self) -> Option<f64> {
+        match self {
+            Value::Real(it) => Some(*it),
+            _ => None,
+        }
+    }
+
     /// The element a single reference points at.
     pub fn as_id(&self) -> Option<ElementId> {
         match self {
@@ -578,6 +696,10 @@ struct MemberSide {
     /// The syntactic role that picks the membership's metaclass, when
     /// the member was declared in one. See [`Role`] for the roles.
     role: Option<Role>,
+    /// Whether the notation owns this feature through a plain
+    /// `OwningMembership` although its owner is a type. See
+    /// [`Model::set_owning_member`].
+    owning: bool,
 }
 
 /// Arena holding every element of one model.
@@ -636,6 +758,27 @@ impl Model {
         self.elements[id.index()].membership.role
     }
 
+    /// Record that `id` is a member of its owner without being one of its
+    /// features: owned through a plain `OwningMembership`.
+    ///
+    /// A type owns most of the features written in it through a
+    /// `FeatureMembership`, and the shape of the model says which ones it
+    /// does not -- a multiplicity, a metadata annotation, a bound. Two
+    /// productions say so with nothing the shape keeps: `TypeFeatureMember
+    /// : OwningMembership = MemberPrefix 'member' FeatureElement`, and
+    /// `OwnedCrossFeatureMember : OwningMembership`, the `[0..1]` of
+    /// `end b2[0..1] feature b`. Which is why it is recorded rather than
+    /// worked out, as the role is.
+    pub fn set_owning_member(&mut self, id: ElementId) {
+        self.elements[id.index()].membership.owning = true;
+    }
+
+    /// Whether `id` was declared a member and not a feature of its owner.
+    /// See [`Model::set_owning_member`].
+    pub fn owning_member(&self, id: ElementId) -> bool {
+        self.elements[id.index()].membership.owning
+    }
+
     /// Whether it holds none.
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
@@ -688,8 +831,8 @@ impl Model {
     /// a property the metaclass does not have is an error.
     ///
     /// So is a value of the wrong shape, where the assertions are on: the
-    /// metamodel says what each property holds, and until this checked it
-    /// `set(part, "isAbstract", Value::String("yes"))` was accepted and
+    /// metamodel says what each property holds, and without the check
+    /// `set(part, "isAbstract", Value::String("yes"))` would be accepted and
     /// written back out as a string where every reader expects a boolean.
     pub fn set(&mut self, id: ElementId, prop: &str, value: Value) -> &mut Model {
         let kind = self.kind(id);
@@ -800,14 +943,15 @@ impl Model {
     /// written.
     ///
     /// A typing is not a property on the feature: parsing reifies each
-    /// one as an owned [`ElementKind::FeatureTyping`] whose `type` is
-    /// filled in once the name resolves, which is where every reader of
-    /// a type has to look. A typing that never resolved is skipped, so
+    /// one as an owned [`ElementKind::FeatureTyping`] -- or the
+    /// [`ElementKind::ConjugatedPortTyping`] that specializes it, for
+    /// `port p : ~PD;` -- whose `type` is filled in once the name
+    /// resolves, which is where every reader of a type has to look. A typing that never resolved is skipped, so
     /// this yields fewer answers than the model wrote.
     pub fn types_of(&self, feature: ElementId) -> impl Iterator<Item = ElementId> + '_ {
         self.owned(feature)
             .iter()
-            .filter(|&&child| self.kind(child) == ElementKind::FeatureTyping)
+            .filter(|&&child| self.kind(child).is_a(ElementKind::FeatureTyping))
             .filter_map(|&child| self.get(child, "type").and_then(Value::as_id))
     }
 
@@ -870,6 +1014,15 @@ impl Model {
             }
             if !visited.insert(at) {
                 return None;
+            }
+            // a feature chain is named by the last feature it runs through:
+            // `perform a.b;` borrows the name `b`
+            if let Some(&last) = match self.maybe(at, "chainingFeature") {
+                Some(Value::RefList(chain)) => chain.last(),
+                _ => None,
+            } {
+                at = last;
+                continue;
             }
             at = self.owned(at).iter().find_map(|&rel| {
                 let target = match self.kind(rel) {
@@ -1107,7 +1260,7 @@ mod tests {
     }
 
     /// The metamodel says what each property holds. A value of another
-    /// shape used to be kept and written back out as itself -- an
+    /// shape is refused rather than kept and written back out as itself -- an
     /// `isAbstract` of `"yes"` where every reader expects a boolean.
     ///
     /// Only where the assertions are on: this is a check on the code
@@ -1121,10 +1274,10 @@ mod tests {
         model.set(part, "isAbstract", Value::String("yes".to_string()));
     }
 
-    /// There is no longer a role this does not know: `Role` is an
+    /// There is no role this does not know: `Role` is an
     /// enum and the match over it has no catch-all, so one added to the
     /// model does not fall through to plain ownership -- it stops the
-    /// build until this says which membership the standard names for it.
+    /// build until this match says which membership the standard names for it.
     /// What is left to check is the element that has no role at all.
     #[test]
     fn a_member_with_no_role_is_owned_plainly() {

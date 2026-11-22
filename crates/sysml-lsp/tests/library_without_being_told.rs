@@ -59,10 +59,10 @@ fn no_library_is_the_way_to_say_otherwise() {
 /// A library path that will not load falls back to the copy built in,
 /// rather than to no library at all.
 ///
-/// One mistyped `sysml.library.path` used to underline every name in
-/// every file, silently: the server degraded to an empty library and
-/// nothing anywhere said why. The command line and the MCP server had
-/// both stopped doing that; this was the front end left.
+/// One mistyped `sysml.library.path` must not underline every name in
+/// every file, silently: degrading to an empty library with nothing
+/// anywhere saying why. The command line and the MCP server do not do
+/// that, and this front end must not either.
 #[test]
 fn a_library_that_will_not_load_falls_back_to_the_one_built_in() {
     let found = diagnostics_for(json!({ "libraryPath": "/nowhere/at/all" }), REACHES);
@@ -92,6 +92,8 @@ fn a_library_that_cannot_be_read_falls_back_too() {
     let shut = std::env::temp_dir().join("sysml-lsp-library-shut");
     std::fs::create_dir_all(&shut).unwrap();
     let hidden = shut.join("hidden.sysml");
+    // a run that stopped before putting the mode back leaves it shut
+    let _ = std::fs::remove_file(&hidden);
     std::fs::write(&hidden, "package Hidden;\n").unwrap();
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
     let found = diagnostics_for(json!({ "libraryPath": shut.to_str().unwrap() }), REACHES);

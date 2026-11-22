@@ -44,18 +44,23 @@ fn check_shape(diagram: &Diagram, model: &Model, where_: &str) {
                 // `if c { ... }` is a node whether or not it was given a
                 // name, and the keyword above it says what it is; every
                 // other box has to name what it stands for
-                let may_be_nameless = matches!(
-                    model.kind(node.id),
-                    ElementKind::IfActionUsage
-                        | ElementKind::WhileLoopActionUsage
-                        | ElementKind::ForLoopActionUsage
-                );
+                // -- and so is a step of a flow written without one, `then
+                // assign ...`, `then send ...`, `then action { ... }` --
+                // but nothing that has a name may be drawn without it
+                let may_be_nameless = model.effective_name(node.id).is_none();
                 assert!(
                     !node.name.is_empty() || may_be_nameless,
                     "{where_}: a box with no name"
                 );
+                // -- and then `«parallel»` for a parallel state, or the
+                // `ordered`/`nonunique` that follow a multiplicity
                 let said = node.name.strip_prefix(name).is_some_and(|rest| {
-                    rest.is_empty() || rest.starts_with(" :") || rest.starts_with('[')
+                    rest.is_empty()
+                        || rest.starts_with(" :")
+                        || rest.starts_with('[')
+                        || [" \u{ab}parallel\u{bb}", " ordered", " nonunique"]
+                            .iter()
+                            .any(|after| rest.starts_with(after))
                 });
                 assert!(
                     said,
@@ -64,22 +69,34 @@ fn check_shape(diagram: &Diagram, model: &Model, where_: &str) {
                 );
             }
             // only the start marker is allowed to carry no label, and only
-            // a succession can put one there
+            // a succession can put one there -- or the `start` every action
+            // inherits, which is what one leaves from
             Shape::Initial => {
                 assert!(node.name.is_empty(), "{where_}: a marker with a name");
-                assert_eq!(
-                    model.kind(node.id),
-                    ElementKind::SuccessionAsUsage,
-                    "{where_}: a start marker that is not a succession"
+                assert!(
+                    model.kind(node.id) == ElementKind::SuccessionAsUsage
+                        || model.name(node.id) == Some("start"),
+                    "{where_}: a start marker that is neither a succession nor `start`"
                 );
             }
+            // and the end marker is the `done` every action inherits
+            Shape::Final => {
+                assert!(node.name.is_empty(), "{where_}: a marker with a name");
+                assert_eq!(model.name(node.id), Some("done"), "{where_}");
+            }
             // the dot three or more ends meet at, named -- when it is
-            // named at all -- by the connection itself
+            // named at all -- by the connection itself; a dependency's
+            // goes on to name the ends that are off the canvas, `from ...`
+            // and `to ...`, which is all that is said of them
             Shape::ConnectionDot => {
                 let name = model.effective_name(node.id).unwrap_or_default();
-                assert_eq!(
-                    node.name, name,
-                    "{where_}: a connection dot that is not named by its connection"
+                let rest = node.name.strip_prefix(name).map(str::trim_start);
+                assert!(
+                    rest.is_some_and(|rest| rest.is_empty()
+                        || (model.kind(node.id) == ElementKind::Dependency
+                            && (rest.starts_with("from ") || rest.starts_with("to ")))),
+                    "{where_}: a connection dot `{}` that is not named by its connection",
+                    node.name
                 );
             }
             // a note carries what a comment says or what a metadata
@@ -125,14 +142,18 @@ fn check_shape(diagram: &Diagram, model: &Model, where_: &str) {
         // A membership may land back on the box it left -- `part
         // subparts : Assembly;` inside `Assembly`, and `portion
         // focusedState : Camera` inside `Camera`, where a portion of a
-        // thing really is typed by the thing -- and only a membership
-        // may: a specialization of itself, a connection to itself or a
-        // transition to itself is a model saying nothing.
+        // thing really is typed by the thing -- and so may a transition:
+        // `state Wait; accept rs then Wait;` handles the event and stays.
+        // Nothing else may: a specialization of itself or a connection to
+        // itself is a model saying nothing.
         if edge.from == edge.to {
             assert!(
                 matches!(
                     edge.relation,
-                    Relation::Composition | Relation::Reference | Relation::Portion
+                    Relation::Composition
+                        | Relation::Reference
+                        | Relation::Portion
+                        | Relation::Transition
                 ),
                 "{where_}: a {:?} onto itself",
                 edge.relation
@@ -153,7 +174,8 @@ fn expected_specializations(model: &Model, drawn: &[ElementId]) -> Vec<(ElementI
             let Some(Value::Ref(supertype)) = model.maybe(relationship, "superclassifier") else {
                 continue;
             };
-            if drawn.contains(supertype) {
+            // `part def F :> A, A;` says one thing twice, and is one arrow
+            if drawn.contains(supertype) && !out.contains(&(subtype, *supertype)) {
                 out.push((subtype, *supertype));
             }
         }
@@ -197,7 +219,14 @@ fn definition_diagrams_are_faithful_to_their_models() {
         let definitions: Vec<ElementId> = model
             .descendants(ws.root())
             .into_iter()
-            .filter(|&id| model.kind(id).is_a(ElementKind::Classifier) && model.name(id).is_some())
+            // named, or short-named only (`part def <S>;` is a definition
+            // like any other); and not the conjugate `~PD` every port
+            // definition implies, which nobody declared
+            .filter(|&id| {
+                model.kind(id).is_a(ElementKind::Classifier)
+                    && model.kind(id) != ElementKind::ConjugatedPortDefinition
+                    && (model.name(id).is_some() || model.effective_short_name(id).is_some())
+            })
             .collect();
         assert_eq!(
             drawn, definitions,
@@ -230,7 +259,8 @@ fn specializes(model: &Model, sub: ElementId, sup: ElementId) -> bool {
         if current == sup {
             return true;
         }
-        queue.extend(model.type_of(current));
+        // every type: `in ref y : A, B;` is assembled from both
+        queue.extend(model.types_of(current));
         for &rel in model.owned(current) {
             if model.kind(rel) != sysml_model::ElementKind::Subclassification {
                 continue;

@@ -7,7 +7,7 @@
 //! file, so a document with a wide character in it lands in the wrong
 //! place unless every crossing goes through `placed`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lsp_types::*;
 use sysml_syntax::TextSize;
@@ -52,10 +52,10 @@ impl Server {
     /// A file with its lines found, kept for as long as the analysis it
     /// was read from.
     ///
-    /// Find-references and workspace-symbol answer with a hundred places
-    /// at a time, most of them in the same few files. Reading each file
-    /// out of the tree and counting its lines again for every one of
-    /// them was the greater part of what those two requests did.
+    /// Find-references and workspace-symbol answer with many places at a
+    /// time, most of them in the same few files. Reading each file out of
+    /// the tree and counting its lines again for every one of them would
+    /// be the greater part of what those two requests do.
     fn placed(&mut self, file: usize) -> Option<&Placed> {
         if !self.analysis().indexed.contains_key(&file) {
             let (url, text) = self.document(file)?;
@@ -70,36 +70,33 @@ impl Server {
     /// the declaration whose name covers the position.
     fn target_at(&mut self, uri: &Url, position: Position) -> Option<sysml_model::ElementId> {
         let (file, offset) = self.locate(uri, position)?;
-        let analysis = self.analysis();
-        analysis
-            .ws
-            .reference_at(file, offset)
-            .map(|r| r.target)
-            .or_else(|| analysis.ws.definition_at(file, offset))
+        self.analysis().ws.target_at(file, offset)
     }
+    /// Every place the element under the cursor is named, by its name
+    /// alone.
+    ///
+    /// The same places a rename rewrites, walked the same way. This
+    /// answered with the whole of `P::Wheel` or `a.b.c` where a rename
+    /// replaces `Wheel` or `c`, and left out what reaches the element
+    /// through a feature that borrows its name -- `l.component` where `l`
+    /// holds a `:>> component` -- which a rename does rewrite. Asked
+    /// before a rename, it under-reported what the rename would touch.
     pub(crate) fn references(
         &mut self,
         uri: &Url,
         position: Position,
         include_declaration: bool,
     ) -> Option<Vec<Location>> {
-        let target = self.target_at(uri, position)?;
-        let refs: Vec<(usize, sysml_syntax::TextRange)> = self
-            .analysis()
-            .ws
-            .references_to(target)
-            .map(|r| (r.file, r.range))
-            .collect();
+        let found = self.target_at(uri, position)?;
+        let ws = &self.analysis().ws;
+        let target = ws.model().naming_element(found).unwrap_or(found);
+        let declared = include_declaration
+            .then(|| ws.declared_at(target))
+            .flatten();
+        let places: Vec<(usize, TextRange)> =
+            declared.into_iter().chain(ws.mentions(target)).collect();
         let mut locations = Vec::new();
-        if include_declaration {
-            let analysis = self.analysis();
-            let decl = analysis
-                .ws
-                .element_file(target)
-                .zip(analysis.ws.element_ranges(target).map(|(_, name)| name));
-            locations.extend(decl.and_then(|(file, range)| self.location(file, range)));
-        }
-        for (file, range) in refs {
+        for (file, range) in places {
             locations.extend(self.location(file, range));
         }
         Some(locations)
@@ -109,150 +106,58 @@ impl Server {
     /// offered: the new name has to be a name, nothing already visible
     /// where the declaration stands may answer to it, and what is being
     /// renamed has to be the project's rather than the library's.
+    ///
+    /// The walk and each of those refusals are the workspace's, shared
+    /// with the MCP server's `rename`; what is decided here is only which
+    /// files this editor may write and how a range is counted in it.
     pub(crate) fn rename(
         &mut self,
         uri: &Url,
         position: Position,
         new_name: &str,
     ) -> Result<WorkspaceEdit, String> {
-        // What may stand there is what this file's lexer reads as one
-        // name and nothing else. Spelling the rule again here got it
-        // wrong three ways: `\u{540d}\u{524d}` passed a Unicode
-        // alphabetic test that the ASCII lexer refuses, so the rename
-        // was applied and the file stopped lexing; a quoted `'two
-        // words'` was refused although it is a name; and `frame` was
-        // refused in KerML, where it is not a keyword.
         let dialect = self.dialect_of(uri);
-        let (tokens, complaints) = sysml_syntax::lex_dialect(new_name, dialect);
-        match tokens.as_slice() {
-            [token]
-                if complaints.is_empty()
-                    && matches!(
-                        token.kind,
-                        sysml_syntax::SyntaxKind::IDENT
-                            | sysml_syntax::SyntaxKind::UNRESTRICTED_NAME
-                    ) => {}
-            [token] if dialect.is_keyword(token.kind) => {
-                return Err(format!("`{new_name}` is a keyword"))
-            }
-            _ => return Err(format!("`{new_name}` is not a name")),
+        // Refused before anything is looked up, so a name that is no name
+        // is said to be one whatever the cursor is on.
+        if let Some(why) = sysml_semantics::refuse_name(new_name, dialect) {
+            return Err(why);
         }
-
-        let Some(found) = self.target_at(uri, position) else {
+        let Some((file, offset)) = self.locate(uri, position) else {
             return Err("there is nothing to rename here".to_string());
         };
-        // A feature that declares no name answers to the name of what it
-        // redefines or references, and there is nothing in it to rewrite.
-        // Renaming is asked of the declaration that name came from, which
-        // is what every mention of it -- this one included -- follows.
-        let analysis = self.analysis();
-        let Some(target) = analysis.ws.model().naming_element(found) else {
-            return Err("that element declares no name to rename".to_string());
-        };
-        // A name reached through `alias X for Y;` resolves to Y, and
-        // nothing records that X was the way in. Renaming X would move
-        // the declaration and leave every use of it behind, so it is
-        // refused rather than half done.
-        if analysis.ws.is_alias(target) {
-            return Err("renaming an alias would leave what uses it behind".to_string());
-        }
-        let decl_file = analysis
+        let renaming = self
+            .analysis()
             .ws
-            .element_file(target)
-            .ok_or("that element belongs to no file".to_string())?;
-        let (_, decl_range) = analysis
-            .ws
-            .element_ranges(target)
-            .ok_or("that element declares no name to rename".to_string())?;
-        let mut edits: Vec<(usize, sysml_syntax::TextRange)> = vec![(decl_file, decl_range)];
-        edits.extend(
-            analysis
-                .ws
-                .references_to(target)
-                .map(|r| (r.file, r.name_range)),
-        );
-        // An unnamed redefinition answers to the name it redefines, so
-        // what names it names this too -- `l.component` where `l` holds
-        // a `:>> component`. Renaming the declaration without those is a
-        // model that no longer resolves.
-        for heir in analysis.ws.named_after(target) {
-            edits.extend(
-                analysis
-                    .ws
-                    .references_to(heir)
-                    .map(|r| (r.file, r.name_range)),
-            );
-        }
+            .prepare_rename(file, offset, new_name, dialect)?;
 
         // the declaration must be somewhere the editor may write --
         // library elements are not
-        if !self.writable(decl_file) {
+        if !self.writable(renaming.declared.0) {
             return Err("that element is declared outside the project".to_string());
         }
 
-        // a name already visible where the declaration stands would
-        // capture, or be captured by, the renamed one
-        let start = decl_range.start();
-        let taken = self
+        // An open document is in the notation its client declared for
+        // it, which its URL need not say; every other file is named by
+        // its path, whose suffix does.
+        let opened: Vec<(usize, Url)> = self
             .analysis()
-            .ws
-            .visible_names(decl_file, start)
-            .into_iter()
-            .any(|(name, _)| name == new_name);
-        if taken {
-            return Err(format!("`{new_name}` is already visible there"));
-        }
-        // The declaration's own scope is not the only place a capture
-        // can happen. Every mention of the element stands in a scope of
-        // its own, and one that already reaches something under the new
-        // name binds to that instead the moment it is rewritten --
-        // quietly, because the file still parses and still resolves.
-        let wanted = [new_name.to_string()];
-        for (file, range) in &edits {
-            let (file, at) = (*file, range.start());
-            if !looked_up_in_place(&self.analysis().ws, file, at) {
-                continue;
-            }
-            let ws = &mut self.analysis().ws;
-            let scope = ws.innermost_element(file, at);
-            if ws
-                .resolve_from(scope, &wanted)
-                .is_some_and(|other| other != target)
-            {
-                return Err(format!(
-                    "`{new_name}` is already visible where this one is used"
-                ));
-            }
-        }
-
-        // Every name this element answers to. The first is the one its
-        // declaration spells and the one a rename replaces; the rest
-        // stand for it some other way -- a short name, which renaming
-        // the long one leaves standing.
-        let model = self.analysis().ws.model();
-        let names: Vec<String> = model
-            .effective_name(target)
-            .into_iter()
-            .chain(model.effective_short_name(target))
-            .map(String::from)
+            .doc_files
+            .iter()
+            .map(|(url, file)| (*file, url.clone()))
             .collect();
-        let renamed = names.first().cloned().unwrap_or_default();
+        let declared: HashMap<usize, sysml_syntax::Dialect> = opened
+            .into_iter()
+            .map(|(file, url)| (file, self.dialect_of(&url)))
+            .collect();
+        let edits = self.analysis().ws.rename_edits(&renaming, |file, name| {
+            declared
+                .get(&file)
+                .copied()
+                .unwrap_or_else(|| sysml_syntax::Dialect::from_path(name))
+        })?;
 
-        // one text and one line index per file, however many of its
-        // names this rename touches
-        let mut by_file: HashMap<usize, Vec<TextRange>> = HashMap::new();
-        for (file, range) in edits {
-            by_file.entry(file).or_default().push(range);
-        }
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-        for (file, ranges) in by_file {
-            let spelt: Vec<(TextRange, Option<TextRange>)> = {
-                let ws = &self.analysis().ws;
-                ranges
-                    .into_iter()
-                    .map(|range| (range, name_token(ws, file, range, &renamed)))
-                    .collect()
-            };
+        for (file, written) in edits {
             // Every one of these is writable without being asked: what
             // holds a reference to a project element is a project file
             // or an open buffer, never the library, which resolves
@@ -261,28 +166,13 @@ impl Server {
             let placed = self
                 .placed(file)
                 .ok_or_else(|| format!("`{name}` cannot be read"))?;
-            let mut written = Vec::new();
-            for (range, at) in spelt {
-                let Some(at) = at else {
-                    // Nothing there spells the name, so the model
-                    // reaches this element some other way: by a short
-                    // name, which this rename leaves standing, or
-                    // through an `alias B for A;` whose own `for A`
-                    // nothing records and no rename can follow.
-                    let at = usize::from(range.start())..usize::from(range.end());
-                    let spelled = sysml_syntax::unquote(&placed.text[at]);
-                    if !names.contains(&spelled) {
-                        return Err(format!(
-                            "`{spelled}` stands for this one by a way no rename can follow"
-                        ));
-                    }
-                    continue;
-                };
-                written.push(TextEdit {
-                    range: placed.index.range(&placed.text, at),
-                    new_text: new_name.to_string(),
-                });
-            }
+            let written: Vec<TextEdit> = written
+                .into_iter()
+                .map(|edit| TextEdit {
+                    range: placed.index.range(&placed.text, edit.range),
+                    new_text: edit.new_text,
+                })
+                .collect();
             changes
                 .entry(placed.url.clone())
                 .or_default()
@@ -299,19 +189,41 @@ impl Server {
         position: Position,
     ) -> Option<CompletionResponse> {
         let (file, offset) = self.locate(uri, position)?;
+        let dialect = self.dialect_of(uri);
         let analysis = self.analysis();
+        // What is written inside a comment, a string or a quoted name is
+        // text rather than the model, and every keyword offered there
+        // was one more line to scroll past.
+        if written_inside_a_token(&analysis.ws, file, offset) {
+            return Some(CompletionResponse::Array(Vec::new()));
+        }
         let mut items: Vec<CompletionItem> = analysis
             .ws
             .visible_names(file, offset)
             .into_iter()
             .map(|(name, kind)| CompletionItem {
+                // `Wheel Unit` is offered by its name and inserted the way
+                // it has to be written: the bare label wrote `part z :
+                // Wheel Unit`, which does not parse
+                insert_text: Some(sysml_syntax::quote(&name)).filter(|it| *it != name),
                 label: name,
                 kind: Some(pictured(kind).0),
                 detail: Some(kind.name().to_string()),
                 ..Default::default()
             })
             .collect();
-        for (keyword, _, _) in sysml_syntax::KEYWORDS {
+        // after `P::` or `x.` only a name can follow
+        let keywords = if analysis.ws.follows_qualifier(file, offset) {
+            &[][..]
+        } else {
+            sysml_syntax::KEYWORDS
+        };
+        // and a keyword of the other notation is a name in this one --
+        // `part` offered in a KerML file is not something it can say
+        let keywords = keywords
+            .iter()
+            .filter(|(_, kind, _)| dialect.is_keyword(*kind));
+        for (keyword, _, _) in keywords {
             items.push(CompletionItem {
                 label: (*keyword).to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -357,7 +269,7 @@ impl Server {
             .collect();
         Some(symbols)
     }
-    pub(crate) fn format(&self, uri: &Url) -> Option<Vec<TextEdit>> {
+    pub(crate) fn format(&self, uri: &Url, options: &FormattingOptions) -> Option<Vec<TextEdit>> {
         let text = self.docs.get(uri)?;
         let dialect = self.dialect_of(uri);
         // A tree recovered from broken source says where the formatter
@@ -368,7 +280,10 @@ impl Server {
         if !sysml_syntax::parse_dialect(text, dialect).ok() {
             return None;
         }
-        let formatted = sysml_syntax::fmt::format_with(text, dialect, self.layout);
+        let formatted = indented(
+            &sysml_syntax::fmt::format_with(text, dialect, self.layout),
+            options,
+        );
         if formatted == *text {
             return Some(Vec::new());
         }
@@ -380,41 +295,62 @@ impl Server {
         }])
     }
     pub(crate) fn workspace_symbols(&mut self, query: &str) -> Option<WorkspaceSymbolResponse> {
-        // the same search the MCP server's `library_search` runs, so an
-        // exact match comes first here too
-        let matches: Vec<(sysml_model::ElementId, String, sysml_model::ElementKind)> = {
-            let analysis = self.analysis();
-            analysis
-                .ws
-                .search_names(query, 128)
-                .into_iter()
-                .map(|id| {
-                    let name = analysis.ws.model().name(id).unwrap_or_default().to_string();
-                    (id, name, analysis.ws.model().kind(id))
-                })
-                .collect()
-        };
+        // As many as an editor's picker shows.
+        const SHOWN: usize = 128;
+        // The same search the MCP server's `library_search` runs, so an
+        // exact match comes first here too -- every match of it, and the
+        // first that can be shown kept. Cut to the limit first, the hits
+        // that have no place to go to would be dropped after the cut: the
+        // library built into this binary is no file, and a query as short
+        // as `e` would fill the limit with it and answer with one of the
+        // project's own definitions where there are three.
+        //
+        // The library is a place to go to because the copy built in is
+        // written out where there are files, and its names would crowd
+        // the project's out the same way: what the project and its open
+        // buffers declare comes first, in its rank, and the library's
+        // after it, in its own.
+        let library_files = self.library.file_count();
+        let mut ranked: Vec<sysml_model::ElementId> =
+            self.analysis().ws.search_names(query, usize::MAX);
+        {
+            let ws = &self.analysis().ws;
+            ranked.sort_by_key(|id| {
+                ws.element_file(*id)
+                    .is_some_and(|file| file < library_files)
+            });
+        }
+        // a file with no place is asked once, not once per element in it
+        let mut nowhere: HashSet<usize> = HashSet::new();
         let mut symbols = Vec::new();
-        for (id, name, kind) in matches {
-            let place = {
-                let analysis = self.analysis();
-                analysis
-                    .ws
-                    .element_file(id)
-                    .zip(analysis.ws.element_ranges(id).map(|(_, n)| n))
-            };
-            let location = place.and_then(|(file, range)| self.location(file, range));
-            if let Some(location) = location {
-                #[allow(deprecated)]
-                symbols.push(SymbolInformation {
-                    name,
-                    kind: pictured(kind).1,
-                    tags: None,
-                    deprecated: None,
-                    location,
-                    container_name: None,
-                });
+        for id in ranked {
+            if symbols.len() == SHOWN {
+                break;
             }
+            let place = {
+                let ws = &self.analysis().ws;
+                ws.element_file(id)
+                    .zip(ws.element_ranges(id).map(|(_, n)| n))
+            };
+            let Some((file, range)) = place.filter(|(file, _)| !nowhere.contains(file)) else {
+                continue;
+            };
+            let Some(location) = self.location(file, range) else {
+                nowhere.insert(file);
+                continue;
+            };
+            let model = self.analysis().ws.model();
+            let name = crate::shown_name(model.name(id).unwrap_or_default());
+            let kind = model.kind(id);
+            #[allow(deprecated)]
+            symbols.push(SymbolInformation {
+                name,
+                kind: pictured(kind).1,
+                tags: None,
+                deprecated: None,
+                location,
+                container_name: None,
+            });
         }
         Some(WorkspaceSymbolResponse::Flat(symbols))
     }
@@ -426,7 +362,12 @@ impl Server {
         let (file, offset) = self.locate(uri, position)?;
         let analysis = self.analysis();
         let (target, active) = analysis.ws.callable_at(file, offset)?;
-        let name = analysis.ws.model().name(target).unwrap_or("?").to_string();
+        let name = analysis
+            .ws
+            .model()
+            .effective_name(target)
+            .unwrap_or("?")
+            .to_string();
         let params = analysis.ws.parameters_of(target);
         let label = format!("{name}({})", params.join(", "));
         Some(SignatureHelp {
@@ -461,16 +402,20 @@ impl Server {
     /// which is a name that resolves wherever it is written.
     ///
     /// Asked rather than published. The walk behind it is over every
-    /// declared name -- sixty thousand with the standard library loaded
-    /// -- which is nothing once, on the click that asks for it, and a
+    /// declared name -- very many with the standard library loaded --
+    /// which is nothing once, on the click that asks for it, and a
     /// stutter on every keystroke.
     pub(crate) fn code_actions(&mut self, uri: &Url, range: Range) -> Option<CodeActionResponse> {
         let text = self.docs.get(uri)?.clone();
         let index = LineIndex::new(&text);
-        let asked = TextRange::new(
+        // A range written end first is the same stretch of text, as
+        // `apply_change` reads one; `TextRange::new` asserts the order,
+        // and a client that sent it backwards took the server down.
+        let (start, end) = (
             index.offset(&text, range.start)?,
             index.offset(&text, range.end)?,
         );
+        let asked = TextRange::new(start.min(end), start.max(end));
         let file = *self.analysis().doc_files.get(uri)?;
         let ws = &self.analysis().ws;
 
@@ -493,6 +438,12 @@ impl Server {
 
         let mut actions = Vec::new();
         for (missing, may) in wanted.iter().zip(suggested) {
+            // a name that reaches the wrong kind of thing is spelt right
+            // and in scope: putting another spelling in its place only
+            // names the same thing again
+            if missing.wrong_kind.is_some() {
+                continue;
+            }
             // Both lists are spelled from the root, so either replaces
             // the whole of what was written -- `Parts::Wheeel` becomes
             // `Parts::Wheel` without the qualifier being put back by
@@ -603,4 +554,50 @@ impl Server {
         let index = LineIndex::new(&text);
         Some((file, index.offset(&text, position)?))
     }
+}
+
+/// Whether `offset` falls inside a comment, a string or a quoted name,
+/// where nothing completion offers can be written. The end of a `//` note
+/// is still inside it: the line goes on being the note until it ends.
+fn written_inside_a_token(ws: &Workspace, file: usize, offset: TextSize) -> bool {
+    use sysml_syntax::SyntaxKind::*;
+    ws.file_parse(file)
+        .syntax()
+        .token_at_offset(offset)
+        .any(|token| {
+            let range = token.text_range();
+            let to_the_end = token.kind() == LINE_NOTE && offset == range.end();
+            matches!(
+                token.kind(),
+                LINE_NOTE | BLOCK_NOTE | COMMENT_BODY | STRING | UNRESTRICTED_NAME
+            ) && range.start() < offset
+                && (offset < range.end() || to_the_end)
+        })
+}
+
+/// The formatter's text, indented the way the editor asked.
+///
+/// The formatter indents four spaces a level, and an editor set to tabs
+/// or to two spaces would have every line it formatted put back the other
+/// way.
+/// Each line's leading spaces are taken four at a time and written as the
+/// editor's own unit; what is left over, in a comment that is indented
+/// inside itself, stays as spaces.
+fn indented(text: &str, options: &FormattingOptions) -> String {
+    let unit = match options.insert_spaces {
+        true => " ".repeat(options.tab_size.max(1) as usize),
+        false => "\t".to_string(),
+    };
+    if unit == "    " {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let rest = line.trim_start_matches(' ');
+        let spaces = line.len() - rest.len();
+        out.push_str(&unit.repeat(spaces / 4));
+        out.push_str(&" ".repeat(spaces % 4));
+        out.push_str(rest);
+    }
+    out
 }

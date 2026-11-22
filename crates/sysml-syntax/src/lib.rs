@@ -59,8 +59,8 @@ impl Dialect {
     /// Pick a dialect from a file name or path, by its extension.
     ///
     /// The one place the rule lives: the formatter, the workspace and the
-    /// corpus tests each used to spell it, and not all of them ignored
-    /// the case of the extension.
+    /// corpus tests all use it, so that all of them ignore the case of
+    /// the extension alike.
     pub fn from_path(path: impl AsRef<std::path::Path>) -> Dialect {
         path.as_ref()
             .extension()
@@ -109,9 +109,13 @@ pub fn comment_text(raw: &str) -> String {
     // still what it says
     let text = raw.strip_prefix("/*").unwrap_or(raw);
     let text = text.strip_suffix("*/").unwrap_or(text);
-    let mut lines: Vec<&str> = text.lines().collect();
+    let mut lines: Vec<&str> = lines_of(text);
+    // Only a line written after `/*` itself goes without a margin; once
+    // a blank one has been dropped, the first line left is under it.
+    let mut after_opening = 1;
     while lines.first().is_some_and(|line| line.trim().is_empty()) {
         lines.remove(0);
+        after_opening = 0;
     }
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
@@ -121,7 +125,7 @@ pub fn comment_text(raw: &str) -> String {
     // neither, so it is taken as it comes.
     let under: Vec<&str> = lines
         .iter()
-        .skip(1)
+        .skip(after_opening)
         .copied()
         .filter(|line| !line.trim().is_empty())
         .collect();
@@ -141,6 +145,7 @@ pub fn comment_text(raw: &str) -> String {
                     None => rest.to_string(),
                 }
             } else {
+                // the first line, after `/*`, need not share it
                 line.strip_prefix(&margin)
                     .unwrap_or_else(|| line.trim_start())
                     .to_string()
@@ -153,13 +158,133 @@ pub fn comment_text(raw: &str) -> String {
 }
 
 /// The whitespace every one of `lines` begins with.
-pub(crate) fn shared_indent(lines: &[&str]) -> String {
-    let indent = |line: &str| line.len() - line.trim_start().len();
-    let shortest = lines.iter().map(|line| indent(line)).min().unwrap_or(0);
+///
+/// What they share, character by character, and not the length of the
+/// shortest indent: a tab under four spaces shares nothing with them,
+/// and the shortest indent measured in bytes cut a U+3000 or a NBSP in
+/// half. Being a prefix of every line is what lets each reader strip it
+/// the same way.
+/// The lines of `text`, broken at `\r\n`, a lone `\r` and `\n` alike.
+///
+/// `str::lines` breaks only at `\n`, so a comment written with old Mac
+/// line endings read as one long line, and its interior was neither
+/// re-indented nor taken off its margin.
+pub(crate) fn lines_of(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\n' => {
+                lines.push(&text[start..at]);
+                start = at + 1;
+            }
+            b'\r' => {
+                lines.push(&text[start..at]);
+                if bytes.get(at + 1) == Some(&b'\n') {
+                    at += 1;
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
     lines
-        .first()
-        .map(|line| line[..shortest].to_string())
-        .unwrap_or_default()
+}
+
+pub(crate) fn shared_indent(lines: &[&str]) -> String {
+    let mut lines = lines
+        .iter()
+        .map(|line| &line[..line.len() - line.trim_start().len()]);
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let shared = lines.fold(first, |shared, indent| {
+        let common = shared
+            .char_indices()
+            .zip(indent.chars())
+            .find(|((_, a), b)| a != b)
+            .map_or(shared.len().min(indent.len()), |((at, _), _)| at);
+        &shared[..common]
+    });
+    shared.to_string()
+}
+
+/// A name the way the notation has to write it: as it is when it is a
+/// basic name, quoted when it is not -- a keyword included, since `part`
+/// written plainly reads back as the keyword rather than as a name.
+/// Inside the quotes a backslash and a quote are escaped again, undoing
+/// what [`unquote`] did when the name was read.
+pub fn quote(name: &str) -> String {
+    let basic = !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && SyntaxKind::from_keyword(name).is_none();
+    if basic {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('\'');
+    for ch in name.chars() {
+        match ch {
+            '\\' | '\'' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// A qualified name the way the notation has to write it, each segment
+/// quoted where it needs to be: `'My Pkg'::'Wheel Unit'`. Joined plainly,
+/// `My Pkg::Wheel Unit` does not parse, and `A::'B::C'` reads as the same
+/// three segments as `A::B::C`.
+pub fn quote_qualified<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    segments
+        .into_iter()
+        .map(quote)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// The names a qualified name is made of, as they are and not as they
+/// were written: `'My Pkg'::'B::C'` is `My Pkg` and `B::C`. A `::` inside
+/// quotes is part of the name, and splitting the text at every one read
+/// `A::'B::C'` as three names.
+pub fn split_qualified(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '\\' if quoted => {
+                chars.next();
+            }
+            '\'' => quoted = !quoted,
+            ':' if !quoted && chars.peek().is_some_and(|&(_, next)| next == ':') => {
+                segments.push(unquote(&text[start..at]));
+                chars.next();
+                start = at + 2;
+            }
+            _ => {}
+        }
+    }
+    segments.push(unquote(&text[start..]));
+    segments
 }
 
 /// The text a string literal denotes.
@@ -223,26 +348,31 @@ impl Diagnostic {
 }
 
 /// Where a byte offset falls, counting lines and columns from one and
-/// measuring the column in bytes.
+/// measuring the column in characters.
 ///
 /// The command line prints this and the MCP server puts it in its
-/// answers; they had a copy each, identical but for whether they counted
+/// answers; a copy in each would differ in whether it counts
 /// from zero. A language server needs a different measure -- the
 /// protocol counts a column in UTF-16 code units -- and keeps its own.
 ///
-/// The counting is over bytes rather than characters because an offset
-/// handed in from elsewhere -- a diagnostic that has been clipped, a
-/// column a user typed -- need not land on a character boundary, and
-/// slicing the text at one that does not is a panic.
+/// The column is characters because that is what the command line's text
+/// report counts: counted in bytes, `--format json` and the terminal gave
+/// the same finding different columns on any line with a wide character
+/// before it.
+///
+/// An offset handed in from elsewhere -- a diagnostic that has been
+/// clipped -- need not land on a character boundary, and slicing the text
+/// at one that does not is a panic; one inside a character is placed at
+/// that character.
 pub fn line_col(text: &str, offset: usize) -> (usize, usize) {
-    let prefix = &text.as_bytes()[..offset.min(text.len())];
-    let line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
-    let column = prefix
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(prefix.len(), |at| prefix.len() - at - 1)
-        + 1;
-    (line, column)
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let prefix = &text[..offset];
+    let line = prefix.matches('\n').count() + 1;
+    let start = prefix.rfind('\n').map_or(0, |at| at + 1);
+    (line, prefix[start..].chars().count() + 1)
 }
 
 #[cfg(test)]
@@ -253,16 +383,20 @@ mod line_col_tests {
         assert_eq!(super::line_col(text, 0), (1, 1));
         assert_eq!(super::line_col(text, 2), (1, 3));
         assert_eq!(super::line_col(text, 3), (2, 1));
-        // a column is bytes, so a wide character is more than one
-        assert_eq!(super::line_col("あb", 3), (1, 4));
         // past the end is the end
         assert_eq!(super::line_col(text, 99), (3, 1));
     }
 
     #[test]
-    fn an_offset_inside_a_character_still_answers() {
-        assert_eq!(super::line_col("あい", 1), (1, 2));
-        assert_eq!(super::line_col("a\nあ", 3), (2, 2));
+    fn a_column_counts_characters_not_bytes() {
+        assert_eq!(super::line_col("あb", 3), (1, 2));
+        assert_eq!(super::line_col("a\né😀名x", 11), (2, 4));
+    }
+
+    #[test]
+    fn an_offset_inside_a_character_is_placed_at_that_character() {
+        assert_eq!(super::line_col("あい", 1), (1, 1));
+        assert_eq!(super::line_col("a\nあい", 6), (2, 2));
     }
 }
 
@@ -285,6 +419,20 @@ mod comment_tests {
             comment_text("/*\n    first\n      indented\n    last\n*/"),
             "first\n  indented\nlast"
         );
+    }
+
+    #[test]
+    fn a_margin_is_what_the_lines_share_and_not_how_long_the_shortest_is() {
+        // measured in bytes, the shortest indent cut the U+3000 in half
+        assert_eq!(
+            comment_text("/* first\n\u{3000}wide\n  two\n    */"),
+            "first\n\u{3000}wide\n  two"
+        );
+        // a tab and four spaces share nothing, so neither is a margin
+        assert_eq!(comment_text("/* top\n\tA\n    B\n*/"), "top\n\tA\n    B");
+        // and when the body starts on the line under `/*`, that line has
+        // a margin like the rest: `\t` here, which leaves `B` indented
+        assert_eq!(comment_text("/*\n\t\tA\n\t  B\n*/"), "A\n  B");
     }
 
     #[test]
@@ -342,5 +490,27 @@ mod name_tests {
             Dialect::from_path(std::path::Path::new("/tmp/x.kerml")),
             Dialect::KerML
         );
+    }
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::*;
+
+    #[test]
+    fn a_qualified_name_is_written_so_it_reads_back_as_the_same_names() {
+        for segments in [
+            vec!["A", "B", "C"],
+            vec!["A", "B::C"],
+            vec!["My Pkg", "Wheel Unit"],
+            vec!["it's", "part", "2nd"],
+            vec!["a\\b"],
+        ] {
+            let written = quote_qualified(segments.iter().copied());
+            assert_eq!(split_qualified(&written), segments, "{written}");
+        }
+        assert_eq!(quote_qualified(["My Pkg", "x"]), "'My Pkg'::x");
+        // a name that needs no quotes is asked for as it is either way
+        assert_eq!(split_qualified("A::'B'::C"), ["A", "B", "C"]);
     }
 }

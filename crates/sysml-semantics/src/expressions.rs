@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use sysml_model::{ElementId, ElementKind, Value};
-use sysml_syntax::SyntaxNode;
+use sysml_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::lookup::Reach;
 use crate::syntax::*;
@@ -24,7 +24,11 @@ impl Workspace {
     /// specification's operator table. Both are held on a `Membership` the
     /// builder stands there ahead of everything else, since
     /// `instantiatedType()` and `referent` each read the first one.
-    pub(crate) fn resolve_expression_tree(&mut self, asked: &[ElementId]) {
+    pub(crate) fn resolve_expression_tree(
+        &mut self,
+        asked: &[ElementId],
+        stats: &mut ResolveStats,
+    ) {
         // Only what was asked for. Walking a name before the file it is
         // written in has been resolved settles what the walk found into
         // the caches this workspace keeps, and the answer a later pass
@@ -46,8 +50,10 @@ impl Workspace {
             // membership of its own, beside the one naming the function
             if self.model.kind(elem) == ElementKind::Membership {
                 match self.model.owner(elem).map(|it| self.model.kind(it)) {
-                    Some(ElementKind::FeatureChainExpression) => self.chains_to(elem, &node),
-                    _ => self.names_what_it_asks_about(elem, &node),
+                    Some(ElementKind::FeatureChainExpression) => {
+                        self.chains_to(elem, &node, stats);
+                    }
+                    _ => self.names_what_it_asks_about(elem, &node, stats),
                 }
                 continue;
             }
@@ -74,20 +80,67 @@ impl Workspace {
                     invoked_function(operator).and_then(|it| self.named_globally(it))
                 }
                 (None, Some(named)) => self.named_globally(named),
-                (None, None) => match invoked_through_arrow(&node) {
-                    Some(named) => self.resolve_operand(elem, &[named]),
-                    None => invoked_by_name(&node)
-                        .and_then(|callee| self.resolve_operand(elem, &operand_segments(&callee))),
-                },
+                // `F(x)`, `new W()` and `xs->f()` name what they invoke,
+                // and a name is a reference whether or not it resolves:
+                // `new Nope()` was a model that resolved
+                (None, None) => {
+                    let (segments, range, counted) = match invoked_through_arrow(&node) {
+                        // what `xs->f()` invokes is looked up with the
+                        // names of the expression it is written in
+                        Some(named) => (vec![named], node.text_range(), true),
+                        None => {
+                            // `F(x)` writes `F` where the names of the
+                            // expression are looked up already
+                            let callee = invoked_by_name(&node);
+                            let mut chains = Vec::new();
+                            name_chains(&node, &mut chains);
+                            let counted = callee.as_ref().is_none_or(|it| chains.contains(it));
+                            let segments =
+                                callee.as_ref().map(operand_segments).unwrap_or_default();
+                            let range = callee.map_or(node.text_range(), |it| it.text_range());
+                            (segments, range, counted)
+                        }
+                    };
+                    let found = self.resolve_operand(elem, &segments);
+                    if !segments.is_empty() && !counted {
+                        let file = self.file_of(elem);
+                        match found {
+                            // recorded as well as counted: a rename that
+                            // does not know `new A()` names `A` leaves it
+                            // naming nothing
+                            Some(target) => {
+                                stats.resolved += 1;
+                                // only a name written in front of the
+                                // arguments is counted here
+                                let callee = invoked_by_name(&node)
+                                    .expect("what is not counted names its callee");
+                                let at = operand_ranges(&callee);
+                                let name_range = last_name_range(&callee);
+                                self.record(elem, file, range, name_range, &at, target);
+                            }
+                            None => self.record_miss(file, range, &segments, stats),
+                        }
+                    }
+                    found
+                }
             };
             let Some(target) = found else {
                 continue;
             };
+            // `x hastype T` owns a membership too, and it names `T`: the
+            // function the operator invokes is never what that one holds,
+            // and written there when `T` did not resolve, a misspelt type
+            // was a test against the library's `hastype` itself
+            let asks_about_a_type = matches!(
+                self.model.maybe(elem, "operator").and_then(Value::as_str),
+                Some("istype" | "hastype" | "as" | "meta" | "@" | "@@")
+            );
             let standing = self
                 .model
                 .owned(elem)
                 .iter()
                 .copied()
+                .filter(|_| !asks_about_a_type)
                 .find(|&child| self.model.kind(child) == ElementKind::Membership);
             if let Some(membership) = standing {
                 self.try_set(membership, "memberElement", Value::Ref(target));
@@ -97,7 +150,10 @@ impl Workspace {
             // what invokes it to invoking something typed by a
             // behaviour. The notation writes that type nowhere.
             self.materialize_implied_for(target);
-            self.hands_over_what_it_takes(elem, target);
+            self.hands_over_what_it_takes(elem, target, stats);
+            if self.model.kind(elem) == ElementKind::ConstructorExpression {
+                self.sets_what_it_names(elem, target, stats);
+            }
             self.comes_to_what_it_invokes(elem, target);
         }
     }
@@ -167,9 +223,41 @@ impl Workspace {
     /// `x istype T` hands over `x` and names `T`, and the name is held
     /// on a membership of the expression's own beside the one naming
     /// the function it invokes.
-    fn names_what_it_asks_about(&mut self, membership: ElementId, node: &SyntaxNode) {
+    fn names_what_it_asks_about(
+        &mut self,
+        membership: ElementId,
+        node: &SyntaxNode,
+        stats: &mut ResolveStats,
+    ) {
         let segments = operand_segments(node);
-        let Some(target) = self.resolve_operand(membership, &segments) else {
+        // `all T` writes the type as an operand, which the names of the
+        // expression already looked up; `xs istype T` writes it as a type
+        // reference, which nothing else reads
+        let counted = matches!(node.kind(), SyntaxKind::NAME_REF | SyntaxKind::PATH_EXPR);
+        let found = self.resolve_operand(membership, &segments);
+        if !counted {
+            match found {
+                Some(target) => {
+                    stats.resolved += 1;
+                    let file = self.file_of(membership);
+                    let at = operand_ranges(node);
+                    self.record(
+                        membership,
+                        file,
+                        node.text_range(),
+                        last_name_range(node),
+                        &at,
+                        target,
+                    );
+                }
+                // `xs istype Nope` asks about nothing
+                None => {
+                    let file = self.file_of(membership);
+                    self.record_miss(file, node.text_range(), &segments, stats);
+                }
+            }
+        }
+        let Some(target) = found else {
             return;
         };
         self.try_set(membership, "memberElement", Value::Ref(target));
@@ -224,15 +312,18 @@ impl Workspace {
     /// local Namespace is the result parameter of the argument Expression":
     /// `(that as SpatialItem).localClock` reads `localClock` from what `that
     /// as SpatialItem` comes to, which for a cast is the type it casts to.
-    fn chains_to(&mut self, membership: ElementId, node: &SyntaxNode) {
+    fn chains_to(
+        &mut self,
+        membership: ElementId,
+        node: &SyntaxNode,
+        stats: &mut ResolveStats,
+    ) -> Option<()> {
         let owner = self
             .model
             .owner(membership)
             .expect("the builder puts the membership on the expression it chains from");
         let mut segments = operand_segments(node);
-        let Some(name) = segments.pop() else {
-            return;
-        };
+        let name = segments.pop()?;
         let held: Vec<ElementId> = self
             .takes(owner)
             .into_iter()
@@ -261,6 +352,9 @@ impl Workspace {
                 scopes.extend(self.supertypes_of(result));
             }
         }
+        // where what the chain starts from is known and none of it has
+        // the name, the name is missing like any other: `A().nope`
+        let known = !scopes.is_empty();
         for scope in scopes {
             // a chain chains to a feature: `targetFeature` is null where
             // what the name reaches is not one, which is what the
@@ -269,6 +363,19 @@ impl Workspace {
                 .lookup(scope, &name, Reach::all(Access::External))
                 .filter(|&it| self.model.kind(it).is_a(ElementKind::Feature));
             if let Some(target) = found {
+                // a name like any other, which a rename has to follow:
+                // `A().y`, `c#(1).count`, `(as T).level`
+                stats.resolved += 1;
+                let file = self.file_of(membership);
+                let name_range = last_name_range(node);
+                self.record(
+                    membership,
+                    file,
+                    name_range,
+                    name_range,
+                    &[name_range],
+                    target,
+                );
                 self.try_set(membership, "memberElement", Value::Ref(target));
                 // `checkFeatureChainExpressionResultSpecialization` --
                 // what a chain comes to is what it chains to
@@ -286,9 +393,15 @@ impl Workspace {
                         .set(result, "isImpliedIncluded", Value::Bool(true));
                     self.supertypes.remove(&result);
                 }
-                return;
+                return Some(());
             }
         }
+        if known {
+            let file = self.file_of(membership);
+            let name_range = last_name_range(node);
+            self.record_miss(file, name_range, &[name], stats);
+        }
+        Some(())
     }
     /// Each argument redefines the parameter it is handed to.
     ///
@@ -297,14 +410,19 @@ impl Workspace {
     /// `validateInvocationExpressionParameterRedefinition` holds every
     /// argument to redefining exactly one. The notation names none of them, so
     /// the order is what says which is which.
-    fn hands_over_what_it_takes(&mut self, invocation: ElementId, function: ElementId) {
+    fn hands_over_what_it_takes(
+        &mut self,
+        invocation: ElementId,
+        function: ElementId,
+        stats: &mut ResolveStats,
+    ) {
         let taken = self.taken_by(function, &mut Vec::new());
         let handed = self.takes(invocation);
         // An argument that names the parameter it is for says which one
         // it redefines; where none of them do, the order says it.
         let named: Vec<Option<ElementId>> = handed
             .iter()
-            .map(|&argument| self.names_a_parameter(argument, function))
+            .map(|&argument| self.names_a_parameter(argument, function, stats))
             .collect();
         let pairs: Vec<(ElementId, ElementId)> = match named.iter().all(Option::is_some) {
             true => handed
@@ -329,6 +447,38 @@ impl Workspace {
             // what it specializes was worked out before this was written
             self.supertypes.remove(&argument);
         }
+    }
+    /// What `new A(y = 1)` gives the `A` it constructs a value for.
+    ///
+    /// A constructor hands its arguments to the result it constructs, and
+    /// an argument that names a feature of the type is a value for that
+    /// one: it redefines it, as a named argument to a function redefines
+    /// the parameter it names.
+    fn sets_what_it_names(
+        &mut self,
+        constructor: ElementId,
+        constructed: ElementId,
+        stats: &mut ResolveStats,
+    ) -> Option<()> {
+        let result = self.hands_back(constructor)?;
+        for argument in self.model.owned(result).to_vec() {
+            let Some(feature) = self.names_a_parameter(argument, constructed, stats) else {
+                continue;
+            };
+            self.reified(
+                argument,
+                ElementKind::Redefinition,
+                &[
+                    ("redefiningFeature", Value::Ref(argument)),
+                    ("redefinedFeature", Value::Ref(feature)),
+                    ("isImplied", Value::Bool(true)),
+                ],
+            );
+            self.model
+                .set(argument, "isImpliedIncluded", Value::Bool(true));
+            self.supertypes.remove(&argument);
+        }
+        Some(())
     }
     /// An invocation comes to what the function it invokes hands back.
     ///
@@ -414,10 +564,29 @@ impl Workspace {
         None
     }
     /// The parameter an argument names itself for, where it names one.
-    fn names_a_parameter(&mut self, argument: ElementId, function: ElementId) -> Option<ElementId> {
+    ///
+    /// The name is a reference like any other: `F(q = 1)` names the `q`
+    /// of `F`, a rename of it has to reach the argument, and `F(nope =
+    /// 1)` names nothing `F` takes.
+    fn names_a_parameter(
+        &mut self,
+        argument: ElementId,
+        function: ElementId,
+        stats: &mut ResolveStats,
+    ) -> Option<ElementId> {
         let node = self.source.get(&argument)?.clone();
         let name = operand_segments(&node).pop()?;
-        self.lookup(function, &name, Reach::all(Access::Internal))
+        let file = self.file_of(argument);
+        let range = node.text_range();
+        let found = self.lookup(function, &name, Reach::all(Access::Internal));
+        match found {
+            Some(parameter) => {
+                stats.resolved += 1;
+                self.record(argument, file, range, range, &[range], parameter);
+            }
+            None => self.record_miss(file, range, &[name], stats),
+        }
+        found
     }
     /// What something is handed, in the order it is handed them.
     fn takes(&self, of: ElementId) -> Vec<ElementId> {
@@ -456,51 +625,6 @@ impl Workspace {
         }
         Vec::new()
     }
-    /// The names a multiplicity counts with.
-    ///
-    /// `first [nCauses] causes.startShot ... { attribute nCauses =
-    /// size(causes); }` counts with an attribute the succession declares, and
-    /// `validateMultiplicityRangeBoundResultTypes` reads what such a bound
-    /// comes to. The builder keeps a named bound as text; until the name is
-    /// looked up it refers to nothing.
-    pub(crate) fn count_with_what_is_named(&mut self, ids: &[ElementId]) {
-        for &elem in ids {
-            if self.model.kind(elem) != ElementKind::FeatureReferenceExpression
-                || self.model.maybe(elem, "referent").is_some()
-            {
-                continue;
-            }
-            let Some(owner) = self
-                .model
-                .owner(elem)
-                .filter(|&it| self.model.kind(it) == ElementKind::MultiplicityRange)
-                .and_then(|range| self.model.owner(range))
-            else {
-                continue;
-            };
-            let written = self
-                .written_as(elem)
-                .expect("the builder keeps a named bound as the text it was written as");
-            let segments: Vec<String> = written.split("::").map(str::to_string).collect();
-            let found = self
-                .resolve_inside(owner, &segments)
-                .or_else(|| self.resolve_from(owner, &segments));
-            if let Some(target) = found {
-                self.refers_to(elem, target);
-            }
-        }
-    }
-    /// The text an element was written as, where the builder kept it.
-    fn written_as(&self, elem: ElementId) -> Option<String> {
-        self.model
-            .owned(elem)
-            .iter()
-            .copied()
-            .find(|&it| self.model.kind(it) == ElementKind::TextualRepresentation)
-            .and_then(|it| self.model.maybe(it, "body"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
     /// Resolve every name written in an expression, from `owner`.
     ///
     /// The model keeps an expression as the text the author wrote, so the
@@ -514,15 +638,26 @@ impl Workspace {
         expr: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&owner).copied().unwrap_or(0);
+        let file = self.file_of(owner);
         let mut chains = Vec::new();
         name_chains(expr, &mut chains);
         for chain in chains {
+            // `{in i; private attribute a = v#(i); a > 0}` declares `a` as
+            // an element of its own, whose value is read with it
+            if self.declared_in_a_body(file, &chain, expr) {
+                continue;
+            }
             let segments = operand_segments(&chain);
+            // a parameter of a body expression the name is written in:
+            // `{ in x; x > 0 }` names its own `x`
+            let from = segments
+                .first()
+                .and_then(|first| self.body_parameter(file, &chain, expr, first))
+                .unwrap_or(owner);
             let at = operand_ranges(&chain);
             let name_range = *at.last().expect("a name chain spells a name");
             let range = chain.text_range();
-            match self.resolve_operand(owner, &segments) {
+            match self.resolve_operand(from, &segments) {
                 Some(target) => {
                     stats.resolved += 1;
                     self.record(owner, file, range, name_range, &at, target);
@@ -540,10 +675,291 @@ impl Workspace {
                 }
             }
         }
+        self.resolve_arrows(owner, expr, stats);
+    }
+    /// The usage a `perform`/`exhibit`/`include`/... or an `entry`/`do`/
+    /// `exit` adapts, when it names one rather than declaring it: the
+    /// reference is what the usage is *about*, and without it the model
+    /// says only that something is performed.
+    ///
+    /// `satisfy r by p;` and `verify r;` have resolvers of their own that
+    /// record the same operand; recording it here too would give a rename
+    /// two edits over one name. They are also why a miss was once left
+    /// unreported here -- `satisfy requirement x by that` declares `x` --
+    /// and with them handled elsewhere, a name that resolves to nothing is
+    /// reported like any other: `perform nope;` passed as a model that
+    /// performs something.
+    pub(crate) fn resolve_adapted(
+        &mut self,
+        id: ElementId,
+        node: &SyntaxNode,
+        stats: &mut ResolveStats,
+    ) {
+        let handled = self
+            .model
+            .kind(id)
+            .is_a(ElementKind::SatisfyRequirementUsage)
+            || self.model.member_role(id) == Some(sysml_model::Role::Verify);
+        let Some(operand) = crate::syntax::adapter_target(node).filter(|_| !handled) else {
+            return;
+        };
+        let file = self.file_of(id);
+        let segments = operand_segments(&operand);
+        let range = operand.text_range();
+        match self.resolve_from(id, &segments) {
+            Some(target) => {
+                stats.resolved += 1;
+                let name_range = crate::syntax::last_name_range(&operand);
+                self.record(
+                    id,
+                    file,
+                    range,
+                    name_range,
+                    &operand_ranges(&operand),
+                    target,
+                );
+                // `event setSpeedMessage.sourceEvent;` is the event of that
+                // message, not the library's `sourceEvent` of any message:
+                // kept as the last feature alone, which message it belonged
+                // to was nowhere in the model
+                let steps = crate::syntax::operand_chain_steps(&operand);
+                self.reify_through(
+                    id,
+                    false,
+                    SyntaxKind::REFERENCES,
+                    (&segments, &steps),
+                    target,
+                );
+            }
+            None => self.record_miss(file, range, &segments, stats),
+        }
+    }
+    /// The file an element is written in: its own, or that of the
+    /// nearest owner the builder put on the text.
+    pub(crate) fn file_of(&self, elem: ElementId) -> usize {
+        std::iter::successors(Some(elem), |&at| self.model.owner(at))
+            .find_map(|at| self.elem_file.get(&at).copied())
+            .unwrap_or_default()
+    }
+    /// Look up the names a bracketed import filter is written with: the
+    /// metadata each `@` asks about, and any other name in the condition.
+    pub(crate) fn resolve_filter_names(
+        &mut self,
+        import: ElementId,
+        filter: &SyntaxNode,
+        stats: &mut ResolveStats,
+    ) {
+        let file = self.file_of(import);
+        // `[@Safety]` writes the metadata it asks about, and `[(as T).x]`
+        // the type it casts to, under the operator
+        let asked_about = |it: &SyntaxNode| {
+            it.ancestors()
+                .skip(1)
+                .find(|up| up.kind() != SyntaxKind::TYPE_REF)
+                .is_some_and(|up| up.kind() == SyntaxKind::UNARY_EXPR)
+        };
+        for asked in filter
+            .descendants()
+            .filter(|it| it.kind() == SyntaxKind::QUALIFIED_NAME && asked_about(it))
+        {
+            let segments = name_segments(&asked);
+            match self.resolve_from(import, &segments) {
+                Some(target) => {
+                    stats.resolved += 1;
+                    let at = segment_ranges(&asked);
+                    let range = asked.text_range();
+                    self.record(import, file, range, last_name_range(&asked), &at, target);
+                }
+                None => self.record_miss(file, asked.text_range(), &segments, stats),
+            }
+        }
+        for condition in filter.children() {
+            self.resolve_expression(import, &condition, stats);
+        }
+        // `[(as T).level > 1]` reads `level` off what the member is cast
+        // to: a bracketed condition is built into no expression, so the
+        // chain is followed here, from the type the cast names
+        let cast_to = |chain: &SyntaxNode| {
+            let cast = chain
+                .children()
+                .next()
+                .filter(|it| it.kind() == SyntaxKind::PAREN_EXPR)?
+                .children()
+                .next()
+                .filter(|it| it.kind() == SyntaxKind::UNARY_EXPR)?;
+            let ty = cast
+                .descendants()
+                .find(|it| it.kind() == SyntaxKind::QUALIFIED_NAME)?;
+            let member = chain
+                .children_with_tokens()
+                .filter_map(|it| it.into_token())
+                .filter(|it| matches!(it.kind(), SyntaxKind::IDENT | SyntaxKind::UNRESTRICTED_NAME))
+                .last()?;
+            Some((ty, member))
+        };
+        let casts: Vec<_> = filter
+            .descendants()
+            .filter(|it| it.kind() == SyntaxKind::PATH_EXPR)
+            .filter_map(|chain| cast_to(&chain))
+            .collect();
+        // where the type does not resolve, that is reported above
+        let resolved: Vec<_> = casts
+            .into_iter()
+            .filter_map(|(ty, member)| {
+                Some((self.resolve_from(import, &name_segments(&ty))?, member))
+            })
+            .collect();
+        for (ty, member) in resolved {
+            let name = sysml_syntax::unquote(member.text());
+            let range = member.text_range();
+            match self.lookup(ty, &name, Reach::all(Access::External)) {
+                Some(target) => {
+                    stats.resolved += 1;
+                    self.record(import, file, range, range, &[range], target);
+                }
+                None => self.record_miss(file, range, &[name], stats),
+            }
+        }
+    }
+    /// What `xs->f(...)` invokes, looked up where the expression is
+    /// written: `select` and `collect` are the library's own, and any
+    /// other name is a function in scope. Counted here rather than with
+    /// the expression the builder made, since some expressions -- what
+    /// a function returns -- are kept as text.
+    fn resolve_arrows(&mut self, owner: ElementId, expr: &SyntaxNode, stats: &mut ResolveStats) {
+        let file = self.file_of(owner);
+        let arrows: Vec<SyntaxNode> = expr
+            .descendants()
+            .filter(|it| it.kind() == SyntaxKind::ARROW_EXPR)
+            .filter(|arrow| !self.declared_in_a_body(file, arrow, expr))
+            .collect();
+        for arrow in arrows {
+            let Some(name) = arrow
+                .children_with_tokens()
+                .filter_map(|it| it.into_token())
+                .skip_while(|it| it.kind() != SyntaxKind::ARROW)
+                .find(|it| matches!(it.kind(), SyntaxKind::IDENT | SyntaxKind::UNRESTRICTED_NAME))
+            else {
+                continue;
+            };
+            let spelled = sysml_syntax::unquote(name.text());
+            let range = name.text_range();
+            let found = match spelled.as_str() {
+                "select" | "collect" => {
+                    self.named_globally(&format!("ControlFunctions::{spelled}"))
+                }
+                _ => self.resolve_operand(owner, std::slice::from_ref(&spelled)),
+            };
+            match found {
+                Some(target) => {
+                    stats.resolved += 1;
+                    self.record(owner, file, range, range, &[range], target);
+                }
+                None => self.record_miss(file, range, &[spelled], stats),
+            }
+        }
+    }
+    /// Whether `chain` is written in a member of a body expression, within
+    /// `expr`, that was built into an element: its names are read with
+    /// that element, and reading them here as well recorded each twice.
+    fn declared_in_a_body(&self, file: usize, chain: &SyntaxNode, expr: &SyntaxNode) -> bool {
+        chain
+            .ancestors()
+            .take_while(|it| it != expr)
+            .filter(|it| {
+                it.parent()
+                    .is_some_and(|parent| parent.kind() == SyntaxKind::BODY_EXPR)
+            })
+            .any(|member| {
+                self.files[file]
+                    .elements
+                    .iter()
+                    .any(|it| self.source.get(it) == Some(&member))
+            })
+    }
+    /// The element a body expression around `chain`, within `expr`,
+    /// declares under `first`, the first name of the chain: a parameter
+    /// `{in x; ...}` or a member `{private attribute a = ...; ...}`.
+    fn body_parameter(
+        &self,
+        file: usize,
+        chain: &SyntaxNode,
+        expr: &SyntaxNode,
+        first: &str,
+    ) -> Option<ElementId> {
+        let declared = chain
+            .ancestors()
+            .take_while(|it| it != expr)
+            .chain(std::iter::once(expr.clone()))
+            .filter(|it| it.kind() == SyntaxKind::BODY_EXPR)
+            .find_map(|body| {
+                body.children().find(|it| {
+                    it.kind() == SyntaxKind::USAGE
+                        && it
+                            .children()
+                            .find(|part| part.kind() == SyntaxKind::NAME)
+                            .and_then(|part| part.first_token())
+                            .is_some_and(|name| sysml_syntax::unquote(name.text()) == first)
+                })
+            })?;
+        self.files[file]
+            .elements
+            .iter()
+            .copied()
+            .find(|it| self.source.get(it) == Some(&declared))
+    }
+    /// Look up the names in what a control node asks and hands over,
+    /// from where the node stands.
+    pub(crate) fn resolve_asked(
+        &mut self,
+        owner: ElementId,
+        node: &SyntaxNode,
+        stats: &mut ResolveStats,
+    ) {
+        let inside = self.inside(owner);
+        for written in crate::syntax::asked_expressions(node) {
+            self.resolve_expression(inside, &written, stats);
+        }
+    }
+    /// Where what a node is handed is looked up from: inside the node.
+    ///
+    /// A name is looked up from the namespace that owns the element it is
+    /// written on, and what a control node asks or sends is not written on
+    /// the node but on a parameter of it. So `action t send cmd via p { in
+    /// cmd; }` sends the `cmd` it declares, and a transition's guard and
+    /// effect see the `accepted` parameter, which answers to the name of
+    /// what its trigger accepts: `accept s : Sig if s.ok do send s`.
+    pub(crate) fn inside(&self, owner: ElementId) -> ElementId {
+        self.model
+            .owned(owner)
+            .iter()
+            .copied()
+            .find(|&it| self.model.kind(it).is_a(ElementKind::Feature))
+            .unwrap_or(owner)
     }
     /// The `FeatureReferenceExpression` an element's value was built
     /// into, where the model made one -- which it does exactly when the
     /// whole value is a name.
+    /// The bounds of an element's multiplicity that were built from an
+    /// expression, each with the text it was built from. A literal bound
+    /// was built from no node of its own and names nothing.
+    pub(crate) fn bounds_written_as_expressions(
+        &self,
+        elem: ElementId,
+    ) -> Vec<(ElementId, SyntaxNode)> {
+        let Some(range) = self
+            .model
+            .maybe(elem, "multiplicity")
+            .and_then(Value::as_id)
+        else {
+            return Vec::new();
+        };
+        self.model
+            .owned(range)
+            .iter()
+            .filter_map(|&bound| Some((bound, self.source.get(&bound)?.clone())))
+            .collect()
+    }
     pub(crate) fn reference_expression(&self, owner: ElementId) -> Option<ElementId> {
         let membership = self
             .model
@@ -566,6 +982,40 @@ impl Workspace {
         // `self` and `that` are not looked up, so no qualified name was
         // walked to reach what they name.
         self.chain.clear();
+        // ... unless the model declares one of its own where it is
+        // written: `part def A { attribute that = 1; attribute b = that; }`
+        // means the attribute, and was read as `A`, while at a package's
+        // top level the same name resolved to nothing at all. The
+        // library's own -- `Occurrence` redeclares `self` -- are what
+        // `self` and `that` stand for already, and stay read that way.
+        // Only as far out as the type the expression is in: that type
+        // has a `self` of its own, inherited, which a declaration further
+        // out does not shadow.
+        let mut scopes: Vec<ElementId> = Vec::new();
+        for scope in std::iter::successors(self.model.owner(elem), |&it| self.model.owner(it))
+            .take_while(|&it| it != self.root)
+        {
+            scopes.push(scope);
+            if self.model.kind(scope).is_a(ElementKind::Type) {
+                break;
+            }
+        }
+        let in_library = scopes
+            .iter()
+            .any(|&it| self.model.kind(it) == ElementKind::LibraryPackage);
+        let declared =
+            scopes
+                .iter()
+                .copied()
+                .filter(|_| !in_library)
+                .find_map(|scope| {
+                    self.model.owned(scope).iter().copied().find(|&member| {
+                        member != elem && self.model.name(member) == Some(&segments[0])
+                    })
+                });
+        if declared.is_some() {
+            return declared;
+        }
         let mut scope = self.model.owner(elem);
         while let Some(current) = scope {
             if self.model.kind(current).is_a(ElementKind::Type) {

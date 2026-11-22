@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use sysml_model::{ElementId, ElementKind, Role, Value};
-use sysml_syntax::SyntaxKind;
+use sysml_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::syntax::*;
 use crate::{Clear, ResolveStats, Workspace};
@@ -65,7 +65,7 @@ impl Workspace {
     /// relationships resolution reifies, so a type that was never resolved has
     /// no members to show and no supertype to inherit from. Resolving every
     /// loaded file answers that by doing far more work than the question
-    /// needs: a standard library is thousands of references, of which a model
+    /// needs: a standard library is very many references, of which a model
     /// uses a handful.
     pub fn resolve_reached(&mut self, files: &[usize]) -> ResolveStats {
         let mut stats = self.resolve_files(files);
@@ -126,7 +126,6 @@ impl Workspace {
     pub(crate) fn imply_for(&mut self, ids: &[ElementId]) {
         let ids = self.with_what_they_own(ids);
         self.carry_ends(&ids);
-        self.count_with_what_is_named(&ids);
         self.relate_named_ends(&ids);
         self.imply_end_redefinitions(&ids);
         self.imply_end_participation(&ids);
@@ -197,6 +196,14 @@ impl Workspace {
         let mut stats = ResolveStats::default();
         let began = self.lookups;
         self.claimed.clear();
+        // the statements more than one element was built from
+        let mut written: HashSet<&SyntaxNode> = HashSet::new();
+        let shared: HashSet<SyntaxNode> = ids
+            .iter()
+            .filter_map(|id| self.source.get(id))
+            .filter(|node| node.kind() == SyntaxKind::CONTROL_STMT && !written.insert(node))
+            .cloned()
+            .collect();
         for &id in ids {
             let Some(node) = self.source.get(&id).cloned() else {
                 continue;
@@ -216,9 +223,59 @@ impl Workspace {
                 SyntaxKind::CONNECTOR_STMT | SyntaxKind::CONTROL_STMT
             ) {
                 self.resolve_connector_ends(id, &node, &mut stats);
+                // `then assign i := i + 1;` is the succession and the
+                // assignment it runs into, written as one statement and
+                // built as two elements. What the statement hands over is
+                // the assignment's, and read for the succession too, every
+                // name in it was recorded twice. A succession alone in its
+                // statement -- `if g then b;` -- asks its guard itself.
+                if self.model.kind(id).is_a(ElementKind::Succession) && shared.contains(&node) {
+                    continue;
+                }
                 self.resolve_trigger_type(id, &node, &mut stats);
                 self.resolve_action_arguments(id, &node, &mut stats);
+                // `do senseTemperature { ... }` performs what it names
+                self.resolve_adapted(id, &node, &mut stats);
+                // what it asks and what it hands over -- `if g then a;`,
+                // `send x via p`, and the value `assign v := x` gives
+                self.resolve_asked(id, &node, &mut stats);
+                // `loop { ... } until done;` parses as two statements, and
+                // the builder folds the second into the loop it closes
+                if let Some(until) = node.next_sibling().filter(|next| {
+                    next.kind() == SyntaxKind::CONTROL_STMT
+                        && next
+                            .first_token()
+                            .is_some_and(|it| it.kind() == SyntaxKind::UNTIL_KW)
+                }) {
+                    self.resolve_asked(id, &until, &mut stats);
+                }
+                // `bind a = b;` writes its second end the way a value is
+                // written, and the ends were read above. What `assign x :=
+                // y` assigns is its second argument, which holds the value
+                // and whose reference to `y` is what the name resolves.
+                let inside = match self.model.kind(id) {
+                    ElementKind::AssignmentActionUsage => {
+                        self.model.owned(id).get(1).copied().unwrap_or(id)
+                    }
+                    _ => self.inside(id),
+                };
+                for clause in node
+                    .children()
+                    .filter(|_| !binds_an_end(&node))
+                    .filter(|child| child.kind() == SyntaxKind::VALUE)
+                {
+                    for written in clause.children() {
+                        self.resolve_expression(inside, &written, &mut stats);
+                    }
+                }
                 continue;
+            }
+            // `action a accept s : Sig;` types its payload `s` as the
+            // statement form does, and the action itself is no `Sig`
+            if node.kind() == SyntaxKind::USAGE
+                && self.model.kind(id).is_a(ElementKind::AcceptActionUsage)
+            {
+                self.resolve_trigger_type(id, &node, &mut stats);
             }
             // `comment about A, B /* ... */` and `metadata m : M about
             // A` both say what they are about, and the names they say it
@@ -256,6 +313,22 @@ impl Workspace {
             // pointing at a package that is no longer there.
             if matches!(node.kind(), SyntaxKind::IMPORT | SyntaxKind::EXPOSE) {
                 self.record_import(id, &node, &mut stats);
+                // `import Q::*[@Safety];` names `Safety` as much as the
+                // statement form `filter @Safety;` does, which is an
+                // element whose condition is resolved like any other; the
+                // bracketed one is not, and `[@Nope]` went unread
+                for filter in node.children().filter(|it| it.kind() == SyntaxKind::FILTER) {
+                    self.resolve_filter_names(id, &filter, &mut stats);
+                }
+                continue;
+            }
+            // `filter Element::name == "System";` is a condition like any
+            // other, whose names are references: the `@` and `as` types in
+            // it are counted where its expression is, the rest only here
+            if node.kind() == SyntaxKind::FILTER {
+                for condition in node.children() {
+                    self.resolve_expression(id, &condition, &mut stats);
+                }
                 continue;
             }
             // `alias Q for P;` is a membership whose member is the
@@ -286,6 +359,16 @@ impl Workspace {
                 self.resolve_relation_ends(id, &node, &mut stats);
                 continue;
             }
+            // `connect [n] a to b;` -- the feature the builder stood up
+            // for the `[n]` counting an end has no declaration around
+            // it, and a bound naming something is a reference all the
+            // same
+            if node.kind() == SyntaxKind::MULTIPLICITY {
+                for (bound, written) in self.bounds_written_as_expressions(id) {
+                    self.resolve_expression(bound, &written, &mut stats);
+                }
+                continue;
+            }
             // a payload carries a typing of its own -- `flow f of Fuel`
             // -- and is an element the builder made, so it resolves like
             // any declaration
@@ -300,6 +383,8 @@ impl Workspace {
             // parses as a usage rather than as a control statement --
             // and what it assigns is a name to look up either way
             self.resolve_action_arguments(id, &node, &mut stats);
+            // `action aLoop while c { ... }` names itself and asks the same
+            self.resolve_asked(id, &node, &mut stats);
             // `attribute pin : PinNumber = ledPinNumber;` -- the value is
             // an expression like any other, and the name in it is a
             // reference like any other. `binding a = b;` writes the same
@@ -316,6 +401,13 @@ impl Workspace {
                 {
                     self.resolve_expression(id, &written, &mut stats);
                 }
+            }
+            // `part wheels : Wheel[count];` -- a bound that names
+            // something was built as the expression it is written as,
+            // and its names are looked up from where it stands, like a
+            // value's
+            for (bound, written) in self.bounds_written_as_expressions(id) {
+                self.resolve_expression(bound, &written, &mut stats);
             }
             let is_definition = node.kind() == SyntaxKind::DEFINITION;
             for (part_kind, targets) in relationship_parts(&node) {
@@ -339,14 +431,14 @@ impl Workspace {
                             id,
                             &t.segments,
                             may_name_itself(part_kind, is_definition),
-                            expected_kind(part_kind, is_definition),
+                            expected_kind(part_kind, is_definition, self.model.kind(id)),
                         )
                     });
                     self.redefining = redefining;
                     match found {
                         Some(target) => {
                             stats.resolved += 1;
-                            let file = self.elem_file.get(&id).copied().unwrap_or(0);
+                            let file = self.file_of(id);
                             self.record(id, file, t.range, t.name_range, &t.at, target);
                             // `chains source.target` names the steps of
                             // one chain, and each step is a chaining of
@@ -354,13 +446,22 @@ impl Workspace {
                             // feature comes to have one chaining
                             // feature, which the standard does not
                             // allow it.
+                            //
+                            // `chainingFeature` is derived from those, and
+                            // kept beside them because that is where
+                            // everything reading a chain looks: left
+                            // empty, `feature c chains f.x` was a chain
+                            // with no steps to everything but the rules.
                             if part_kind == SyntaxKind::CHAINS_KW {
+                                let mut chain = Vec::new();
                                 for depth in 1..=t.segments.len() {
                                     if let Some(step) = self.resolve_from(id, &t.segments[..depth])
                                     {
                                         self.reify(id, is_definition, part_kind, step);
+                                        chain.push(step);
                                     }
                                 }
+                                self.try_set(id, "chainingFeature", Value::RefList(chain));
                                 continue;
                             }
                             // A dotted operand names a chain, not the feature at the end of it. The
@@ -372,7 +473,7 @@ impl Workspace {
                             // `validateSubsettingFeaturingTypes` and
                             // `validateRedefinitionFeaturingTypes` ask.
                             //
-                            // A reference subsetting is one too -- 106 of them under the standard
+                            // A reference subsetting is one too -- many of them under the standard
                             // library alone -- and a connector end written `lcp ::> w.lcp` reaches
                             // what it relates through the chain. For a cross subsetting there is
                             // more: `deriveFeatureCrossFeature` reads
@@ -387,57 +488,34 @@ impl Workspace {
                                     | SyntaxKind::DISJOINT_KW
                             ) || part_kind == SyntaxKind::SUBSETTING
                                 && !is_definition;
-                            let reached = match names_a_chain {
-                                true => self.chained(id, &t.segments, &t.chain, target),
-                                false => target,
-                            };
-                            self.reify(id, is_definition, part_kind, reached);
+                            match names_a_chain {
+                                true => self.reify_through(
+                                    id,
+                                    is_definition,
+                                    part_kind,
+                                    (&t.segments, &t.chain),
+                                    target,
+                                ),
+                                false => self.reify(id, is_definition, part_kind, target),
+                            }
                         }
                         None => {
-                            let file = self.elem_file.get(&id).copied().unwrap_or(0);
+                            let file = self.file_of(id);
                             self.record_miss(file, t.range, &t.segments, &mut stats);
                         }
                     }
                 }
             }
-            // `perform w;`, `exhibit s;`, `assert c;`, `include u;` -- the reference
-            // is what the usage is *about*, and without it the model says only that
-            // something is performed.
-            //
-            // A name that does not resolve is left alone rather than reported:
-            // `satisfy requirement viewpointConformance by that;` writes the same
-            // shape and *declares* that name, so a finding here would be false.
-            //
-            // `satisfy r by p;` and `verify r;` have resolvers of their own that
-            // record the same operand; recording it here too would give a rename two
-            // edits over one name.
-            let handled = self
-                .model
-                .kind(id)
-                .is_a(ElementKind::SatisfyRequirementUsage)
-                || self.model.member_role(id) == Some(Role::Verify);
-            if let Some(operand) = adapter_target(&node).filter(|_| !handled) {
-                if let Some(target) = self.resolve_from(id, &operand_segments(&operand)) {
-                    stats.resolved += 1;
-                    let file = self.elem_file.get(&id).copied().unwrap_or(0);
-                    let range = operand.text_range();
-                    let name_range = last_name_range(&operand);
-                    self.record(
-                        id,
-                        file,
-                        range,
-                        name_range,
-                        &operand_ranges(&operand),
-                        target,
-                    );
-                    self.reify(id, false, SyntaxKind::REFERENCES, target);
-                }
-            }
+            self.resolve_adapted(id, &node, &mut stats);
             // `connection c : L connect a to b;` is written as a usage, so
             // its ends arrive here rather than through a connector
             // statement -- and so is KerML's `connector c from a to b;`,
-            // which is a `Connector` and not a usage at all.
-            if self.model.kind(id).is_a(ElementKind::Connector) {
+            // which is a `Connector` and not a usage at all. Nor is the
+            // transition `succession s first a if g then b;` declares,
+            // which relates its two through a succession of its own.
+            if self.model.kind(id).is_a(ElementKind::Connector)
+                || self.model.kind(id).is_a(ElementKind::TransitionUsage)
+            {
                 self.resolve_connector_ends(id, &node, &mut stats);
             }
             if self
@@ -451,7 +529,7 @@ impl Workspace {
                 self.resolve_verification(id, &node, &mut stats);
             }
         }
-        self.resolve_expression_tree(ids);
+        self.resolve_expression_tree(ids, &mut stats);
         self.imply_for(ids);
         stats.lookups = self.lookups - began;
         stats

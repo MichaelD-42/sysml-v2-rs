@@ -8,11 +8,15 @@
 //! layout arranged for bends ends up where ELK left no room. Where ELK
 //! routes nothing, the renderer routes for itself.
 
-use elkrs::alg_layered::options_gen::SPACING_NODE_NODE_BETWEEN_LAYERS;
+use elkrs::alg_layered::options_gen::{
+    SPACING_EDGE_EDGE_BETWEEN_LAYERS, SPACING_EDGE_NODE_BETWEEN_LAYERS,
+    SPACING_NODE_NODE_BETWEEN_LAYERS,
+};
 use elkrs::core::engine::RecursiveGraphLayoutEngine;
 use elkrs::core::options_gen::{
-    Direction, ElkPadding, HierarchyHandling, ALGORITHM, DIRECTION, HIERARCHY_HANDLING, PADDING,
-    SPACING_NODE_NODE,
+    Direction, ElkPadding, HierarchyHandling, PortConstraints, PortSide, ALGORITHM, DIRECTION,
+    HIERARCHY_HANDLING, PADDING, PORT_CONSTRAINTS, PORT_SIDE, SPACING_COMPONENT_COMPONENT,
+    SPACING_NODE_NODE, SPACING_PORT_PORT,
 };
 use elkrs::graph::graph::{EdgeId, ElementId, ElkGraph, NodeId, ShapeId};
 
@@ -56,8 +60,7 @@ impl Built {
         let options = &built.graph.node(root).properties;
         options.set(&ALGORITHM, "layered".to_string());
         options.set(&DIRECTION, Direction::DOWN);
-        options.set(&SPACING_NODE_NODE, style.h_gap);
-        options.set(&SPACING_NODE_NODE_BETWEEN_LAYERS, style.v_gap);
+        spaced(options, diagram, style);
         // a package holds what it contains, so it goes to ELK as a node
         // with children and the engine arranges each package's contents
         // inside it
@@ -101,10 +104,14 @@ impl Built {
         // padding of exactly the tab would leave the first box's top
         // border drawn along the tab's bottom, which reads as one line
         let top = style.package_tab() + pad;
+        // and the names a box at either end writes beside its border,
+        // which would otherwise be written across the frame
+        let side = pad + border_room(diagram, style);
         let options = &self.graph.node(id).properties;
         options.set(&ALGORITHM, "layered".to_string());
         options.set(&DIRECTION, Direction::DOWN);
-        options.set(&PADDING, ElkPadding::new(top, pad, pad, pad));
+        spaced(options, diagram, style);
+        options.set(&PADDING, ElkPadding::new(top, side, pad, side));
 
         for &node in &diagram.groups[at].nodes {
             let (width, height) = sizes[node];
@@ -144,8 +151,27 @@ impl Built {
             };
             let (tail, head) = (self.at(tail), self.at(head));
             let id = self.graph.create_edge(Some(holder));
-            self.graph.add_edge_source(id, ShapeId::Node(tail));
-            self.graph.add_edge_target(id, ShapeId::Node(head));
+            // Each end leaves by a port of its own, on the border the
+            // layering points it out of: the bottom of the box above, the
+            // top of the box below. Where on that border is left to the
+            // engine, which orders a side's ports so that what leaves
+            // them crosses as little as it can -- left to itself, it
+            // shared one point of the border between every line and
+            // spread them in no order, and a box's three diamonds went
+            // to the three boxes below it criss-crossed. A line from a
+            // box to itself is the engine's own to place.
+            match tail == head {
+                true => {
+                    self.graph.add_edge_source(id, ShapeId::Node(tail));
+                    self.graph.add_edge_target(id, ShapeId::Node(head));
+                }
+                false => {
+                    let leaving = self.port_on(tail, PortSide::SOUTH);
+                    let arriving = self.port_on(head, PortSide::NORTH);
+                    self.graph.add_edge_source(id, ShapeId::Port(leaving));
+                    self.graph.add_edge_target(id, ShapeId::Port(arriving));
+                }
+            }
             self.edges[at] = Some(id);
             // What a line says is written across the middle of it, and a
             // transition's trigger and effect can be longer than
@@ -164,6 +190,18 @@ impl Built {
                 self.edges_within(diagram, owners, style, Some(at));
             }
         }
+    }
+
+    /// A port of `node`'s own on `side`, for one end of one line: the
+    /// node keeps each to its side and orders them itself.
+    fn port_on(&mut self, node: NodeId, side: PortSide) -> elkrs::graph::graph::PortId {
+        self.graph
+            .node(node)
+            .properties
+            .set(&PORT_CONSTRAINTS, PortConstraints::FIXED_SIDE);
+        let port = self.graph.create_port(node);
+        self.graph.port(port).properties.set(&PORT_SIDE, side);
+        port
     }
 
     /// The ELK node a box became.
@@ -209,24 +247,40 @@ impl Built {
         // it. Asking the engine for a minimum size instead is worth less
         // than it looks: it applies one to a nested node along its own
         // axis, so a frame told to be wide comes back tall.
-        for frame in &mut packages {
+        //
+        // So the room is made here, by opening a strip of it down the
+        // whole canvas at the frame's right edge: what lies right of it
+        // moves over, and what spans it -- the frame itself and every
+        // package holding it -- grows. Widening the frame alone drew it
+        // over the package beside it and out of the one around it.
+        let mut placed: Vec<Placed> = placed;
+        let mut routes = self.routes(diagram, style);
+        let canvas = &self.graph.node(self.graph.root).shape;
+        let mut width = canvas.width + 2.0 * style.margin;
+        for at in 0..packages.len() {
             // room for the name and for the corner the tab is cut off
             // at, which the drawing would otherwise take out of it
-            frame.width = frame
-                .width
-                .max(style.name_width(&frame.name) + 2.0 * style.padding + style.package_slant());
+            let wanted =
+                style.name_width(&packages[at].name) + 2.0 * style.padding + style.package_slant();
+            let short = wanted - packages[at].width;
+            if short > 0.0 {
+                let strip = packages[at].x + packages[at].width;
+                widen(
+                    &mut packages,
+                    &mut placed,
+                    &mut routes,
+                    diagram,
+                    strip,
+                    short,
+                );
+                width += short;
+            }
         }
-        let canvas = &self.graph.node(self.graph.root).shape;
-        let width = packages
-            .iter()
-            .fold(canvas.width + 2.0 * style.margin, |canvas: f64, frame| {
-                canvas.max(frame.x + frame.width + style.margin)
-            });
         Layout {
             placed,
             width,
             height: canvas.height + 2.0 * style.margin,
-            routes: self.routes(diagram, style),
+            routes,
             // a laned view never reaches here; it is placed by this crate
             lanes: Vec::new(),
             packages,
@@ -281,6 +335,122 @@ impl Built {
             })
             .collect()
     }
+}
+
+/// How far apart the engine is to set what one node holds.
+///
+/// A port's name and a parameter's are written beside the border they sit
+/// on, reading outwards, and the engine knows nothing of them: two boxes
+/// set the usual gap apart had the names of one written over the other.
+/// So the gap between two boxes side by side leaves room for a name from
+/// each, and so does the gap between two boxes nothing joins, which the
+/// engine sets apart as components rather than as nodes.
+fn spaced(options: &elkrs::graph::properties::PropertyMap, diagram: &Diagram, style: &Style) {
+    let apart = style.h_gap.max(2.0 * border_room(diagram, style));
+    options.set(&SPACING_NODE_NODE, apart);
+    options.set(&SPACING_COMPONENT_COMPONENT, apart);
+    options.set(&SPACING_NODE_NODE_BETWEEN_LAYERS, style.v_gap);
+    // What a line carries at its end -- a composition's diamond, a
+    // specialization's triangle -- is drawn along the first stretch of
+    // it, and a line run across that stretch reads as one ending in the
+    // marker. So the first stretch is twice a marker long before any line
+    // between the layers may cross it, the lines between two layers are
+    // a marker's breadth and more apart, and so are the ports along a
+    // border, so two markers side by side do not touch.
+    options.set(&SPACING_EDGE_NODE_BETWEEN_LAYERS, 2.0 * MARKER_LENGTH);
+    options.set(&SPACING_EDGE_EDGE_BETWEEN_LAYERS, MARKER_BREADTH + 4.0);
+    options.set(&SPACING_PORT_PORT, 2.0 * MARKER_BREADTH);
+}
+
+/// How long the longest marker a line ends in is drawn: a composition's
+/// diamond, along the line.
+const MARKER_LENGTH: f64 = 16.0;
+
+/// How broad the broadest marker is drawn, across the line.
+const MARKER_BREADTH: f64 = 10.0;
+
+/// The most room any box needs outside its border for the names on it.
+fn border_room(diagram: &Diagram, style: &Style) -> f64 {
+    (0..diagram.nodes.len())
+        .map(|at| crate::svg::label_room(diagram, at, style))
+        .fold(0.0, f64::max)
+}
+
+/// Open a strip `room` wide down the canvas at `x`.
+///
+/// What starts at or right of it moves right; a package that starts left
+/// of it and reaches it holds it, and grows. A line keeps both its ends on
+/// the boxes they were on, and its bends move with whatever side of the
+/// strip they were on -- an upright stretch has both its ends on one side,
+/// so it stays upright, and a level one crossing the strip grows longer.
+fn widen(
+    packages: &mut [Frame],
+    placed: &mut [Placed],
+    routes: &mut [Vec<(f64, f64)>],
+    diagram: &Diagram,
+    x: f64,
+    room: f64,
+) {
+    for frame in packages.iter_mut() {
+        if frame.x >= x {
+            frame.x += room;
+        } else if frame.x + frame.width >= x {
+            frame.width += room;
+        }
+    }
+    let moved: Vec<bool> = placed.iter().map(|placed| placed.x >= x).collect();
+    for (placed, &moved) in placed.iter_mut().zip(&moved) {
+        if moved {
+            placed.x += room;
+        }
+    }
+    for (route, edge) in routes.iter_mut().zip(&diagram.edges) {
+        let shifts = shifted(route, (moved[edge.from], moved[edge.to]), x);
+        for (point, shifts) in route.iter_mut().zip(shifts) {
+            if shifts {
+                point.0 += room;
+            }
+        }
+    }
+}
+
+/// Which points of one route move with a strip opened at `x`, given
+/// whether the boxes at its two ends moved.
+///
+/// An end goes where the box it is on went, wherever on the box it is,
+/// and so does every bend the end reaches by an upright stretch: the
+/// stretch stays upright only if both of its points move together. A box
+/// can straddle the strip -- one in a package beside the widened one,
+/// reaching past the edge the strip opens at -- and then its end stays
+/// put while the bend straight above it, right of the strip, would have
+/// moved, turning the stretch into a diagonal drawn across the canvas.
+/// An upright stretch touching neither end moves by which side of the
+/// strip it is on.
+fn shifted(route: &[(f64, f64)], ends: (bool, bool), x: f64) -> Vec<bool> {
+    let last = route.len().saturating_sub(1);
+    let mut shifts = vec![false; route.len()];
+    let mut start = 0;
+    while start < route.len() {
+        // the upright stretch starting here: every point after it at the
+        // same x
+        let mut end = start;
+        while end < last && (route[end + 1].0 - route[start].0).abs() < 0.01 {
+            end += 1;
+        }
+        let decided = match (start == 0, end == last) {
+            // one upright line from box to box: each end keeps to its
+            // own box, there being no bend to make the step at
+            (true, true) if ends.0 != ends.1 => None,
+            (true, _) => Some(ends.0),
+            (_, true) => Some(ends.1),
+            _ => Some(route[start].0 >= x),
+        };
+        for (nth, shift) in shifts.iter_mut().enumerate().take(end + 1).skip(start) {
+            *shift = decided.unwrap_or(if nth == 0 { ends.0 } else { ends.1 });
+        }
+        start = end + 1;
+    }
+    shifts
 }
 
 /// The packages each edge is written in: the innermost one holding both
@@ -492,6 +662,37 @@ mod tests {
     }
 
     #[test]
+    fn making_room_for_a_long_package_name_keeps_every_route_square() {
+        // C sits in a package beside the one that is widened, and reaches
+        // past the edge the room is opened at: its end stayed put while
+        // the bend straight above it moved over, and the line ran
+        // diagonally across the canvas from one to the other.
+        let style = Style::default();
+        let ws = resolved(
+            "package Outer {\n\
+             \tpackage First {\n\
+             \t\tpart def A;\n\
+             \t\tpackage InnerWithAnotherQuiteLongPackageNameHere_abcdefghijklmnop \
+             { part def B :> A; }\n\
+             \t}\n\
+             \tpackage Sibling { part def C :> First::A; }\n\
+             }\n",
+        );
+        let diagram = definition_diagram(ws.model(), &[ws.root()]);
+        let layout = laid_out(&diagram, &style);
+        assert_eq!(layout.routes.len(), 2);
+        for route in &layout.routes {
+            for leg in route.windows(2) {
+                let ((x1, y1), (x2, y2)) = (leg[0], leg[1]);
+                assert!(
+                    (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01,
+                    "a slanted leg in {route:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_box_outside_every_package_is_placed_too() {
         let style = Style::default();
         let ws = resolved("package P { part def A; }\npart def Loose;\n");
@@ -550,6 +751,92 @@ mod tests {
         assert!(start.1 >= from.y, "{route:?}");
         assert!(finish.1 <= to.y + to.height, "{route:?}");
         assert_eq!(layout.routes.len(), diagram.edges.len());
+    }
+
+    /// Wholes over the parts they share, each part named by all of them:
+    /// the lines of one whole cross the lines of another in the gap
+    /// between the rows.
+    const SHARED: &str = "part def Engine;\npart def Wheel;\npart def Gearbox;\n\
+                          part def Car { part e : Engine; part w : Wheel; part g : Gearbox; }\n\
+                          part def Van { part e : Engine; part w : Wheel; part g : Gearbox; }\n\
+                          part def Bus { part e : Engine; part w : Wheel; part g : Gearbox; }\n";
+
+    /// A line's first stretch is twice a diamond long before it turns,
+    /// and nothing between the rows crosses it: a line run across the
+    /// diamond read as the one it belonged to.
+    #[test]
+    fn a_line_leaves_its_box_for_twice_a_marker_before_it_turns() {
+        let ws = resolved(SHARED);
+        let diagram = definition_diagram(ws.model(), &[ws.root()]);
+        let style = Style::default();
+        let layout = laid_out(&diagram, &style);
+        let mut stubs = Vec::new();
+        for (edge, route) in diagram.edges.iter().zip(&layout.routes) {
+            let whole = &layout.placed[edge.from];
+            let bottom = whole.y + whole.height;
+            // it leaves the bottom border straight down
+            assert!((route[0].1 - bottom).abs() < 0.5, "{route:?}");
+            assert!((route[1].0 - route[0].0).abs() < 0.5, "{route:?}");
+            assert!(
+                route[1].1 - bottom >= 2.0 * MARKER_LENGTH - 0.5,
+                "{route:?}"
+            );
+            stubs.push((route[0].0, bottom, bottom + 2.0 * MARKER_LENGTH));
+        }
+        // and no level stretch of any line runs across another's stub
+        for route in &layout.routes {
+            for leg in route.windows(2) {
+                let ((x1, y1), (x2, y2)) = (leg[0], leg[1]);
+                if (y1 - y2).abs() > 0.5 {
+                    continue;
+                }
+                let (low, high) = (x1.min(x2), x1.max(x2));
+                for &(x, top, foot) in &stubs {
+                    let across = low < x - 0.5 && x + 0.5 < high;
+                    assert!(!(across && top < y1 && y1 < foot), "{route:?} crosses {x}");
+                }
+            }
+        }
+    }
+
+    /// The lines leaving one box leave it in the order of where they are
+    /// going, so that two of them never cross just under it; and the
+    /// level stretches between two rows are each at a height of their own.
+    #[test]
+    fn a_box_lets_its_lines_out_in_the_order_they_go() {
+        let ws = resolved(SHARED);
+        let diagram = definition_diagram(ws.model(), &[ws.root()]);
+        let style = Style::default();
+        let layout = laid_out(&diagram, &style);
+        for whole in 0..diagram.nodes.len() {
+            let mut leaving: Vec<(f64, f64)> = diagram
+                .edges
+                .iter()
+                .zip(&layout.routes)
+                .filter(|(edge, _)| edge.from == whole)
+                .map(|(_, route)| (route[0].0, route[route.len() - 1].0))
+                .collect();
+            leaving.sort_by(|one, other| one.0.total_cmp(&other.0));
+            for pair in leaving.windows(2) {
+                assert!(pair[0].1 <= pair[1].1 + 0.5, "{leaving:?}");
+            }
+        }
+        let mut heights: Vec<(f64, (f64, f64))> = Vec::new();
+        for route in &layout.routes {
+            for leg in route.windows(2) {
+                if (leg[0].1 - leg[1].1).abs() < 0.5 && (leg[0].0 - leg[1].0).abs() > 0.5 {
+                    let span = (leg[0].0.min(leg[1].0), leg[0].0.max(leg[1].0));
+                    for &(y, (low, high)) in &heights {
+                        let overlap = span.0 < high && low < span.1;
+                        assert!(
+                            !(overlap && (y - leg[0].1).abs() < MARKER_BREADTH),
+                            "two level stretches share a height near {y}"
+                        );
+                    }
+                    heights.push((leg[0].1, span));
+                }
+            }
+        }
     }
 
     #[test]

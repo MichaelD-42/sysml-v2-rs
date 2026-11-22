@@ -30,10 +30,6 @@ pub(crate) struct Reach {
     access: Access,
     /// Whether what the namespace inherits is searched.
     inherited: bool,
-    /// Whether what it imports is searched. A supertype's members are
-    /// inherited; what that supertype itself imports is not, so the
-    /// walk upward turns this off.
-    imports: bool,
     /// A member the answer must not be -- the declaration whose own
     /// clause is being resolved, which would otherwise answer itself.
     exclude: Option<ElementId>,
@@ -46,7 +42,6 @@ impl Reach {
         Reach {
             access,
             inherited: true,
-            imports: true,
             exclude: None,
         }
     }
@@ -68,14 +63,6 @@ impl Reach {
     pub(crate) fn narrowed_to(self, access: Access) -> Reach {
         Reach { access, ..self }
     }
-
-    /// ... and not what the namespace imports.
-    pub(crate) fn without_imports(self) -> Reach {
-        Reach {
-            imports: false,
-            ..self
-        }
-    }
 }
 
 impl Workspace {
@@ -93,22 +80,32 @@ impl Workspace {
     ///
     /// The candidates are gathered rather than searched for: ranking them the
     /// way [`search_names`](Self::search_names) does is work for a person
-    /// choosing between near misses, and taking the best few hundred first
-    /// only meant that enough elements called `x` could push `SomePackage::x`
+    /// choosing between near misses, and taking only the best few first
+    /// would let enough elements called `x` push `SomePackage::x`
     /// out of its own answer.
     pub fn named_globally(&mut self, qualified: &str) -> Option<ElementId> {
         if let Some(&found) = self.globals.get(qualified) {
             return found;
         }
-        let declared = qualified.rsplit("::").next().unwrap_or(qualified);
+        // compared name by name, so that `'My Pkg'::x` is asked for the
+        // way it is written and `A::'B::C'` is not `A::B::C`
+        let wanted = sysml_syntax::split_qualified(qualified);
+        let declared = wanted.last().cloned().unwrap_or_default();
         let candidates: Vec<ElementId> = self
             .named_elements()
             .filter(|&(_, name)| name == declared)
             .map(|(id, _)| id)
             .collect();
-        let found = candidates
-            .into_iter()
-            .find(|&it| self.qualified_name_of(it) == qualified);
+        let found = candidates.into_iter().find(|&it| {
+            let mut segments = Vec::new();
+            let mut current = Some(it);
+            while let Some(e) = current.filter(|&e| e != self.root) {
+                segments.push(self.model.name(e).unwrap_or("?"));
+                current = self.model.owner(e);
+            }
+            segments.reverse();
+            segments == wanted
+        });
         self.globals.insert(qualified.to_string(), found);
         found
     }
@@ -166,9 +163,17 @@ impl Workspace {
         // (KerML 8.2.3.5.1). `feature aa subsets non;` names nothing
         // when `non` is a classifier, however plainly the name is
         // there: what a feature subsets is a feature.
+        let mismatch = found
+            .zip(expected)
+            .filter(|&(hit, kind)| !self.model.kind(hit).is_a(kind));
         let found =
             found.filter(|&hit| expected.is_none_or(|kind| self.model.kind(hit).is_a(kind)));
         self.depth -= 1;
+        // an outermost lookup's, for the miss recorded after it: the
+        // lookups made on the way, for imports and the like, are not
+        if self.depth == 0 {
+            self.wrong_kind = mismatch;
+        }
         self.origin = outer;
         if found.is_none() {
             self.misses += 1;
@@ -210,7 +215,7 @@ impl Workspace {
         else {
             return;
         };
-        let file = self.elem_file.get(&import).copied().unwrap_or(0);
+        let file = self.file_of(import);
         match self.resolve_from(import, &segments) {
             Some(target) => {
                 stats.resolved += 1;
@@ -231,7 +236,7 @@ impl Workspace {
         node: &SyntaxNode,
         stats: &mut ResolveStats,
     ) {
-        let file = self.elem_file.get(&alias).copied().unwrap_or(0);
+        let file = self.file_of(alias);
         // An alias writes exactly one name -- the parser puts one there
         // even where the text does not, empty rather than missing.
         for qname in node
@@ -259,10 +264,36 @@ impl Workspace {
         stats: &mut ResolveStats,
     ) {
         stats.unresolved += 1;
+        let wrong_kind = self.wrong_kind.take();
+        // Read from the smallest node holding the name rather than the
+        // whole file: rendering the file per miss made a file of many
+        // unresolved names cost the square of its length.
+        let written = self
+            .files
+            .get(file)
+            .map(|it| it.parse.syntax())
+            // what is not in the file has nothing written there to read
+            .filter(|root| root.text_range().contains_range(range))
+            .and_then(|root| {
+                let cover = root.covering_element(range);
+                let node = match cover.as_node() {
+                    Some(node) => node.clone(),
+                    None => cover.parent()?,
+                };
+                let start = node.text_range().start();
+                node.text()
+                    .to_string()
+                    .get(usize::from(range.start() - start)..usize::from(range.end() - start))
+                    .map(str::to_string)
+            });
+        let name = written
+            .and_then(|written| spelled_as_written(segments, &written))
+            .unwrap_or_else(|| Self::spell(segments));
         self.unresolved.push(Unresolved {
             file,
             range,
-            name: Self::spell(segments),
+            name,
+            wrong_kind,
         });
     }
     /// Record a resolved reference, and with it every earlier segment of
@@ -279,7 +310,15 @@ impl Workspace {
         at: &[TextRange],
         target: ElementId,
     ) {
+        // the walk that reached `target`, and no other: a lookup that
+        // walks no qualified name leaves the last one's steps behind, and
+        // paired with these ranges they made `approved` in `(as A::T)
+        // .approved` a mention of `A`
         let walked = std::mem::take(&mut self.chain);
+        let walked = match walked.last() == Some(&target) {
+            true => walked,
+            false => Vec::new(),
+        };
         self.references.push(Reference {
             file,
             range,
@@ -422,14 +461,30 @@ impl Workspace {
         self.lookup_guarded(ns, name, reach, &mut guard)
     }
 
+    /// The guard is kept per namespace *and* per way of searching it: a
+    /// subtype's walk meets its supertype first through the inheritance,
+    /// seeing what a subtype may, and an `import all A::*` of the same
+    /// supertype later asks for more. Keyed on the namespace alone, the
+    /// second search was refused as a cycle and the name went unfound.
     fn lookup_guarded(
         &mut self,
         ns: ElementId,
         name: &str,
         reach: Reach,
-        guard: &mut HashSet<ElementId>,
+        guard: &mut HashSet<(ElementId, Access, bool)>,
     ) -> Option<ElementId> {
-        if !guard.insert(ns) {
+        if !guard.insert((ns, reach.access, reach.inherited)) {
+            return None;
+        }
+        // An alias was set aside for being too deep to work out here, and
+        // everything until the outermost alias takes it up again is held
+        // back and asked again afterwards. Searching on would only pay for
+        // answers that are thrown away: a failed lookup goes on to the
+        // namespace's imports, the scopes around it and a second walk, and
+        // over a long chain of aliases that is a scan of the whole
+        // namespace per link.
+        if self.deferred_alias.is_some() {
+            self.blocked += 1;
             return None;
         }
         // A namespace inherits from a namespace that inherits from a
@@ -451,7 +506,7 @@ impl Workspace {
         ns: ElementId,
         name: &str,
         reach: Reach,
-        guard: &mut HashSet<ElementId>,
+        guard: &mut HashSet<(ElementId, Access, bool)>,
     ) -> Option<ElementId> {
         // Direct members and aliases, in the order they are written.
         let mut candidates = self.members_named(ns, name);
@@ -479,6 +534,11 @@ impl Workspace {
                 return Some(child);
             }
         }
+        // the alias just asked for was set aside, and with it whatever
+        // this walk would find: see `lookup_guarded`
+        if self.deferred_alias.is_some() {
+            return None;
+        }
         // inherited members through specializations/typings. Private members
         // are not inherited; through an external path only public ones are
         // accessible.
@@ -495,12 +555,9 @@ impl Workspace {
             // candidate no other candidate specializes.
             let mut hits = Vec::new();
             for sup in self.supertypes_of(ns) {
-                if let Some(hit) = self.lookup_guarded(
-                    sup,
-                    name,
-                    reach.without_imports().narrowed_to(sub_access),
-                    guard,
-                ) {
+                if let Some(hit) =
+                    self.lookup_guarded(sup, name, reach.narrowed_to(sub_access), guard)
+                {
                     if !hits.contains(&hit) {
                         hits.push(hit);
                     }
@@ -519,59 +576,76 @@ impl Workspace {
             }
         }
         // imported members: all imports apply inside the namespace itself,
-        // only `public import`s re-export
-        if reach.imports && reach.access != Access::Inherited {
-            for import in self.imports_of(ns) {
-                if reach.access == Access::External && self.visibility(import) != Vis::Public {
-                    continue;
+        // only `public import`s re-export, and a subtype inherits what a
+        // supertype imports unless it imported it privately
+        // -- what a supertype imports publicly or protectedly is inherited
+        // with the rest of what it has: `inheritableMemberships` takes its
+        // `nonPrivateMemberships`, imported ones included
+        for import in self.imports_of(ns) {
+            let shown = match reach.access {
+                Access::Internal => true,
+                Access::Inherited => self.visibility(import) != Vis::Private,
+                Access::External => self.visibility(import) == Vis::Public,
+            };
+            if !shown {
+                continue;
+            }
+            let Some(imp) = self.import_target(import) else {
+                continue;
+            };
+            // `import all` overrides target-side visibility
+            let target_access = if imp.all {
+                Access::Internal
+            } else {
+                Access::External
+            };
+            if imp.scope.brings_the_member() {
+                // `import A::B;` makes the member visible under
+                // the name the import wrote, and where that is
+                // the member's own its short name answers too.
+                // Where it is an alias's -- `import A::Alias;`
+                // -- the member's own name was not imported,
+                // and offering it as well would let a name the
+                // importing file never wrote resolve.
+                let wrote = imp.leaf.as_deref();
+                let by_its_own_name =
+                    wrote.is_some_and(|leaf| self.member_name_matches(imp.target, leaf));
+                if (wrote == Some(name)
+                    || (by_its_own_name && self.member_name_matches(imp.target, name)))
+                    && self.admits(imp.target, &imp.filters)
+                {
+                    return Some(imp.target);
                 }
-                let Some(imp) = self.import_target(import) else {
-                    continue;
-                };
-                // `import all` overrides target-side visibility
-                let target_access = if imp.all {
-                    Access::Internal
-                } else {
-                    Access::External
-                };
-                if imp.scope.brings_the_member() {
-                    // `import A::B;` makes the member visible under
-                    // the name the import wrote, and where that is
-                    // the member's own its short name answers too.
-                    // Where it is an alias's -- `import A::Alias;`
-                    // -- the member's own name was not imported,
-                    // and offering it as well would let a name the
-                    // importing file never wrote resolve.
-                    let wrote = imp.leaf.as_deref();
-                    let by_its_own_name =
-                        wrote.is_some_and(|leaf| self.member_name_matches(imp.target, leaf));
-                    if (wrote == Some(name)
-                        || (by_its_own_name && self.member_name_matches(imp.target, name)))
-                        && self.admits(imp.target, &imp.filters)
-                    {
-                        return Some(imp.target);
+            }
+            if imp.scope.brings_its_members() {
+                let inherited = self.inherits_into_imports(imp.target);
+                if let Some(hit) = self.lookup_guarded(
+                    imp.target,
+                    name,
+                    reach.narrowed_to(target_access).inheriting(inherited),
+                    guard,
+                ) {
+                    if self.admits(hit, &imp.filters) {
+                        return Some(hit);
                     }
                 }
-                if imp.scope.brings_its_members() {
-                    let inherited = self.inherits_into_imports(imp.target);
-                    if let Some(hit) = self.lookup_guarded(
-                        imp.target,
-                        name,
-                        reach.narrowed_to(target_access).inheriting(inherited),
-                        guard,
-                    ) {
-                        if self.admits(hit, &imp.filters) {
-                            return Some(hit);
+                if imp.scope.reaches_below() {
+                    for desc in self.nested_visible(imp.target, target_access) {
+                        if Some(desc) == reach.exclude || !self.member_name_matches(desc, name) {
+                            continue;
                         }
-                    }
-                    if imp.scope.reaches_below() {
-                        for desc in self.nested_visible(imp.target, target_access) {
-                            if Some(desc) != reach.exclude
-                                && self.member_name_matches(desc, name)
-                                && self.admits(desc, &imp.filters)
-                            {
-                                return Some(desc);
+                        // an alias answers with what it names, and it is
+                        // that which the filters have to admit
+                        let found = if self.model.kind(desc) == ElementKind::Membership {
+                            match self.resolve_alias(desc) {
+                                Some(target) => target,
+                                None => continue,
                             }
+                        } else {
+                            desc
+                        };
+                        if self.admits(found, &imp.filters) {
+                            return Some(found);
                         }
                     }
                 }
@@ -581,7 +655,7 @@ impl Workspace {
     }
     /// The members of `ns` that answer to `name`, in the order a walk
     /// of the namespace would have met them.
-    fn members_named(&mut self, ns: ElementId, name: &str) -> Vec<ElementId> {
+    pub(crate) fn members_named(&mut self, ns: ElementId, name: &str) -> Vec<ElementId> {
         if !self.members.contains_key(&ns) {
             let index = self.member_index(ns);
             self.members.insert(ns, index);
@@ -633,6 +707,36 @@ impl Workspace {
         }
         false
     }
+    /// One of the standard library's own types, `Actions::Action`, for an
+    /// element that specializes it without saying so.
+    ///
+    /// The path is the library's and not a name the model wrote, so it is
+    /// read in the library: a model is free to declare a root package
+    /// called `Requirements` or `Actions` of its own -- `SimpleVehicleModel`
+    /// does -- and asked from the root as a name written in that model, the
+    /// model's package stood in front of the library's, held no
+    /// `Actions::Action`, and every action in the workspace specialized
+    /// nothing: `start`, `done` and `subj` named nothing.
+    /// Where no library package of that name is loaded, the path is asked
+    /// as though written at `elem`, which is what it always was.
+    pub(crate) fn library_type(&mut self, elem: ElementId, path: &str) -> Option<ElementId> {
+        let mut segments = path.split("::");
+        let first = segments.next()?;
+        let library = self
+            .members_named(self.root, first)
+            .into_iter()
+            .find(|&it| self.in_library(it));
+        let Some(mut current) = library else {
+            let written: Vec<String> = std::iter::once(String::new())
+                .chain(path.split("::").map(String::from))
+                .collect();
+            return self.resolve_from(elem, &written);
+        };
+        for seg in segments {
+            current = self.lookup(current, seg, Reach::all(Access::External))?;
+        }
+        Some(current)
+    }
     /// Everything an `import N::**` reaches below `ns`: the members
     /// `access` can see, then the members of those, and so on down.
     ///
@@ -644,7 +748,20 @@ impl Workspace {
         let mut out = Vec::new();
         let mut stack: Vec<ElementId> = self.model.owned(ns).iter().rev().copied().collect();
         while let Some(at) = stack.pop() {
-            if self.model.kind(at).is_a(ElementKind::Relationship) || !self.visible(at, access) {
+            if !self.visible(at, access) {
+                continue;
+            }
+            // An alias is a membership of the namespace it is written in,
+            // and so as much a visible member there as anything declared:
+            // `import A::**;` reaches `alias AL for D;` in `A::N` as it
+            // reaches `D`. It is the one relationship that is, and it has
+            // nothing below it to walk into.
+            let kind = self.model.kind(at);
+            if kind == ElementKind::Membership {
+                out.push(at);
+                continue;
+            }
+            if kind.is_a(ElementKind::Relationship) {
                 continue;
             }
             out.push(at);
@@ -726,6 +843,11 @@ impl Workspace {
                 .and_then(|named| self.model.name(named))
                 .map(String::from);
         };
+        // `do senseTemperature { out temp; }` is a statement rather than a
+        // usage, and answers to what it performs all the same
+        if node.kind() == SyntaxKind::CONTROL_STMT {
+            return adapter_target_segments(node).and_then(|segments| segments.last().cloned());
+        }
         if node.kind() != SyntaxKind::USAGE {
             return None;
         }
@@ -752,4 +874,28 @@ impl Workspace {
         }
         None
     }
+}
+
+/// `segments` joined the way the source joined them: `a.cc` is a feature
+/// chain, and reported as `a::cc` it named a path nobody wrote, which an
+/// editor's quick fix then replaced with one that meant something else.
+/// `None` where what is written is not plainly the segments and their
+/// separators -- quoted names, a multiplicity in front -- and the plain
+/// spelling stands.
+fn spelled_as_written(segments: &[String], written: &str) -> Option<String> {
+    let compact: String = written.chars().filter(|it| !it.is_whitespace()).collect();
+    let (first, rest) = segments.split_first()?;
+    let mut rest_of = compact.strip_prefix(first.as_str())?;
+    let mut out = first.clone();
+    for segment in rest {
+        let (separator, after) = if let Some(after) = rest_of.strip_prefix("::") {
+            ("::", after)
+        } else {
+            (".", rest_of.strip_prefix('.')?)
+        };
+        rest_of = after.strip_prefix(segment.as_str())?;
+        out.push_str(separator);
+        out.push_str(segment);
+    }
+    rest_of.is_empty().then_some(out)
 }

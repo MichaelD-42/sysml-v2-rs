@@ -1,6 +1,6 @@
 # Changelog
 
-Ten crates are published from this repository and each carries its own
+Each crate published from this repository carries its own
 version, because what a number moves for is a change in the crate it is
 on. So an entry here names the crates it is about and the version each
 went to; a crate not named in an entry did not change in it.
@@ -8,7 +8,209 @@ went to; a crate not named in an entry did not change in it.
 Dates are the day the tag was cut. Anything under **Unreleased** is on
 `main` and is not on crates.io yet.
 
-## Unreleased
+## 2026-11-16
+
+Published: `sysmlv2-syntax` **0.1.4**, `sysmlv2-model` **0.1.3**,
+`sysmlv2-semantics` **0.1.3**, `sysmlv2-interchange` **0.2.1**,
+`sysmlv2-lsp` **0.2.1**, `sysmlv2-diagram` **0.2.2**,
+`sysmlv2-rust` **0.1.2**, `sysmlv2-cli` **0.2.0** (breaking: the keys
+of `--format json` and `sysml mcp`, below).
+
+### Lines that can be told apart
+
+`sysmlv2-diagram`
+
+- A line leaves its box straight for twice the length of the marker it
+  carries before it turns, and no other line crosses that stretch: a
+  line run just under a row of diamonds read as ending in whichever
+  diamond it passed.
+- Each end of a line has a port of its own on the border the layering
+  points it out of, ordered along that border so that what leaves a box
+  goes the way its lines are going.
+- The level stretches between two rows are a marker's breadth and more
+  apart. A drawing with many lines between its rows is taller for it.
+
+### A name declared twice is said where it is repeated
+
+`sysmlv2-semantics`, `sysmlv2-cli`, `sysmlv2-lsp`
+
+- Two declarations of one name in one namespace are reported at the
+  second, saying which name it is and where the first is -- in
+  `sysml check`'s text and JSON (`detail`, `first`), in `check` over
+  MCP, and in the editor, with the first declaration as related
+  information. They were one violation of the namespace around them,
+  in the specification's general words, and six `part def Vehicle`
+  read as one unnamed complaint about the package.
+- The editor and the playground show it as an error, as `sysml check`
+  counts it. The other constraints stay warnings there: they are asked
+  of what this toolchain builds of the abstract syntax, and a repeated
+  name is in the text itself.
+
+### One spelling for every key, a name for every element, and the whole model written back
+
+`sysmlv2-cli`, `sysmlv2-semantics`, `sysmlv2-lsp`, `sysmlv2-model`
+
+- **Breaking:** every key `sysml --format json` and `sysml mcp` name
+  themselves is `snake_case`, as the arguments already were:
+  `parseErrors`, `libraryUnresolved`, `declaredAs`, `didYouMean`,
+  `endOffset`, `endLine`, `endColumn`, `shortName` and `newText` are now
+  `parse_errors`, `library_unresolved`, `declared_as`, `did_you_mean`,
+  `end_offset`, `end_line`, `end_column`, `short_name` and `new_text`.
+  The check that `sysml mcp` answered and the one the command line
+  printed had spelt the same hint two ways. What the protocols define
+  (MCP's `inputSchema`, LSP's `newText`) and the standard JSON's
+  metamodel names (`declaredName`, `@id`) are left as they are.
+- `import_json` writes back the whole of a model rather than its
+  declarations: connections, bindings, flows, messages, interfaces and
+  allocations by the ends they connect; successions, with `then b;` and
+  `then action b;` where one follows the step before it; decisions'
+  `if g then b;` and `else c;`; transitions with their triggers, guards
+  and effects; `accept`, `send`, `assign`, `if`, `while`, `loop`, `for`
+  and `terminate`; `perform`, `exhibit`, `include`, `satisfy`, `assert`,
+  `render` and events; metadata, dependencies, filtered imports,
+  exposures, named comments and what they are `about`; KerML's
+  connectors, `unions`, `intersects`, `differences`, `disjoint from`,
+  `featured by` and `inverse of`; and every expression -- as the text
+  the document kept of it, which `sysml export` keeps of each, and
+  otherwise from its structure. Exported again, what it writes of each
+  official example whose names all resolve is the document it was read
+  from in 31 of 32 training directories, 37 of 38 example and validation
+  directories, and 8 of 13 KerML ones.
+- Each name it writes is the one that finds the element from where it
+  stands -- through an import, from the nearest namespace that holds it,
+  or from `$::` past a nearer declaration of the same name -- rather than
+  its whole qualified name, which does not reach a private member and
+  which a package of the model's own can hide.
+- `interface a to b;` connects `a` and `b`. It was read as an interface
+  named `a` with the one end `b`: SysML writes an interface's declaration
+  only in front of `connect`, as KerML writes a connector's only in front
+  of `from`.
+- The unit in `accept after 5 [s] then off;` is part of the time it
+  waits, and no longer the multiplicity of the transition: only a step's
+  name takes one in a statement, as `then timeslice t[0..*]` does.
+- `import A::**;` is the import of `A` and everything under it, a
+  `MembershipImport`, and no longer the `NamespaceImport` that
+  `A::*::**` is, which does not bring `A` in.
+- Writing `[*]` asked `LiteralInfinity` for a value it has no property
+  for, which a debug build stops on.
+- An element that declares no name of its own but borrows one, such as
+  `part :>> engine;`, is named by that name in `sysml check`, in the
+  language server's hover and signature help, and in suggestions,
+  rather than as `'?'`.
+
+### Any language, both ways
+
+`sysmlv2-rust` **0.1.2**, `sysmlv2-cli` **0.1.5**
+
+Rust is the language that ships, as it was; every other is now yours to
+add. Both halves of the seam live in `sysmlv2-rust`, stated as data in
+no language in particular, rather than in crates of their own: the
+official support is for Rust, and the way to another language is part
+of it.
+
+- `sysml import-code` imports code in any language the way Doxygen
+  takes one it has never heard of: through a program that writes what
+  the tool already reads. What is already read is a *surface* — the
+  records, enumerations, interfaces and functions some code declares,
+  as JSON, in no language in particular — and one writer turns any
+  surface into a package whose every definition carries a `@code`
+  binding. Which names are quoted, how two members that want one name
+  are told apart, what is refused for naming a type nothing declares:
+  decided once, in `sysml_rust::surface`, and not by each importer
+  again.
+- The importer is found by name on `PATH`, as `cargo` and `git` find a
+  subcommand: `sysml-import-<lang>`, where the language is the inputs'
+  extension unless `--lang` names it or `--via` names the command. It
+  may write the surface or the SysML itself. Either way the package is
+  parsed and resolved against the standard library before it is
+  written out, and an importer that got a name wrong is told here
+  rather than by the first model that imports what it wrote.
+  `--schema` prints what a surface is.
+- `import-rust` now reads a crate as a surface and writes it through
+  the same writer, so the two subcommands cannot drift; `--surface`
+  writes that JSON instead of the SysML, which is the quickest way to
+  see what an importer for another language has to say. What the
+  fixture crate imports as is unchanged to the byte, except two
+  comment lines that no longer say `Rust`.
+- The MCP server's `import_code` takes a surface as an object, and its
+  input schema is the surface's own, so a client builds the call from
+  what a front end's author reads. An agent may write one itself, for
+  a language no tool reads yet: it says what it can see of the code,
+  and the answer is a checked package rather than a guess.
+- `examples/import-python` is such an importer, in two hundred lines
+  of Python, with the package it writes checked in beside it and held
+  there by a test.
+- `sysmlv2-rust` gains `surface`, `plan` and `binding` as public
+  modules, `rustdoc_to_surface`, and a `schema` feature that derives
+  the JSON schema of a surface and of a plan; nothing it had is
+  changed. It depends on `sysmlv2-semantics` now, since a plan is read
+  off a resolved workspace.
+- The same seam the other way: `sysml codegen --lang <lang>` hands the
+  plan — what the model implies for code, in no language in particular,
+  as `sysml plan` prints it — to `sysml-gen-<lang>` on `PATH` on
+  standard input, and takes what comes back as the code. `--lang rust`
+  is the generator built in, and writes what `rustgen` writes. A model
+  that does not resolve is refused before any generator runs, as
+  `rustgen` refuses it. `--via` names a command instead, and both it
+  and `import-code --via` now split the command as a shell would, so a
+  path with a space in it can be quoted.
+- The plan moved out of the tool into `sysml_rust::plan`, where a
+  generator written in Rust reads it back as a `Plan` rather than as
+  JSON; `sysml plan --schema` prints its schema for one written in
+  anything else.
+  The metaclass and shape a definition is planned with are `String`s
+  now, not borrowed for the life of the program. Two things are no
+  longer planned as records: a metadata definition, which is the
+  vocabulary an annotation is written in, and the conjugated port
+  implied beside every port definition, which a generator could not
+  even name — a class `code` and a class `~Gpio` came out of a model
+  that declared neither.
+- `examples/generate-python` is a generator for Python, with the module
+  it writes for a thermostat model checked in beside it and held there
+  by a test; it imports and runs as it is.
+
+### A quantity is a number
+
+`sysmlv2-rust` **0.1.2**, `sysmlv2-cli` **0.1.5**
+
+- A feature typed by a scalar quantity — `ISQ::MassValue`, or a
+  model's own `attribute def Payload :> MassValue` — is generated as
+  the `f64` of SI coherent units it holds, with the unit on the line
+  above it: `` /// `SpeedValue` in `m/s`. `` Before, it had no Rust
+  type and was left out, and so was every calculation with one among
+  its parameters. Over the corpus's examples and training models, the
+  features left out for want of a type go from 198 to 82 and the
+  definitions from 53 to 6, among them the four calculations of
+  `Dynamics.sysml`; every file generated still compiles.
+- A feature that names no type and subsets one that does holds what
+  that one holds: `attribute mass :> ISQ::mass;`, which is how the
+  corpus writes most of its quantities, is a `MassValue`, as is a
+  subset of it, however many subsets away. The multiplicity stays the
+  subset's own, so `in m :> ISQ::mass` is one mass and not the `[*]`
+  of them `ISQ::mass` allows. The generator and the plan ask this in
+  one place, where they used to each follow a redefinition one step
+  and stop. The unit is read off the
+  dimension the library gives the quantity, not off a list of names.
+- A value written with a unit is converted: `2500 [g]` is `2.5`,
+  `100 [km/h]` is `27.7777777777778`, `3 [ft]` is `0.9144`, and
+  `s [km/h]` over a parameter is `s * 0.2777777777777778`. A unit is
+  worth what the library says — `kW` is `kilo` times `W`, which is
+  `J/s`, down to `kg*m/s^2` — and its names are the ones resolved where
+  it is written. Degree Celsius and Fahrenheit are not converted: the
+  library makes them units of temperature *difference*, and `20
+  ['°C']` written for a temperature would come out twenty kelvin.
+- A model's own quantity definition is `pub type Payload = f64;`
+  rather than a struct of the library's machinery for a quantity
+  value.
+- A declared value the generator cannot write — `= y * 2`, or one of
+  those temperatures — still starts the field at its type's default,
+  but now says so on the line above the field and among what was left
+  open. It used to read as a zero the model chose.
+- The plan says a quantity is a `Real`, as its documentation always
+  claimed and its code never did — a quantity value specializes
+  `NumericalValue`, which is above `Real`, and the walk up its
+  supertypes never got there — and gains `unit`, the SI unit that
+  number counts.
 
 ### Two lines that cross are drawn crossing
 

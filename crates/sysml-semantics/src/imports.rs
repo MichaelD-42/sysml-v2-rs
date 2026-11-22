@@ -12,11 +12,11 @@
 
 use std::collections::HashSet;
 
-use sysml_model::{ElementId, ElementKind};
+use sysml_model::{ElementId, ElementKind, Vis};
 use sysml_syntax::{SyntaxKind, SyntaxNode};
 
 use crate::syntax::*;
-use crate::{Access, ImportScope, ImportTarget, Workspace};
+use crate::{Access, ImportScope, ImportTarget, Workspace, MAX_ALIAS_NESTING};
 
 impl Workspace {
     /// All references resolving to `target`.
@@ -44,6 +44,29 @@ impl Workspace {
     pub fn import_of(&mut self, import: ElementId) -> Option<ElementId> {
         self.import_target(import).map(|target| target.target)
     }
+    /// The membership a member import names, where that is an alias: `import
+    /// D::Car;` with `alias Car for Vehicle;` in `D` imports the alias, and
+    /// reaches `Vehicle` only through it. [`import_of`](Self::import_of)
+    /// answers with `Vehicle`, which is what a name imported this way
+    /// resolves to, and which would say the import named `Vehicle`.
+    pub fn imported_alias(&mut self, import: ElementId) -> Option<ElementId> {
+        let imp = self.import_target(import)?;
+        let leaf = imp.leaf?;
+        let node = self.source.get(&import)?.clone();
+        let qname = node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::QUALIFIED_NAME)?;
+        let segments = name_segments(&qname);
+        let (_, path) = segments.split_last()?;
+        let ns = match path {
+            [] => self.model.owner(import)?,
+            _ => self.resolve_from(import, path)?,
+        };
+        self.model.owned(ns).iter().copied().find(|&member| {
+            self.model.kind(member) == ElementKind::Membership
+                && self.model.name(member) == Some(leaf.as_str())
+        })
+    }
     /// The members the imports of `ns` bring into it, resolved and
     /// visibility-filtered, in import order: what the standard's derived
     /// `importedMembership` reaches beyond the owned members.
@@ -54,7 +77,40 @@ impl Workspace {
     pub fn imported_members(&mut self, ns: ElementId) -> Vec<ElementId> {
         let mut out = Vec::new();
         let mut seen: HashSet<ElementId> = self.model.owned(ns).iter().copied().collect();
+        let mut walked = HashSet::from([ns]);
+        self.imported_into(ns, Access::Internal, &mut out, &mut seen, &mut walked);
+        out
+    }
+    /// The members the imports of `ns` give a type that specializes it:
+    /// what its public and protected imports bring in, and not what it
+    /// imports privately (`nonPrivateMemberships`).
+    pub fn inheritable_imported_members(&mut self, ns: ElementId) -> Vec<ElementId> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<ElementId> = self.model.owned(ns).iter().copied().collect();
+        let mut walked = HashSet::from([ns]);
+        self.imported_into(ns, Access::Inherited, &mut out, &mut seen, &mut walked);
+        out
+    }
+    /// What the imports of `ns` that `access` can see bring in, appended
+    /// to `out`: all of them from inside `ns`, its public ones from
+    /// outside, which is what `visibleMemberships` re-exports.
+    fn imported_into(
+        &mut self,
+        ns: ElementId,
+        access: Access,
+        out: &mut Vec<ElementId>,
+        seen: &mut HashSet<ElementId>,
+        walked: &mut HashSet<ElementId>,
+    ) {
         for import in self.imports_of(ns) {
+            let shown = match access {
+                Access::Internal => true,
+                Access::Inherited => self.visibility(import) != Vis::Private,
+                Access::External => self.visibility(import) == Vis::Public,
+            };
+            if !shown {
+                continue;
+            }
             let Some(imp) = self.import_target(import) else {
                 continue;
             };
@@ -70,23 +126,32 @@ impl Workspace {
                 out.push(imp.target);
             }
             if imp.scope.brings_its_members() {
-                self.visible_members_into(imp.target, access, &imp.filters, &mut out, &mut seen);
+                let mut from = vec![imp.target];
                 if imp.scope.reaches_below() {
-                    for below in self.nested_visible(imp.target, access) {
-                        if self.model.kind(below).is_a(ElementKind::Namespace) {
-                            self.visible_members_into(
-                                below,
-                                access,
-                                &imp.filters,
-                                &mut out,
-                                &mut seen,
-                            );
-                        }
+                    from.extend(
+                        self.nested_visible(imp.target, access)
+                            .into_iter()
+                            .filter(|&below| self.model.kind(below).is_a(ElementKind::Namespace)),
+                    );
+                }
+                for target in from {
+                    self.visible_members_into(target, access, &imp.filters, out, seen);
+                    // and what that namespace's own public imports bring
+                    // it: `import Q::*` reaches the `Engine` that `Q`
+                    // has through `public import Lib::*`, as a name
+                    // written there resolves to
+                    if walked.insert(target) {
+                        let mut further = Vec::new();
+                        self.imported_into(target, Access::External, &mut further, seen, walked);
+                        out.extend(
+                            further
+                                .into_iter()
+                                .filter(|&it| self.admits(it, &imp.filters)),
+                        );
                     }
                 }
             }
         }
-        out
     }
     /// Append the members of `ns` that `access` can see, each once.
     fn visible_members_into(
@@ -170,14 +235,31 @@ impl Workspace {
     /// A condition past what is evaluated here answers yes: a filter says
     /// which of the names already there to keep, so one that is not understood
     /// must not leave a name the model declares resolving to nothing.
+    ///
+    /// A condition asked again while it is being answered -- `@Safety`
+    /// where the only `Safety` there is would come in through this same
+    /// filtered import -- answers no. A name found only by supposing the
+    /// filter admits it is not found; without this, each round started
+    /// a fresh lookup with a fresh guard, and the search, branching at
+    /// every level down to the depth limit, never came back. The answer
+    /// is the recursion's and not the model's, so it is counted the way
+    /// the import guards count theirs, and nothing failed under it is
+    /// cached.
     pub(crate) fn admits(
         &mut self,
         member: ElementId,
         filters: &[(SyntaxNode, ElementId)],
     ) -> bool {
-        filters
-            .iter()
-            .all(|(condition, at)| self.condition_holds(condition, member, *at) != Some(false))
+        filters.iter().all(|(condition, at)| {
+            if self.filtering.contains(condition) {
+                self.blocked += 1;
+                return false;
+            }
+            self.filtering.push(condition.clone());
+            let holds = self.condition_holds(condition, member, *at);
+            self.filtering.pop();
+            holds != Some(false)
+        })
     }
     /// What one filter condition comes to for one candidate member, or
     /// `None` where the condition reaches past the operators that can be
@@ -197,10 +279,13 @@ impl Workspace {
             .children()
             .filter(|child| child.kind() != SyntaxKind::QUALIFIED_NAME);
         match condition.kind() {
-            SyntaxKind::PAREN_EXPR => {
-                let inner = operands.next()?;
-                self.condition_holds(&inner, member, at)
-            }
+            // `(@A)` is the condition inside it; `(@A, @B)` is a
+            // sequence, which is no condition at all, and reading its
+            // first element alone made it filter by `@A`
+            SyntaxKind::PAREN_EXPR => match (operands.next(), operands.next()) {
+                (Some(inner), None) => self.condition_holds(&inner, member, at),
+                _ => None,
+            },
             // `@Safety` asks what the member is annotated with, and it
             // is the whole of what the published models filter by.
             SyntaxKind::UNARY_EXPR if operator == Some(SyntaxKind::AT) => {
@@ -214,24 +299,50 @@ impl Workspace {
                 let inner = operands.next()?;
                 Some(!self.condition_holds(&inner, member, at)?)
             }
+            // `[true]` and `[false]` say outright whether anything passes
+            SyntaxKind::LITERAL => match operator? {
+                SyntaxKind::TRUE_KW => Some(true),
+                SyntaxKind::FALSE_KW => Some(false),
+                _ => None,
+            },
             SyntaxKind::BINARY_EXPR => {
                 // The operator is read before the operands because one
                 // this cannot answer -- `==` and `>` are both in the
                 // corpus -- settles the condition whatever they are.
-                let combine: fn(bool, bool) -> bool = match operator? {
-                    SyntaxKind::AND_KW | SyntaxKind::AMP => |left, right| left && right,
-                    SyntaxKind::OR_KW | SyntaxKind::PIPE => |left, right| left || right,
-                    SyntaxKind::XOR_KW => |left, right| left != right,
-                    _ => return None,
-                };
+                let operator = operator?;
+                if !matches!(
+                    operator,
+                    SyntaxKind::AND_KW
+                        | SyntaxKind::AMP
+                        | SyntaxKind::OR_KW
+                        | SyntaxKind::PIPE
+                        | SyntaxKind::XOR_KW
+                ) {
+                    return None;
+                }
                 let left = operands.next()?;
                 let right = operands.next()?;
-                // Both sides are answered whichever operator it is: a
-                // condition half of which cannot be evaluated is not
-                // evaluated, rather than answered from the half that can.
-                let left = self.condition_holds(&left, member, at)?;
-                let right = self.condition_holds(&right, member, at)?;
-                Some(combine(left, right))
+                let left = self.condition_holds(&left, member, at);
+                let right = self.condition_holds(&right, member, at);
+                // A side that cannot be answered leaves the condition
+                // unanswered unless the other side settles it on its own:
+                // `@Safety and x == 1` does not hold for a member that is
+                // not annotated, whatever `x == 1` is. Answered as
+                // unknown instead, the whole filter fell away and admitted
+                // everything.
+                match operator {
+                    SyntaxKind::AND_KW | SyntaxKind::AMP => match (left, right) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    },
+                    SyntaxKind::OR_KW | SyntaxKind::PIPE => match (left, right) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    },
+                    _ => Some(left? != right?),
+                }
             }
             _ => None,
         }
@@ -254,16 +365,33 @@ impl Workspace {
                 return true;
             }
         }
+        // Only the reflective model's own definitions say what an element
+        // is. A model's `metadata def Step;` is a keyword of its own that
+        // happens to share a metaclass's name; read by that name, `[@Step]`
+        // admitted every step in the package, annotated or not.
         let names_a_metaclass = matches!(
             self.model.kind(wanted),
             ElementKind::Metaclass | ElementKind::MetadataDefinition
-        );
+        ) && self.in_reflective_model(wanted);
         names_a_metaclass
             && self
                 .model
                 .name(wanted)
                 .and_then(ElementKind::from_name)
                 .is_some_and(|kind| self.model.kind(member).is_a(kind))
+    }
+    /// Is `elem` declared in the standard library's reflective model of
+    /// the abstract syntax -- the `KerML` and `SysML` library packages,
+    /// where `metaclass Structure` and `metadata def PartUsage` stand for
+    /// the metaclasses of those names?
+    fn in_reflective_model(&self, elem: ElementId) -> bool {
+        // the element under the root that `elem` is, or is inside
+        std::iter::successors(Some(elem), |&at| self.model.owner(at))
+            .find(|&at| self.model.owner(at) == Some(self.root))
+            .is_some_and(|top| {
+                self.model.kind(top).is_a(ElementKind::LibraryPackage)
+                    && matches!(self.model.name(top), Some("KerML" | "SysML"))
+            })
     }
     pub(crate) fn import_target(&mut self, import: ElementId) -> Option<ImportTarget> {
         if let Some(cached) = self.imports.get(&import) {
@@ -279,7 +407,24 @@ impl Workspace {
         self.lookups += 1;
         let cut = self.blocked;
         let result = (|| {
-            let node = self.source.get(&import)?.clone();
+            // `import A::*[@Safety];` imports the filter package it owns,
+            // and that package imports `A::*` -- the import the text was
+            // written for
+            let Some(node) = self.source.get(&import).cloned() else {
+                let package = self
+                    .model
+                    .owned(import)
+                    .iter()
+                    .copied()
+                    .find(|&it| self.model.kind(it).is_a(ElementKind::Package))?;
+                return Some(ImportTarget {
+                    target: package,
+                    scope: ImportScope::Members,
+                    leaf: None,
+                    all: self.model.flag(import, "isImportAll"),
+                    filters: Vec::new(),
+                });
+            };
             let qname = node
                 .children()
                 .find(|c| c.kind() == SyntaxKind::QUALIFIED_NAME)?;
@@ -342,6 +487,66 @@ impl Workspace {
         if let Some(cached) = self.aliases.get(&alias) {
             return *cached;
         }
+        if self.alias_nesting >= MAX_ALIAS_NESTING {
+            // Too deep to go on here: the alias is worked out later, from
+            // the outermost one, and every answer that waited on it is
+            // held back until then.
+            if self.deferred_alias.is_none() {
+                self.deferred_alias = Some(alias);
+                self.deferred_waiting = self
+                    .resolving
+                    .iter()
+                    .copied()
+                    .filter(|&it| self.model.kind(it) == ElementKind::Membership)
+                    .collect();
+            }
+            self.blocked += 1;
+            return None;
+        }
+        if self.alias_nesting > 0 {
+            return self.resolve_alias_once(alias);
+        }
+        // The outermost alias. Where one deep inside it was set aside, that
+        // one is worked out first -- itself perhaps setting aside one
+        // deeper still -- and then the one that waited on it again, so a
+        // chain of any length resolves a bounded stretch at a time.
+        let mut pending = vec![alias];
+        let mut waiting = HashSet::new();
+        while let Some(&next) = pending.last() {
+            self.deferred_alias = None;
+            self.resolve_alias_once(next);
+            let Some(deeper) = self.deferred_alias.take() else {
+                pending.pop();
+                continue;
+            };
+            waiting.extend(std::mem::take(&mut self.deferred_waiting));
+            // What waited on `deeper` is worked out again once it is
+            // known, so the answers given in its absence are dropped.
+            for id in std::mem::take(&mut self.provisional) {
+                self.imports.remove(&id);
+                self.aliases.remove(&id);
+                self.supertypes.remove(&id);
+                self.semantic_bases.remove(&id);
+            }
+            if waiting.contains(&deeper) || pending.contains(&deeper) {
+                // Each alias waiting here leads to the next, and the last
+                // leads back to one already waiting: a cycle, `alias A for
+                // B; alias B for A;` written long, and nothing on it or
+                // leading into it names anything. Every link is told so at
+                // once; left to be found again from each of them, a long
+                // ring was walked once per link.
+                for id in pending.drain(..).chain(waiting.drain()) {
+                    self.aliases.insert(id, None);
+                }
+                break;
+            }
+            pending.push(deeper);
+        }
+        self.aliases.get(&alias).copied().flatten()
+    }
+    /// One alias, worked out where it stands; a caller has already asked
+    /// the cache, and an alias set aside is never put in it.
+    fn resolve_alias_once(&mut self, alias: ElementId) -> Option<ElementId> {
         if !self.in_progress.insert(alias) {
             if self.resolving.last() != Some(&alias) {
                 self.blocked += 1;
@@ -350,7 +555,9 @@ impl Workspace {
         }
         self.resolving.push(alias);
         self.lookups += 1;
+        self.alias_nesting += 1;
         let cut = self.blocked;
+        let set_aside = self.deferred_alias;
         let result = (|| {
             let node = self.source.get(&alias)?.clone();
             let qname = node
@@ -359,10 +566,15 @@ impl Workspace {
             let segments = name_segments(&qname);
             self.resolve_from(alias, &segments)
         })();
+        self.alias_nesting -= 1;
         self.resolving.pop();
         self.in_progress.remove(&alias);
         self.aliases.insert(alias, result);
-        if result.is_none() && self.blocked != cut {
+        // An alias set aside below this one may be what the name meant,
+        // and the lookup carried on past it to whatever else answers to
+        // the name: an answer found that way is held back too.
+        let waited = self.deferred_alias != set_aside;
+        if (result.is_none() || waited) && self.blocked != cut {
             self.provisional.insert(alias);
         }
         result

@@ -385,7 +385,7 @@ fn a_calc_usage_performs_its_definition_over_what_the_part_bound() {
     assert!(rust.contains("pub fn widen(&self, extra: i64) -> i64 {"));
     assert!(rust.contains("widen(self.capacity, extra)"));
     // the parameters a usage binds declare no type of their own, and
-    // that is no longer a reason to skip the method
+    // that is not a reason to skip the method
     assert!(!rust.contains("not generated: calc"));
 }
 
@@ -807,8 +807,8 @@ fn state_machines_cover_their_table() {
     .unwrap();
     // a trigger typed by a generated item carries it in the event
     assert!(rust.contains("Start(Job),"));
-    // a scalar-typed trigger has no event payload shape: bare event
-    assert!(rust.contains("    Label,"));
+    // a scalar-typed trigger carries its scalar, as a field would
+    assert!(rust.contains("    Label(String),"), "{rust}");
     // a bound item rides along by its Rust path
     assert!(rust.contains("Remote(fake::Payload),"));
     // guard without payload, guard with payload, effect hook and call
@@ -817,6 +817,57 @@ fn state_machines_cover_their_table() {
     assert!(rust.contains("/// SysML effect of `start`."));
     assert!(rust.contains("hooks.effect_start(job);"));
     assert!(rust.contains("hooks.on_exit_rest();"));
+}
+
+/// `accept go : Boolean` waits for a boolean, and the event it reacts to
+/// has to carry one. The event was a bare variant whenever the payload
+/// was a scalar rather than a generated or bound type -- at the state
+/// definition's level and inside a state body alike -- so the guard
+/// over it had nothing to read and stayed `true`. A hook takes the
+/// payload by reference, and a number is compared only as a number, so
+/// the guard reads through it.
+#[test]
+fn a_trigger_carries_a_scalar_payload() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tstate def M {\n\
+         \t\tstate a; state b;\n\
+         \t\tstate c { accept go : Boolean if go then a; }\n\
+         \t\ttransition up first a accept lvl : Integer if lvl > 3 then b;\n\
+         \t\ttransition fine first b accept r : Real if r < 2 then c;\n\
+         \t\ttransition say first b accept tag : String if tag == \"x\" then a;\n\
+         \t\ttransition quiet first a accept n : Natural then c;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("    CToA(bool),"), "{rust}");
+    assert!(rust.contains("    Up(i64),"), "{rust}");
+    assert!(rust.contains("    Fine(f64),"), "{rust}");
+    assert!(rust.contains("    Say(String),"), "{rust}");
+    assert!(rust.contains("    Quiet(u64),"), "{rust}");
+    // the guards translate over the payload rather than defaulting
+    assert!(
+        rust.contains("fn guard_up(&self, lvl: &i64) -> bool {\n        (*lvl) > 3\n"),
+        "{rust}"
+    );
+    assert!(rust.contains("(*r) < 2.0"), "{rust}");
+    assert!(rust.contains("tag.clone() == \"x\""), "{rust}");
+    assert!(
+        rust.contains("fn guard_c_to_a(&self, go: &bool) -> bool {\n        (*go)\n"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("(MState::C, MEvent::CToA(go)) if hooks.guard_c_to_a(go) => {"),
+        "{rust}"
+    );
+    // no guard and no effect reads the payload, so nothing binds it
+    assert!(
+        rust.contains("(MState::A, MEvent::Quiet(_)) => {"),
+        "{rust}"
+    );
+    compiles(&rust);
 }
 
 #[test]
@@ -1733,8 +1784,8 @@ fn a_diamond_flattens_and_only_a_real_circle_is_refused() {
 
 /// Metadata is how a model says anything about anything, and only one
 /// definition of it -- this crate's own `@code` -- says which Rust item
-/// something stands for. A `@Safety { :>> level = "high"; }` once read
-/// as a binding, and its part vanished without so much as a note.
+/// something stands for. A `@Safety { :>> level = "high"; }` read
+/// as a binding would make its part vanish without so much as a note.
 #[test]
 fn somebody_elses_metadata_is_not_a_rust_binding() {
     let rust = generate(
@@ -1756,9 +1807,9 @@ fn somebody_elses_metadata_is_not_a_rust_binding() {
 }
 
 /// A struct has a size only if everything it holds inline does. The
-/// cycle detector used to look at declared members of structs alone, so
+/// cycle detector must look past the declared members of structs, or
 /// a circle closing through an inherited field, or through the payload
-/// of a variation's variant, reached `rustc` with no `Box` in it.
+/// of a variation's variant, reaches `rustc` with no `Box` in it.
 #[test]
 fn a_cycle_through_an_inherited_field_or_a_variant_payload_is_boxed() {
     let rust = generate(
@@ -1768,7 +1819,7 @@ fn a_cycle_through_an_inherited_field_or_a_variant_payload_is_boxed() {
          \tpart def A :> Base;\n\
          \tpart def B { part a : A; }\n\
          \tpart def Tree { part root : Node; }\n\
-         \tvariation part def Node { variant leaf; variant branch : Tree; }\n\
+         \tvariation part def Node { variant part leaf; variant part branch : Tree; }\n\
          }\n",
     )
     .unwrap();
@@ -1785,9 +1836,9 @@ fn a_variation_starts_at_its_first_payload_less_variant() {
     let rust = generate(
         "package S {\n\
          \tprivate import ScalarValues::*;\n\
-         \tvariation part def Mode { variant off; variant on; }\n\
+         \tvariation part def Mode { variant part off; variant part on; }\n\
          \tpart def Payload { attribute p : Real; }\n\
-         \tvariation part def Loaded { variant full : Payload; }\n\
+         \tvariation part def Loaded { variant part full : Payload; }\n\
          \tpart def Holder { part m : Mode; }\n\
          \tpart def Carrier { part l : Loaded; }\n\
          }\n",
@@ -1904,7 +1955,7 @@ fn a_state_machine_spells_its_states_and_reserves_the_names_it_derives() {
          \tstate def 'Traffic Light' {\n\
          \t\tstate 'red light';\n\
          \t\tstate green;\n\
-         \t\tstate waiting { accept go then green; }\n\
+         \t\tstate waiting { accept go : ScalarValues::Boolean then green; }\n\
          \t\ttransition 'go-green' first 'red light' then green;\n\
          \t}\n\
          \tpart def Junction { state s : 'Traffic Light'; }\n\
@@ -1914,13 +1965,14 @@ fn a_state_machine_spells_its_states_and_reserves_the_names_it_derives() {
     )
     .unwrap();
     assert!(rust.contains("pub enum TrafficLightState"), "{rust}");
+    // a transition inside a state leaves from it, and is a row of the
+    // table like any other, not left out with a note saying so.
+    // Its `go : Boolean` rides in the event, unread by any guard or effect.
     assert!(
-        rust.contains(
-            "// not generated: a transition inside state `waiting` -- only a transition naming \
-             both its ends joins the table"
-        ),
+        rust.contains("(TrafficLightState::Waiting, TrafficLightEvent::WaitingToGreen(_)) => {"),
         "{rust}"
     );
+    assert!(!rust.contains("transition inside state"), "{rust}");
     assert!(rust.contains("    RedLight,"), "{rust}");
     assert!(rust.contains("    GoGreen,"), "{rust}");
     assert!(rust.contains("pub s: TrafficLightState,"), "{rust}");
@@ -1996,7 +2048,7 @@ fn a_generic_parameter_is_named_the_way_a_type_is() {
 
 /// Every multiplicity a model can write, as the container it means.
 /// `[1..1]` is the default said out loud and `[0]` is nothing at all;
-/// both used to come out as a `Vec`, which claims neither.
+/// neither comes out as a `Vec`, which claims neither.
 #[test]
 fn a_multiplicity_becomes_the_container_it_states() {
     let rust = generate(
@@ -2021,4 +2073,752 @@ fn a_multiplicity_becomes_the_container_it_states() {
     assert!(rust.contains("pub many: Vec<Thing>,"), "{rust}");
     assert!(rust.contains("pub three: [Thing; 3],"), "{rust}");
     compiles(&rust);
+}
+
+/// What the generator was handed that it could not write as Rust that
+/// compiles, it writes otherwise or leaves open and says so: a
+/// number specialized under a name of its own, a redefinition under a
+/// new name, two generals handing down one name, text joined with `+`,
+/// and values an `Integer` cannot hold.
+#[test]
+fn what_the_types_say_is_what_compiles() {
+    let rust = generate(
+        "package P {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tattribute def Kg :> Real;\n\
+         \tpackage Q { abstract attribute def Real { attribute re : ScalarValues::Real; } }\n\
+         \tpart def X1 { attribute x : Integer; }\n\
+         \tpart def X2 { attribute x : String; }\n\
+         \tpart def R2 :> X1 { attribute y :>> x = 7; }\n\
+         \tpart def Both :> X1, X2;\n\
+         \tpart def A {\n\
+         \t\tattribute k : Kg = 1.0;\n\
+         \t\tattribute q : Q::Real;\n\
+         \t\tattribute st : String = \"x\" + \"y\";\n\
+         \t\tattribute pw : Integer = 2 ** 3;\n\
+         \t\tattribute big : Integer = 99999999999999999999;\n\
+         \t\tattribute i : Integer = 1.5;\n\
+         \t\tattribute one : Integer[1..1];\n\
+         \t\tattribute three : Integer[3];\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("pub type Kg = f64;"), "{rust}");
+    assert!(rust.contains("pub k: f64,"), "{rust}");
+    // a model's own `Real` is not the library's
+    assert!(!rust.contains("pub q: f64"), "{rust}");
+    assert!(
+        rust.contains("pub struct R2 {\n    pub y: i64,\n}"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("`x` is handed down by two generals that do not redefine one another"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("st: \"x\".to_string() + &\"y\".to_string(),"),
+        "{rust}"
+    );
+    for open in ["pw", "big", "i"] {
+        assert!(
+            rust.contains(&format!("// left open: `{open}`")),
+            "{open}: {rust}"
+        );
+    }
+    assert!(rust.contains("pub one: i64,"), "{rust}");
+    assert!(rust.contains("pub three: [i64; 3],"), "{rust}");
+    assert!(rust.contains("/// SysML: `attribute def Kg`"), "{rust}");
+    compiles(&rust);
+}
+
+#[test]
+fn a_call_is_to_the_calculation_the_model_resolved_it_to_not_one_that_shares_its_name() {
+    // `C` imports `B`, so its `F` is `B::F` -- the one with a formula --
+    // and not the abstract `A::F` that shares the name. Which of the two
+    // a lookup by name found depended on how a hash map was laid out, so
+    // the same model came out two ways.
+    let model = "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tpackage A { abstract calc def F { in x : Real; return : Real; } }\n\
+         \tpackage B { calc def F { in x : Real; return : Real; x * 2.0 } }\n\
+         \tpackage C { private import B::*; calc def G { in a : Real; return : Real; F(a) } }\n\
+         }\n";
+    let rust = generate(model).unwrap();
+    assert!(
+        rust.contains("pub fn g(a: f64) -> f64 {\n    f(a)\n}"),
+        "{rust}"
+    );
+    for _ in 0..12 {
+        assert_eq!(
+            generate(model).unwrap(),
+            rust,
+            "the output is not deterministic"
+        );
+    }
+    compiles(&rust);
+
+    // two `F`s with formulas: the second lost the Rust name `f` to the
+    // first, so a call meaning the second has no function to call, and
+    // calling the first would compute something else
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tpackage A { calc def F { in x : Real; in y : Real; return : Real; x - y } }\n\
+         \tpackage B {\n\
+         \t\tcalc def F { in y : Real; in x : Real; return : Real; x / y }\n\
+         \t\tcalc def G { in a : Real; return : Real; F(y = a, x = 2.0) }\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("todo!(\"{}\", \"F(y = a, x = 2.0)\")"),
+        "{rust}"
+    );
+    assert!(!rust.contains("f(2.0, a)"), "{rust}");
+    compiles(&rust);
+}
+
+#[test]
+fn a_machine_starts_in_the_state_its_entry_names_not_the_first_one_declared() {
+    let rust = generate(
+        "package S {\n\
+         \tstate def M {\n\
+         \t\tentry; then b;\n\
+         \t\tstate a;\n\
+         \t\tstate b;\n\
+         \t\ttransition go first a then b;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("    pub fn initial() -> Self {\n        MState::B\n    }"),
+        "{rust}"
+    );
+    assert!(rust.contains("`entry; then b;`"), "{rust}");
+    compiles(&rust);
+}
+
+#[test]
+fn an_unnamed_transition_is_a_row_of_the_table_called_after_its_ends() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tstate def M {\n\
+         \t\tstate a;\n\
+         \t\tstate b;\n\
+         \t\ttransition first b if true then a;\n\
+         \t\ttransition b_to_a first a then b;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    // the model's own `b_to_a` keeps its name, and the unnamed one is
+    // called after its ends clear of it
+    assert!(rust.contains("    BToA2,\n    BToA,\n"), "{rust}");
+    assert!(
+        rust.contains("(MState::B, MEvent::BToA2) if hooks.guard_b_to_a_2() => {"),
+        "{rust}"
+    );
+    assert!(rust.contains("(MState::A, MEvent::BToA) => {"), "{rust}");
+    compiles(&rust);
+}
+
+/// The behaviours below are made of these.
+const STEPS: &str = "\tprivate import ScalarValues::*;\n\
+     \taction def Measure { out reading : Real; }\n\
+     \taction def Log { in reading : Real; }\n\
+     \taction def Note { in text : String; }\n";
+
+#[test]
+fn a_decision_runs_the_one_branch_its_guards_choose() {
+    let rust = generate(&format!(
+        "package S {{\n{STEPS}\
+         \taction def Choose {{\n\
+         \t\tin flag : Boolean;\n\
+         \t\tin level : Real;\n\
+         \t\taction measure : Measure;\n\
+         \t\taction high : Log;\n\
+         \t\taction low : Log;\n\
+         \t\taction neither : Log;\n\
+         \t\taction finish : Measure;\n\
+         \t\tfirst measure then d;\n\
+         \t\tdecide d;\n\
+         \t\t\tif flag then high;\n\
+         \t\t\tif level > 1.0 then low;\n\
+         \t\t\telse neither;\n\
+         \t\tfirst high then m;\n\
+         \t\tfirst low then m;\n\
+         \t\tfirst neither then m;\n\
+         \t\tmerge m;\n\
+         \t\tfirst m then finish;\n\
+         \t\tflow measure.reading to high.reading;\n\
+         \t\tflow measure.reading to low.reading;\n\
+         \t\tflow measure.reading to neither.reading;\n\
+         \t}}\n\
+         }}\n"
+    ))
+    .unwrap();
+    assert!(
+        rust.contains(concat!(
+            "    fn choose(&mut self, flag: bool, level: f64) {\n",
+            "        let measure = self.measure();\n",
+            "        if flag {\n",
+            "            let high = self.log(measure);\n",
+            "        } else if level > 1.0 {\n",
+            "            let low = self.log(measure);\n",
+            "        } else {\n",
+            "            let neither = self.log(measure);\n",
+            "        }\n",
+            "        let finish = self.measure();\n",
+            "    }\n",
+        )),
+        "{rust}"
+    );
+    compiles(&rust);
+}
+
+#[test]
+fn if_while_and_loop_actions_are_rusts_own_if_while_and_loop() {
+    let rust = generate(&format!(
+        "package S {{\n{STEPS}\
+         \taction def Run {{\n\
+         \t\tin flag : Boolean;\n\
+         \t\tin text : String;\n\
+         \t\taction measure : Measure;\n\
+         \t\twhile flag {{ action again : Measure; action lg : Log; flow again.reading to lg.reading; }}\n\
+         \t\tif flag {{ action more : Measure; }} else {{ action less : Measure; }}\n\
+         \t\tloop action forever {{\n\
+         \t\t\taction x : Log;\n\
+         \t\t\tflow measure.reading to x.reading;\n\
+         \t\t\taction say : Note {{ in text = Run::text; }}\n\
+         \t\t}} until flag;\n\
+         \t\tthen action last : Measure;\n\
+         \t}}\n\
+         }}\n"
+    ))
+    .unwrap();
+    assert!(
+        rust.contains(concat!(
+            "    fn run(&mut self, flag: bool, text: String) {\n",
+            "        let measure = self.measure();\n",
+            "        while flag {\n",
+            "            let again = self.measure();\n",
+            "            let lg = self.log(again);\n",
+            "        }\n",
+            "        if flag {\n",
+            "            let more = self.measure();\n",
+            "        } else {\n",
+            "            let less = self.measure();\n",
+            "        }\n",
+            "        loop {\n",
+            "            let x = self.log(measure);\n",
+            // read again on every pass, so it is not taken on the first
+            "            let say = self.note(text.clone());\n",
+            "            if flag {\n",
+            "                break;\n",
+            "            }\n",
+            "        }\n",
+            "        let last = self.measure();\n",
+            "    }\n",
+        )),
+        "{rust}"
+    );
+    compiles(&rust);
+}
+
+#[test]
+fn control_flow_a_body_cannot_honour_is_named_rather_than_dropped() {
+    let rust = generate(&format!(
+        "package S {{\n{STEPS}\
+         \taction def Leaks {{\n\
+         \t\tin flag : Boolean;\n\
+         \t\tout result : Real;\n\
+         \t\tif flag {{ action inner : Measure; flow inner.reading to result; }}\n\
+         \t}}\n\
+         \taction def Unguarded {{\n\
+         \t\tin flag : Boolean;\n\
+         \t\taction measure : Measure;\n\
+         \t\taction lg : Log;\n\
+         \t\tfirst measure;\n\
+         \t\tif flag then lg;\n\
+         \t\tflow measure.reading to lg.reading;\n\
+         \t}}\n\
+         \taction def Meets {{\n\
+         \t\tin flag : Boolean;\n\
+         \t\taction a : Measure;\n\
+         \t\taction b : Measure;\n\
+         \t\taction c : Measure;\n\
+         \t\tdecide d;\n\
+         \t\t\tif flag then a;\n\
+         \t\t\telse b;\n\
+         \t\tfirst a then c;\n\
+         \t\tfirst b then c;\n\
+         \t}}\n\
+         \taction def Sends {{\n\
+         \t\taction measure : Measure;\n\
+         \t\tsend 1 to measure;\n\
+         \t}}\n\
+         }}\n"
+    ))
+    .unwrap();
+    for (def, why) in [
+        (
+            "Leaks",
+            "`result` is produced only inside a branch or a loop",
+        ),
+        ("Unguarded", "the succession out of `measure` is guarded"),
+        (
+            "Meets",
+            "the ways out of `d` meet again other than at a `merge`, at `c`",
+        ),
+        ("Sends", "is a `send` -- no generated body performs one"),
+    ] {
+        let at = rust.find(&format!("pub trait {def}")).expect(def);
+        let before = &rust[..at];
+        let said = &before[before.rfind("/// SysML: `action def").unwrap()..];
+        assert!(said.contains("Not performed here: "), "{def}: {said}");
+        assert!(said.contains(why), "{def}: {said}");
+    }
+    compiles(&rust);
+}
+
+/// A state or a transition named after a Rust keyword, and two states
+/// that spell alike in Rust, each get a hook of their own.
+///
+/// A hook is a prefix and a name, and `on_entry_r#move` is no Rust name
+/// at all; `'a b'` and `a_b` both wanted `on_entry_a_b`.
+#[test]
+fn every_state_and_transition_has_a_hook_rust_can_name() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tattribute def Go;\n\
+         \tstate def M {\n\
+         \t\tentry; then move;\n\
+         \t\tstate move;\n\
+         \t\tstate 'type';\n\
+         \t\tstate 'a b';\n\
+         \t\tstate a_b;\n\
+         \t\ttransition 'type' first move accept g : Go if true then 'type';\n\
+         \t\ttransition t2 first 'a b' accept Go then a_b;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("fn on_entry_move(&mut self)"), "{rust}");
+    assert!(rust.contains("fn guard_type(&self"), "{rust}");
+    assert!(rust.contains("fn on_entry_a_b(&mut self)"), "{rust}");
+    assert!(rust.contains("fn on_entry_a_b_2(&mut self)"), "{rust}");
+    assert!(!rust.contains("_r#"), "{rust}");
+    compiles(&rust);
+}
+
+/// What a comment quotes from the model stays inside the comment.
+///
+/// A guard or a value written over several lines put its second line
+/// after the comment's end, where it was read as code.
+#[test]
+fn model_text_quoted_in_a_comment_stays_on_its_line() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tattribute def Sig { attribute level : Integer; attribute hot : Boolean; }\n\
+         \tstate def M {\n\
+         \t\tstate a; state b;\n\
+         \t\ttransition t1 first a accept s : Sig\n\
+         \t\t\tif s.level > 3\n\
+         \t\t\t   and s.hot\n\
+         \t\t\tthen b;\n\
+         \t}\n\
+         \tpart def P {\n\
+         \t\tattribute x : Real = 1.0;\n\
+         \t\tattribute y : Real = x * // twice\n\
+         \t\t\t2.0;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("/// SysML guard: `[s.level > 3 and s.hot]`"),
+        "{rust}"
+    );
+    assert!(rust.contains("`= x * // twice 2.0` is beyond"), "{rust}");
+    compiles(&rust);
+}
+
+/// Two methods of one struct that spell alike in Rust are two methods.
+#[test]
+fn two_calculations_that_spell_alike_are_two_methods() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tpart def P {\n\
+         \t\tattribute x : Real = 1.0;\n\
+         \t\tcalc fooBar : Real { x }\n\
+         \t\tcalc foo_bar : Real { x * 2 }\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("pub fn foo_bar(&self)"), "{rust}");
+    assert!(rust.contains("pub fn foo_bar_2(&self)"), "{rust}");
+    compiles(&rust);
+}
+
+/// A formula reads a chain only through features that hold one value,
+/// joins text the way Rust does, and makes the numbers on either side of
+/// an operator the same kind of number.
+#[test]
+fn a_formula_is_rust_that_types_or_is_left_to_write() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tpart def Inner { attribute amount : Real = 2.0; attribute n : Integer = 1; }\n\
+         \tpart def P {\n\
+         \t\tattribute name : String = \"n\";\n\
+         \t\tattribute r : Real = 2.0;\n\
+         \t\tattribute i : Integer = 3;\n\
+         \t\tpart line : Inner[0..1];\n\
+         \t\tpart lines : Inner[*];\n\
+         \t\tpart one : Inner;\n\
+         \t\tcalc through : Real { one.amount * 2 }\n\
+         \t\tcalc maybe : Real { line.amount * 2 }\n\
+         \t\tcalc several : Real { lines.amount }\n\
+         \t\tcalc greeting : String { \"a\" + name + \"!\" }\n\
+         \t\tcalc big : Boolean { r > 1 and i < 2 }\n\
+         \t\tcalc mixed : Real { one.amount ** 2 + one.n }\n\
+         \t\tcalc half : Real { i / 2 }\n\
+         \t}\n\
+         \tcalc def Inferred { in a : Real; in b : Real; a * b + 1 }\n\
+         \tconstraint def Pos { in v : Real; v > 0 }\n\
+         }\n",
+    )
+    .unwrap();
+    let body = |name: &str| {
+        let at = rust.find(&format!("fn {name}(")).expect(name);
+        let rest = &rust[at..];
+        rest[rest.find('{').unwrap() + 1..rest.find("\n    }").unwrap_or(rest.len())]
+            .trim()
+            .to_string()
+    };
+    assert_eq!(body("through"), "self.one.amount * 2.0");
+    // an `Option` and a `Vec` have no `amount`
+    assert!(body("maybe").starts_with("todo!"), "{rust}");
+    assert!(body("several").starts_with("todo!"), "{rust}");
+    assert_eq!(
+        body("greeting"),
+        "(\"a\".to_string() + &self.name.clone()) + &\"!\".to_string()"
+    );
+    assert_eq!(body("big"), "(self.r > 1.0) && (self.i < 2)");
+    assert_eq!(
+        body("mixed"),
+        "f64::powf(self.one.amount, 2.0) + (self.one.n as f64)"
+    );
+    assert_eq!(body("half"), "(self.i as f64) / 2.0");
+    assert!(rust.contains("(a * b) + 1.0"), "{rust}");
+    assert!(rust.contains("v > 0.0"), "{rust}");
+    compiles(&rust);
+}
+
+/// A value that names another feature starts from that feature's value
+/// as this field holds it, and an enumeration's value is its variant.
+///
+/// `attribute y : Real = c;` with `c : Integer = 2` wrote `y: 2`, which
+/// is no `f64`, and `lvl : Level = Level::low` with `low = 0.25` wrote
+/// `lvl: 0.25`; `Color::green` was never written at all, so the field
+/// started at `Color::Red`.
+#[test]
+fn a_value_that_names_a_feature_is_written_for_the_field_it_starts() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tenum def Level :> Real { low = 0.25; high = 0.75; }\n\
+         \tenum def Color { red; green; }\n\
+         \tpart def P {\n\
+         \t\tattribute c : Integer = 2;\n\
+         \t\tattribute y : Real = c;\n\
+         \t\tattribute lvl : Level = Level::high;\n\
+         \t\tattribute col : Color = Color::green;\n\
+         \t\tattribute nat : Natural = 3 - 5;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("y: 2.0,"), "{rust}");
+    assert!(rust.contains("lvl: Level::High,"), "{rust}");
+    assert!(rust.contains("col: Color::Green,"), "{rust}");
+    // a `u64` refuses `3 - 5` at compile time, so it is left to write
+    assert!(rust.contains("nat: Default::default(),"), "{rust}");
+    compiles(&rust);
+}
+
+/// Two behaviours made of each other are no supertraits of each other.
+#[test]
+fn behaviours_made_of_each_other_are_no_circle_of_traits() {
+    let rust = generate(
+        "package S {\n\
+         \taction def A1 { action b : B1; }\n\
+         \taction def B1 { action a : A1; }\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("pub trait A1 {"), "{rust}");
+    assert!(rust.contains("pub trait B1 {"), "{rust}");
+    assert!(
+        rust.contains("Not performed here: it is made of itself, by way of `B1`."),
+        "{rust}"
+    );
+    compiles(&rust);
+}
+
+/// A declared value on a field that holds more or fewer than one value
+/// is written in the container's form where one value is exactly what
+/// the model says, and is left open, aloud, where it is not.
+#[test]
+fn a_declared_value_reaches_an_option_a_vec_and_an_array_of_one() {
+    let mut ws = sysml_semantics::Workspace::new();
+    ws.add_file("scalars.kerml", SCALARS);
+    let file = ws.add_file(
+        "system.sysml",
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tpart def P {\n\
+         \t\tattribute opt : Integer[0..1] = 3;\n\
+         \t\tattribute many : Integer[*] = 3;\n\
+         \t\tattribute single : Real[1] = 2.5;\n\
+         \t\tattribute word : String[0..*] = \"w\";\n\
+         \t\tattribute three : Real[3] = 1.5;\n\
+         \t\tattribute twoOrMore : Integer[2..*] = 4;\n\
+         \t}\n\
+         }\n",
+    );
+    ws.resolve_all();
+    let roots = ws.file_roots(file).to_vec();
+    let generated = sysml_rust::generate(ws.model(), &roots).unwrap();
+    let rust = &generated.rust;
+    assert!(rust.contains("opt: Some(3),"), "{rust}");
+    assert!(rust.contains("many: vec![3],"), "{rust}");
+    assert!(rust.contains("single: 2.5,"), "{rust}");
+    assert!(rust.contains("word: vec![\"w\".to_string()],"), "{rust}");
+    // one value is no three, and repeating it is a choice the model
+    // never made
+    assert!(
+        rust.contains("// left open: `three` starts at its type's default"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("// left open: `twoOrMore` starts at its type's default"),
+        "{rust}"
+    );
+    for name in ["three", "twoOrMore"] {
+        assert!(
+            generated
+                .open
+                .iter()
+                .any(|open| open.why.starts_with(&format!("`{name}` starts"))),
+            "{name}: {:?}",
+            generated.open
+        );
+    }
+    compiles(rust);
+}
+
+/// What a general does is done by every struct below it: its calcs and
+/// performs are methods there, its API ports generic parameters, and a
+/// calc redefined below is the one written.
+#[test]
+fn behaviour_declared_on_a_general_is_a_method_of_its_subtypes() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tprivate import Api::*;\n\
+         \taction def Brake { in force : Real; }\n\
+         \tabstract part def Base {\n\
+         \t\tattribute k : Real = 2;\n\
+         \t\tcalc twice : Real { k * 2 }\n\
+         \t\tcalc thrice : Real { k * 3 }\n\
+         \t\tperform action brake : Brake;\n\
+         \t\tport store : Store;\n\
+         \t\tperform action ping : Ping;\n\
+         \t}\n\
+         \tpart def Car :> Base { attribute :>> k = 5; calc :>> thrice : Real { k * 30 } }\n\
+         \tpart def Truck :> Car;\n\
+         }\n",
+    )
+    .unwrap();
+    for name in ["Car", "Truck"] {
+        let at = rust
+            .find(&format!("impl<Store: fake::Store> {name}<Store> {{"))
+            .unwrap_or_else(|| panic!("{name} has methods and the port's parameter:\n{rust}"));
+        let block = &rust[at..rust[at..].find("\n}\n").map_or(rust.len(), |end| at + end)];
+        assert!(
+            block.contains("pub fn twice(&self) -> f64"),
+            "{name}: {block}"
+        );
+        assert!(block.contains("self.k * 30.0"), "{name}: {block}");
+        assert!(!block.contains("self.k * 3.0"), "{name}: {block}");
+        assert!(
+            block.contains("pub fn brake(&self, with: &mut impl Brake, force: f64)"),
+            "{name}: {block}"
+        );
+        assert!(block.contains("self.store.ping()"), "{name}: {block}");
+    }
+    compiles(&format!(
+        "{rust}\nmod fake {{ pub trait Store {{ fn ping(&self); }} }}\n"
+    ));
+}
+
+/// A perform the model leaves unnamed is still performed: `perform
+/// inner;` under the name it refers to, `perform action : Steer;` under
+/// its type's, and the method says the name is not the model's.
+#[test]
+fn an_unnamed_perform_is_a_method_called_after_what_it_performs() {
+    let rust = generate(
+        "package S {\n\
+         \taction def Steer;\n\
+         \tpart def Car {\n\
+         \t\tperform action : Steer;\n\
+         \t\taction inner : Steer;\n\
+         \t\tperform inner;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("pub fn steer(&self, with: &mut impl Steer)"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("pub fn inner(&self, with: &mut impl Steer)"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("/// Unnamed in the model: called here after its type.\n    pub fn steer("),
+        "{rust}"
+    );
+    compiles(&rust);
+}
+
+/// A type's own functions -- `impl Gauge { pub fn new() -> Self; pub fn
+/// total(&self) -> f64; pub fn grow(&mut self, amount: f64) }` -- are what
+/// `sysml import-rust` writes as action defs bound to `fake::Gauge::new`
+/// and the like. No trait declares them, so no port provides them, and
+/// performing one was refused as an API no port of the part provides. One
+/// that takes a receiver is called through the field holding a `Gauge`;
+/// one that takes none on the type itself; and a part that holds no
+/// `Gauge` -- or holds it as perhaps none -- says why it cannot.
+#[test]
+fn a_type_s_own_function_is_performed_through_what_holds_the_type() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tprivate import Api::*;\n\
+         \titem def Gauge { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge\"; } }\n\
+         \taction def GaugeNew { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge::new\"; :>> takesSelf = \"\"; :>> isAsync = false; :>> isFallible = false; } out result : Gauge; }\n\
+         \taction def Total { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge::total\"; :>> takesSelf = \"&self\"; :>> isAsync = false; :>> isFallible = false; } out result : Real; }\n\
+         \taction def Grow { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge::grow\"; :>> takesSelf = \"&mut self\"; :>> isAsync = false; :>> isFallible = false; } in amount : Real; }\n\
+         \tpart def Meter {\n\
+         \t\titem gauge : Gauge;\n\
+         \t\tperform action total : Total;\n\
+         \t\tperform action grow : Grow;\n\
+         \t\tperform action fresh : GaugeNew;\n\
+         \t}\n\
+         \tpart def Bare { perform action total : Total; perform action fresh : GaugeNew; }\n\
+         \tpart def Maybe { item gauge : Gauge[0..1]; perform action total : Total; }\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(rust.contains("self.gauge.total()"), "{rust}");
+    assert!(
+        rust.contains("pub fn grow(&mut self, amount: f64)")
+            && rust.contains("self.gauge.grow(amount)"),
+        "{rust}"
+    );
+    assert!(rust.contains("fake::Gauge::new()"), "{rust}");
+    assert!(
+        rust.contains("// not generated: perform `total` -- `fake::Gauge::total` is called on a `fake::Gauge`, and `Bare` holds none"),
+        "{rust}"
+    );
+    assert!(
+        rust.contains("`Maybe` holds `gauge` as perhaps none"),
+        "{rust}"
+    );
+    compiles(&format!(
+        "{rust}\nmod fake {{\n\
+         #[derive(Clone, Debug, Default, PartialEq)] pub struct Gauge;\n\
+         impl Gauge {{\n\
+         pub fn new() -> Self {{ Gauge }}\n\
+         pub fn total(&self) -> f64 {{ 0.0 }}\n\
+         pub fn grow(&mut self, amount: f64) {{ let _ = amount; }}\n\
+         }}\n}}\n"
+    ));
+}
+
+/// An API function said to take no receiver is called on its type, and a
+/// port is a value of that type, so it is not called through the port.
+#[test]
+fn a_function_of_a_port_s_api_with_no_receiver_is_not_called_through_it() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import Api::*;\n\
+         \taction def Open { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Store::open\"; :>> takesSelf = \"\"; :>> isAsync = false; :>> isFallible = false; } }\n\
+         \tpart def Node {\n\
+         \t\tport store : Store;\n\
+         \t\tperform action open : Open;\n\
+         \t}\n}\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("`fake::Store::open` takes no receiver, and a port is called through one"),
+        "{rust}"
+    );
+}
+
+/// A type's own function called on one of it has no one to be called on
+/// where the part holds several.
+#[test]
+fn a_type_s_own_function_is_not_performed_through_several_of_it() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tprivate import Api::*;\n\
+         \titem def Gauge { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge\"; } }\n\
+         \taction def Total { @code { :>> writtenIn = \"rust\"; :>> path = \"fake::Gauge::total\"; :>> takesSelf = \"&self\"; :>> isAsync = false; :>> isFallible = false; } out result : Real; }\n\
+         \tpart def Many { item gauge : Gauge[*]; perform action total : Total; }\n\
+         }\n",
+    )
+    .unwrap();
+    assert!(
+        rust.contains("`Many` holds `gauge` as several of them"),
+        "{rust}"
+    );
+}
+
+/// A number is no start for a field whose type is a struct, nor a
+/// variant of one enumeration for a field of another.
+#[test]
+fn a_value_of_another_type_is_no_start_for_a_field() {
+    let rust = generate(
+        "package S {\n\
+         \tprivate import ScalarValues::*;\n\
+         \tattribute def Box { attribute side : Real; }\n\
+         \tenum def Level { low; high; }\n\
+         \tenum def Color { red; green; }\n\
+         \tpart def P {\n\
+         \t\tattribute b : Box = 3;\n\
+         \t\tattribute lvl : Level = Color::green;\n\
+         \t}\n\
+         }\n",
+    )
+    .unwrap();
+    // each starts at its type's default, the struct's given no `3`
+    assert!(rust.contains("    pub b: Box_,\n"), "{rust}");
+    assert!(!rust.contains("b: 3"), "{rust}");
+    assert!(
+        rust.contains("// left open: `lvl` starts at its type's default: `= Color::green`"),
+        "{rust}"
+    );
 }

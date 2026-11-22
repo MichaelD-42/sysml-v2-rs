@@ -14,13 +14,12 @@
 //!
 //! Breaking the corpus, next door, reaches far more of them than writing
 //! models by hand -- but not all. A constraint the corpus asks of three
-//! elements has nothing much to break: of the hundred and eight that no
-//! break had reached, nine were answered of fewer than ten elements. Six
-//! of the models here came of aiming at those.
+//! elements has nothing much to break, so some models here are aimed at
+//! exactly those constraints.
 //!
-//! A seventh came of asking why an aimed model did not work.
-//! `validateSubjectMembershipOwningType` was answered of eighteen subjects
-//! and could not have been false of any: it asks whether the owning type
+//! Another comes of asking why an aimed model did not work.
+//! `validateSubjectMembershipOwningType` is answered of few subjects
+//! and could not be false of any if misread: it asks whether the owning type
 //! is one of four and writes the second as a metaclass that does not
 //! exist. Read as the constraint's own words say, a subject under an
 //! action definition is reported.
@@ -37,6 +36,83 @@ use sysml_semantics::Workspace;
 /// The set is exact in both directions: a rule that stops noticing fails
 /// here, and so does one that starts complaining about something else.
 const REJECTED: &[(&str, &str, &[&str])] = &[
+    // a variation specializes no variation: an enumeration is one, so
+    // one enumeration cannot extend another
+    (
+        "an enumeration extending an enumeration",
+        "package P {\n\tenum def E { enum a; }\n\tenum def F :> E { enum b; }\n}\n",
+        &["validateDefinitionVariationSpecialization"],
+    ),
+    (
+        "a variation usage typed by a variation",
+        "package P {\n\tvariation part def V { variant part a; }\n\tvariation part w : V { variant part b; }\n}\n",
+        &["validateUsageVariationSpecialization"],
+    ),
+    (
+        "a variation of something that is not one",
+        "package P {\n\tpart def V;\n\tvariation part def W :> V { variant part b; }\n}\n",
+        &[],
+    ),
+    // `validateNamespaceDistinguishibility`: two members of one
+    // namespace answer to one name, and nothing can tell which is meant
+    (
+        "two definitions of one name",
+        "package P {\n\tpart def A;\n\tpart def A;\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    (
+        "two features of one name",
+        "package P {\n\tpart def A {\n\t\tpart x;\n\t\tpart x;\n\t}\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    (
+        "an alias that takes a name already taken",
+        "package P {\n\tpart def A;\n\tpart def B;\n\talias A for B;\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    (
+        "a short name that is another member's",
+        "package P {\n\tpart def <s> A;\n\tpart def <s> B;\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    // ... and where the metaclasses do not conform, the name is shared
+    // and both are told apart: `isDistinguishableFrom`
+    (
+        "a definition and a usage may share a name",
+        "package P {\n\tpart def A;\n\tpart A : A;\n}\n",
+        &[],
+    ),
+    (
+        "a member whose short name is its own name is one member",
+        "package P {\n\tpart def <A> A;\n}\n",
+        &[],
+    ),
+    // A type's memberships are its inherited ones too (KerML 7.3.2.2), so
+    // a member of the name of an inherited one that does not redefine it
+    // is a second `x`, and so are two unrelated `x`s from two supertypes
+    (
+        "an owned member of the name of an inherited one",
+        "package P {\n\tpart def A { part x; }\n\tpart def B :> A { part x; }\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    (
+        "two inherited members of one name",
+        "package P {\n\tpart def A { part x; }\n\tpart def E { part x; }\n\tpart def F :> A, E;\n}\n",
+        &["validateNamespaceDistinguishibility"],
+    ),
+    // ... and not where one stands in the place of the other: redefined
+    // by name, by position as a parameter, or inherited beside what it
+    // redefines by another path, or where the metaclasses do not conform
+    (
+        "a redefinition, a parameter by position, a diamond",
+        "package P {\n\tpart def A { part x; attribute q; }\n\
+         \tpart def C :> A { attribute x; }\n\
+         \tpart def D :> A { part x :>> x; }\n\
+         \tpart def G :> A, D;\n\
+         \taction def S { in a; in b; }\n\
+         \taction def T :> S { in b; in a; }\n}\n",
+        &[],
+    ),
     (
         "an objective belongs to a case",
         "package P {\n\tpart def E {\n\t\tobjective o;\n\t}\n}\n",
@@ -116,7 +192,10 @@ const REJECTED: &[(&str, &str, &[&str])] = &[
     ),
     (
         "a rendering belongs to a view",
-        "package P {\n\tpart def Q;\n\tpart q : Q {\n\t\trender asTree;\n\t}\n}\n",
+        // `render` names a rendering the library declares; `asTree`, which
+        // is not in the library, and goes unreported only for as long as
+        // nothing looks the name up
+        "package P {\n\tpart def Q;\n\tpart q : Q {\n\t\trender Views::asTreeDiagram;\n\t}\n}\n",
         &["validateViewRenderingMembershipOwningType"],
     ),
     (
@@ -124,14 +203,17 @@ const REJECTED: &[(&str, &str, &[&str])] = &[
         "package P {\n\tpart def Q;\n\taction def A {\n\t\tsubject s : Q;\n\t}\n}\n",
         &["validateSubjectMembershipOwningType"],
     ),
+    // `render r : R` renders the `r` there is: `ViewRenderingUsage =
+    // OwnedReferenceSubsetting FeatureSpecializationPart? ...`, and only
+    // `render rendering r : R` declares one
     (
         "a view renders one way",
-        "package P {\n\trendering def R;\n\tview def V {\n\t\trender r1 : R;\n\t\trender r2 : R;\n\t}\n}\n",
+        "package P {\n\trendering def R;\n\tview def V {\n\t\trender rendering r1 : R;\n\t\trender rendering r2 : R;\n\t}\n}\n",
         &["validateViewDefinitionOnlyOneViewRendering"],
     ),
     (
         "and so does a use of one",
-        "package P {\n\trendering def R;\n\tview def V;\n\tview v : V {\n\t\trender r1 : R;\n\t\trender r2 : R;\n\t}\n}\n",
+        "package P {\n\trendering def R;\n\tview def V;\n\tview v : V {\n\t\trender rendering r1 : R;\n\t\trender rendering r2 : R;\n\t}\n}\n",
         &["validateViewUsageOnlyOneViewRendering"],
     ),
     (
@@ -155,6 +237,41 @@ const REJECTED: &[(&str, &str, &[&str])] = &[
         "package P {\n\tpart def Q;\n\tpart q : Q;\n\taction def A {\n\t\taccept when q;\n\t}\n}\n",
         &["validateTriggerInvocationExpressionWhenArgument"],
     ),
+    // A model of SysML alone writes no `chains`, and a rule that reads
+    // a `featureTarget` is asked of it all the same: which kinds this
+    // toolchain builds is a question of the whole model, and not of
+    // the files a check happens to be asked about.
+    (
+        "what is performed is an action, and this is a part",
+        "package P {\n\tpart pp;\n\tpart def Perf {\n\t\tperform pp;\n\t}\n}\n",
+        &["validatePerformActionUsageReference"],
+    ),
+    (
+        "and what is exhibited is a state",
+        "package P {\n\taction aa;\n\tpart def Exh {\n\t\texhibit aa;\n\t}\n}\n",
+        &["validateExhibitStateUsageReference"],
+    ),
+    // "The subject of a case definition or usage is modeled as its first
+    // parameter" (SysML 7.22.2), and a parameter redefines the one at its
+    // position in what its owner specializes: an actor declared first
+    // takes the place of `Case::subj`, which leaves the case with no
+    // subject, so `input->first() = subjectParameter` is false. The pilot
+    // implementation says the same, "Subject must be first parameter.",
+    // and the corpus writes `subject;` before an actor wherever it has
+    // nothing more to say of the subject.
+    (
+        "an actor where the subject goes",
+        "package P {\n\tpart def Q;\n\tuse case def U {\n\t\tactor a : Q;\n\t}\n}\n",
+        &["validateCaseDefinitionSubjectParameterPosition"],
+    ),
+    (
+        "and the same actor after its subject",
+        "package P {\n\tpart def Q;\n\tuse case def U {\n\t\tsubject;\n\t\tactor a : Q;\n\t}\n\
+         \tuse case u : U {\n\t\tsubject;\n\t\tactor b : Q;\n\t}\n\
+         \trequirement def R {\n\t\tsubject s : Q;\n\t\tstakeholder h : Q;\n\t}\n\
+         \trequirement r : R;\n}\n",
+        &[],
+    ),
     (
         "a verification verifies inside its objective, not beside it",
         "package P {\n\trequirement def R;\n\tverification def V {\n\t\tverify requirement R;\n\t}\n}\n",
@@ -162,6 +279,23 @@ const REJECTED: &[(&str, &str, &[&str])] = &[
             "validateRequirementConstraintMembershipOwningType",
             "validateRequirementVerificationMembershipOwningType",
         ],
+    ),
+    // `crossFeature.type->asSet() = type->asSet()`: what an end is
+    // reached across has the end's types. A `B` reached across where the
+    // end is an `A` is not that; the same two types listed the other way
+    // round are, because a set keeps no order -- compared as lists, the
+    // second was reported as well.
+    (
+        "an end reached across a feature of another type",
+        "package P {\n\tpart def A;\n\tpart def B;\n\tconnection def S {\n\
+         \t\tend part ea : A crosses eb.fb;\n\t\tend part eb : B { part fb : B; }\n\t}\n}\n",
+        &["validateFeatureCrossFeatureType"],
+    ),
+    (
+        "and one reached across its own types in another order",
+        "package P {\n\tpart def A;\n\tpart def B;\n\tpart def R {\n\
+         \t\tend part ea : A, B crosses eb.fa;\n\t\tend part eb : B { part fa : B, A; }\n\t}\n}\n",
+        &[],
     ),
 ];
 
@@ -193,27 +327,66 @@ fn a_model_the_standard_rejects_is_reported_as_rejected() {
     }
 }
 
+/// A name declared twice in one namespace is said at each repeat, with
+/// the first declaration beside it, and is certain: the text says it twice,
+/// whatever the toolchain builds of it. A namespace whose members are told
+/// apart only through what it inherits is said of the namespace, as before.
+#[test]
+fn a_name_declared_again_is_said_where_it_is_repeated() {
+    let mut ws = Workspace::new();
+    let file = ws.add_file(
+        "twice.sysml",
+        "package P {\n\
+         \tpart def A;\n\
+         \tpart def B;\n\
+         \tpart def A;\n\
+         \tpart def A;\n\
+         \tattribute def B;\n\
+         }\n",
+    );
+    ws.resolve_all();
+    let checked = ws.check_rules(&[file]);
+    let repeats: Vec<_> = checked
+        .violations
+        .iter()
+        .filter(|it| it.rule == "validateNamespaceDistinguishibility")
+        .collect();
+    let line = |elem| {
+        let (_, range) = ws.element_place(elem).unwrap();
+        let text = ws.file_parse(file).syntax().text().to_string();
+        sysml_syntax::line_col(&text, usize::from(range.start())).0
+    };
+    // the second and third `A`, each pointing back at the first; `B` is a
+    // part definition and an attribute definition, neither of which is
+    // the other, and is not a repeat
+    let said: Vec<(usize, usize)> = repeats
+        .iter()
+        .map(|it| (line(it.element), line(it.also.expect("the first"))))
+        .collect();
+    assert_eq!(said, [(4, 2), (5, 2)], "{repeats:?}");
+    for repeat in &repeats {
+        assert!(repeat.certain(), "{repeat:?}");
+        let detail = repeat.detail.as_deref().unwrap();
+        assert!(detail.contains("`A`") && detail.contains("`P`"), "{detail}");
+    }
+}
+
 /// The same question asked of the corpus, by breaking it on purpose.
 ///
 /// Writing a wrong model by hand reaches the constraints one at a time,
-/// and only the ones whose shape is already understood. The corpus is 403
-/// files of rich, correct SysML: change one thing in one of them and it is
+/// and only the ones whose shape is already understood. The corpus is
+/// many files of rich, correct SysML: change one thing in one of them and it is
 /// still a model, still parses, still resolves -- and is now wrong in a
 /// way somebody's editor could be wrong.
 ///
-/// Four sweeps got here. Fifty keyword swaps over every file left 1674
-/// models, tripped twenty-six constraints, and found a panic: `connector
-/// ps : P ([0..*] myCart, ...)` counted the `*` of the bound as a step of
-/// the name beside it. A second widened the swaps past the definition
-/// keywords -- 4257 models, thirty-nine constraints. A third broke one
-/// place at a time and took whole lines out and put them in twice: 12040
-/// models, fourteen more. A fourth reordered neighbouring lines and broke
-/// two places at once, and found nothing new. Only the first found a
-/// panic.
-///
-/// What the fourth did find was elsewhere: breaking the standard library
-/// rather than a model reaches four more, next door. Sixty-two of the
-/// hundred and seventy answered constraints are demonstrated to fire.
+/// Several kinds of sweep reach them. Keyword swaps over every file
+/// trip many constraints, and can find a panic: `connector ps : P
+/// ([0..*] myCart, ...)` must not count the `*` of the bound as a step of
+/// the name beside it. Swaps past the definition keywords reach more;
+/// so does breaking one place at a time, taking whole lines out and putting
+/// them in twice. Reordering neighbouring lines and breaking two places
+/// at once reach little that is new. Breaking the standard library
+/// rather than a model reaches a few more, next door.
 ///
 /// Each row is one break, the file it is made in, and constraints that
 /// must notice. Others may notice too -- one keyword can be wrong several
@@ -476,8 +649,9 @@ const MUTATED: &[(&str, Break, &[&str])] = &[
         &["validateFlowPayloadFeature"],
     ),
     (
+        // `then done;` twice: the join has two successions out of it
         "Fork Join Example.sysml",
-        Repeat(22),
+        Repeat(39),
         &["validateJoinNodeOutgoingSuccessions"],
     ),
     (
@@ -633,9 +807,12 @@ const LIBRARY_BROKEN: &[(&str, Break, &[&str])] = &[
         &["validateFeatureCrossFeatureType"],
     ),
     (
+        // a second `else arr.elements#(...);` is a succession on its own,
+        // to an expression that is no feature to run to -- its index is
+        // no multiplicity, which it must not be read as
         "CollectionFunctions.kerml",
         Repeat(66),
-        &["validateMultiplicityRangeBounds"],
+        &["validateConnectorRelatedFeatures"],
     ),
     (
         "FeatureReferencingPerformances.kerml",

@@ -298,7 +298,7 @@ fn a_new_name_is_whatever_this_file_reads_as_one_name() {
         )
     };
 
-    // a quoted name is a name, and used to be refused
+    // a quoted name is a name, and must not be refused
     let quoted = rename(&mut client, "'two words'");
     assert!(quoted.error.is_none(), "{:?}", quoted.error);
     let edits = quoted.result.unwrap()["changes"][uri]
@@ -315,6 +315,18 @@ fn a_new_name_is_whatever_this_file_reads_as_one_name() {
             .error
             .is_some_and(|err| err.message.contains("is not a name")),
         "a name outside the lexer's alphabet was accepted"
+    );
+
+    // `''` reads as a name and names nothing, which is what it is
+    // refused for -- not for being a name already taken
+    let empty = rename(&mut client, "''");
+    assert!(
+        empty
+            .error
+            .as_ref()
+            .is_some_and(|err| err.message.contains("is an empty name")),
+        "{:?}",
+        empty.error
     );
     client.stop(handle);
 }
@@ -379,9 +391,10 @@ fn a_document_that_does_not_parse_is_left_alone() {
 
 #[test]
 fn a_notification_this_server_cannot_read_is_dropped_rather_than_fatal() {
-    // a client is not supposed to send these; one that does used to end
-    // the session, leaving the file it was editing with no diagnostics,
-    // no completion and no navigation until the window was reloaded
+    // a client is not supposed to send these; one that does must not end
+    // the session, which would leave the file it was editing with no
+    // diagnostics, no completion and no navigation until the window was
+    // reloaded
     let uri = "file:///nonsense.sysml";
     let (mut client, handle) = opened(uri, "package Demo {\n    part def Vehicle;\n}\n");
     for method in [
@@ -603,11 +616,11 @@ fn diagnostics_say_what_the_specification_requires() {
 fn the_client_says_how_wide_a_line_may_be() {
     let uri = "file:///wide.sysml";
     let text = "package P {\n\tpart def A {\n\t\tattribute a = b and c and d and e;\n\t}\n}\n";
-    let formatted = |width: Option<u64>| {
+    let formatted = |width: Value| {
         let (mut client, handle) = serving();
         let mut options = json!({ "noLibrary": true });
-        if let Some(width) = width {
-            options["formatWidth"] = json!(width);
+        if !width.is_null() {
+            options["formatWidth"] = width;
         }
         client.initialize_with(options);
         client.notify(
@@ -630,18 +643,42 @@ fn the_client_says_how_wide_a_line_may_be() {
     };
 
     // told nothing, the line holds; told thirty columns, it gives way
-    let wide = formatted(None);
+    let wide = formatted(Value::Null);
     assert_eq!(
         wide.lines().filter(|line| line.contains("and")).count(),
         1,
         "{wide}"
     );
-    let narrow = formatted(Some(30));
+    let narrow = formatted(json!(30));
     assert!(
         narrow.lines().filter(|line| line.contains("and")).count() > 1,
         "{narrow}"
     );
     assert_eq!(narrow.matches("and").count(), 3, "{narrow}");
+    // a settings file that holds the number as a string means the same
+    assert_eq!(formatted(json!("30")), narrow);
+    // and one that holds no number at all leaves the width as it was
+    assert_eq!(formatted(json!("narrow")), wide);
+}
+
+/// A width that is no number is said to be, where the client collects
+/// this server's log, rather than dropped without a word.
+#[test]
+fn a_width_that_is_no_number_is_said_to_be() {
+    let (mut client, handle) = serving();
+    client.initialize_with(json!({ "noLibrary": true, "formatWidth": "narrow" }));
+    let said = loop {
+        if let lsp_server::Message::Notification(note) = client.recv() {
+            if note.method == "window/logMessage" {
+                break note.params["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+    };
+    assert!(said.contains("format width"), "{said}");
+    client.stop(handle);
 }
 
 /// The client says how the preview is painted, by name or in full, and
@@ -688,4 +725,426 @@ fn the_client_says_how_the_preview_is_painted() {
 
     // and told something that is not a skin, it draws what it drew
     assert_eq!(drawn(json!({ "light": { "paper": "#fff" } })), plain);
+}
+
+/// After `P::` the completion is what `P` holds, and no keyword: one was
+/// never what can be written there, and the names around the cursor
+/// must not be offered in place of `P`'s.
+#[test]
+fn completion_after_a_qualifier_offers_what_the_qualifier_holds() {
+    let (mut client, handle) = serving();
+    client.initialize();
+    let uri = "file:///qualified.sysml";
+    let text = "package P {\n    part def Wheel;\n}\npackage Q {\n    import P::\n}\n";
+    client.notify(
+        lsp_types::notification::DidOpenTextDocument::METHOD,
+        json!({ "textDocument": { "uri": uri, "languageId": "sysml", "version": 1, "text": text } }),
+    );
+    client.wait_diagnostics();
+    let completions = client.request(
+        lsp_types::request::Completion::METHOD,
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 4, "character": 14 }
+        }),
+    );
+    let labels: Vec<&str> = completions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(labels, ["Wheel"]);
+
+    client.request(lsp_types::request::Shutdown::METHOD, Value::Null);
+    client.notify(lsp_types::notification::Exit::METHOD, Value::Null);
+    handle.join().unwrap();
+}
+
+/// Open several documents on a fresh server, each in the language its
+/// client declares, and wait until each has been heard about.
+fn all_opened(docs: &[(&str, &str, &str)]) -> (Client, std::thread::JoinHandle<()>) {
+    let (mut client, handle) = serving();
+    client.initialize();
+    for (uri, language, text) in docs {
+        client.notify(
+            lsp_types::notification::DidOpenTextDocument::METHOD,
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language, "version": 1, "text": text
+            }}),
+        );
+    }
+    client.diagnostics(docs.len());
+    (client, handle)
+}
+
+/// Where a list of ranges starts and ends, as `line:column-line:column`,
+/// sorted, which is what two answers about the same places agree on.
+fn spans<'a>(ranges: impl IntoIterator<Item = &'a Value>) -> Vec<String> {
+    let at = |position: &Value| format!("{}:{}", position["line"], position["character"]);
+    let mut spans: Vec<String> = ranges
+        .into_iter()
+        .map(|range| format!("{}-{}", at(&range["start"]), at(&range["end"])))
+        .collect();
+    spans.sort();
+    spans
+}
+
+fn rename_at(client: &mut Client, uri: &str, line: u32, character: u32, to: &str) -> Value {
+    client.request(
+        lsp_types::request::Rename::METHOD,
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "newName": to,
+        }),
+    )
+}
+
+fn references_at(client: &mut Client, uri: &str, line: u32, character: u32) -> Vec<String> {
+    let found = client.request(
+        lsp_types::request::References::METHOD,
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        }),
+    );
+    spans(found.as_array().unwrap().iter().map(|it| &it["range"]))
+}
+
+/// `part` is a name in KerML and a keyword in SysML. A rename asked in
+/// a KerML file must not be read as a name and written bare into a SysML
+/// file that names the same element, which would then stop parsing; each
+/// file gets it the way it has to be written there.
+#[test]
+fn a_new_name_is_quoted_in_a_file_that_reads_it_as_a_keyword() {
+    let kerml = "file:///p/k.kerml";
+    let sysml = "file:///p/a.sysml";
+    let (mut client, handle) = all_opened(&[
+        (kerml, "kerml", "package K {\n    classifier Foo;\n}\n"),
+        (sysml, "sysml", "part x : K::Foo;\n"),
+    ]);
+    let edit = rename_at(&mut client, kerml, 1, 16, "part");
+    assert_eq!(edit["changes"][kerml][0]["newText"], "part", "{edit}");
+    assert_eq!(edit["changes"][sysml][0]["newText"], "'part'", "{edit}");
+    client.stop(handle);
+}
+
+/// `<W>` is a name of the element as much as `Wheel` is. Asked about at
+/// the `W` that declares it, references and rename answered nothing; a
+/// rename asked at a `W` that uses it rewrote `Wheel` and left the `W`.
+#[test]
+fn a_short_name_is_found_and_renamed_where_it_is_pointed_at() {
+    let uri = "file:///short-names.sysml";
+    let (mut client, handle) = opened(
+        uri,
+        "part def <W> Wheel;\npart w : W;\npart v : Wheel;\npart def <X>;\n",
+    );
+
+    // both spellings are the one element, wherever it is asked about
+    let all = ["0:13-0:18", "1:9-1:10", "2:9-2:14"];
+    assert_eq!(references_at(&mut client, uri, 0, 10), all);
+    assert_eq!(references_at(&mut client, uri, 1, 9), all);
+    // a declaration with only a short name is named by it, not by the
+    // whole of itself
+    assert_eq!(references_at(&mut client, uri, 3, 10), ["3:10-3:11"]);
+
+    // renamed by the short name, at a use or at the declaration, the
+    // short name is what changes
+    for (line, character) in [(1, 9), (0, 10)] {
+        let edit = rename_at(&mut client, uri, line, character, "T");
+        let edits = edit["changes"][uri].as_array().unwrap();
+        assert_eq!(
+            spans(edits.iter().map(|it| &it["range"])),
+            ["0:10-0:11", "1:9-1:10"]
+        );
+        assert!(edits.iter().all(|it| it["newText"] == "T"), "{edit}");
+    }
+    client.stop(handle);
+}
+
+/// Find-references is what a reader asks before a rename, to see what
+/// it will touch. It answered with the whole of `a.c` or `P::Wheel`, and
+/// left out what reaches the element through a feature that borrows its
+/// name, which the rename rewrites.
+#[test]
+fn references_are_the_places_a_rename_rewrites() {
+    let uri = "file:///agree.sysml";
+    let (mut client, handle) = opened(
+        uri,
+        "part def A { part c; }\n\
+         part a : A { part :>> c; }\n\
+         part z :> a.c;\n\
+         package P { part def Wheel; }\n\
+         part y : P::Wheel;\n",
+    );
+    let found = references_at(&mut client, uri, 0, 18);
+    let edit = rename_at(&mut client, uri, 0, 18, "d");
+    let renamed = spans(
+        edit["changes"][uri]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| &it["range"]),
+    );
+    assert_eq!(found, renamed);
+    assert!(found.contains(&"2:12-2:13".to_string()), "{found:?}");
+
+    assert_eq!(
+        references_at(&mut client, uri, 3, 21),
+        ["3:21-3:26", "4:12-4:17"]
+    );
+    client.stop(handle);
+}
+
+/// Every name in a document symbol tree, depth first.
+fn symbol_names(symbols: &Value, out: &mut Vec<String>) {
+    for symbol in symbols.as_array().into_iter().flatten() {
+        out.push(symbol["name"].as_str().unwrap().to_string());
+        symbol_names(&symbol["children"], out);
+    }
+}
+
+/// An element declared without a name was left out of the outline, and
+/// everything named inside it with it.
+#[test]
+fn an_unnamed_element_stays_in_the_outline_with_what_it_holds() {
+    let sysml = "file:///outline.sysml";
+    let kerml = "file:///outline.kerml";
+    let (mut client, handle) = all_opened(&[
+        (
+            sysml,
+            "sysml",
+            "package Q {\n\
+             \x20   part def A { part x; doc /* about A */ }\n\
+             \x20   part a : A { part :>> x { part inner; } attribute v = 1 + 2; }\n\
+             \x20   part { part alsoInner; }\n\
+             \x20   connection { end part e1; }\n\
+             \x20   perform action { action step1; }\n\
+             \x20   part def <X>;\n\
+             }\n",
+        ),
+        // an expression is no declaration, but one that holds a
+        // parameter is somewhere the parameter is
+        (kerml, "kerml", "package K {\n    expr { in y; }\n}\n"),
+    ]);
+    let names = |client: &mut Client, uri: &str| {
+        let symbols = client.request(
+            lsp_types::request::DocumentSymbolRequest::METHOD,
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        let mut names = Vec::new();
+        symbol_names(&symbols, &mut names);
+        names
+    };
+    assert_eq!(
+        names(&mut client, sysml),
+        [
+            "Q",
+            "A",
+            "x",
+            "a",
+            "x",
+            "inner",
+            "v",
+            "(unnamed)",
+            "alsoInner",
+            "(unnamed)",
+            "e1",
+            "(unnamed)",
+            "step1",
+            "<X>"
+        ]
+    );
+    assert_eq!(names(&mut client, kerml), ["K", "(unnamed)", "y"]);
+    client.stop(handle);
+}
+
+/// Inside a comment, a string or a quoted name there is nothing to
+/// complete, and a keyword of SysML is a name in KerML.
+#[test]
+fn completion_offers_nothing_inside_text_and_only_this_notation_s_keywords() {
+    let sysml = "file:///completing.sysml";
+    let kerml = "file:///completing.kerml";
+    let (mut client, handle) = all_opened(&[
+        (
+            sysml,
+            "sysml",
+            "// a note\npackage P {\n    doc /* body */\n    attribute s = \"text\";\n    part 'quoted name';\n    \n}\n",
+        ),
+        (kerml, "kerml", "package K {\n    \n}\n"),
+    ]);
+    let labels = |client: &mut Client, uri: &str, line: u32, character: u32| -> Vec<String> {
+        let items = client.request(
+            lsp_types::request::Completion::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        );
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| it["label"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // in the note, at the end of its line, in a doc's body, in a string
+    // and in a quoted name
+    for (line, character) in [(0, 5), (0, 9), (2, 12), (3, 20), (4, 12)] {
+        assert_eq!(
+            labels(&mut client, sysml, line, character),
+            [] as [String; 0],
+            "{line}:{character}"
+        );
+    }
+    let between = labels(&mut client, sysml, 5, 4);
+    assert!(between.iter().any(|it| it == "part"), "{between:?}");
+
+    let kerml_labels = labels(&mut client, kerml, 1, 4);
+    assert!(kerml_labels.iter().any(|it| it == "classifier"));
+    assert!(!kerml_labels.iter().any(|it| it == "part"));
+    client.stop(handle);
+}
+
+/// The editor says how a level is indented, and formatting answers in it.
+#[test]
+fn formatting_indents_the_way_the_editor_asks() {
+    let uri = "file:///indent.sysml";
+    let text = "package P {\n    part def A {\n        part b;\n    }\n}\n";
+    let (mut client, handle) = opened(uri, text);
+    let mut formatted = |tab_size: u32, insert_spaces: bool| {
+        let edits = client.request(
+            lsp_types::request::Formatting::METHOD,
+            json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+            }),
+        );
+        edits[0]["newText"].as_str().unwrap_or(text).to_string()
+    };
+    assert_eq!(formatted(4, true), text);
+    assert_eq!(
+        formatted(2, true),
+        "package P {\n  part def A {\n    part b;\n  }\n}\n"
+    );
+    assert_eq!(
+        formatted(4, false),
+        "package P {\n\tpart def A {\n\t\tpart b;\n\t}\n}\n"
+    );
+    client.stop(handle);
+}
+
+/// A name that resolves to nothing fails `sysml check`, so an editor is
+/// told it is an error and not a warning.
+#[test]
+fn an_unresolved_name_is_an_error() {
+    let (client, handle, said) = opened_as("file:///missing.sysml", "sysml", "part x : Missing;\n");
+    let diagnostics = said["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{said}");
+    assert_eq!(diagnostics[0]["severity"], 1, "{said}");
+    client.stop(handle);
+}
+
+/// A name declared twice in one namespace is an error where it is
+/// declared again, saying which name and where it was first -- in the
+/// message, for a client that shows nothing more, and as related
+/// information -- rather than a warning in the specification's general
+/// words on the namespace around it.
+#[test]
+fn a_name_declared_again_is_an_error_where_it_is_repeated() {
+    // the constraints are asked of a model with the library to ask them
+    // against, as `sysml check` asks them
+    let library = std::path::Path::new("../sysml-stdlib/library");
+    if !library.is_dir() {
+        return;
+    }
+    let (mut client, handle) = serving();
+    client.request(
+        lsp_types::request::Initialize::METHOD,
+        json!({
+            "capabilities": {},
+            "initializationOptions": { "libraryPath": library.to_str().unwrap() },
+        }),
+    );
+    client.notify(lsp_types::notification::Initialized::METHOD, json!({}));
+    let uri = "file:///twice.sysml";
+    let text = "package P {\n    part def A;\n    part def A;\n}\n";
+    client.notify(
+        lsp_types::notification::DidOpenTextDocument::METHOD,
+        json!({ "textDocument": { "uri": uri, "languageId": "sysml", "version": 1, "text": text } }),
+    );
+    let said = client.wait_diagnostics();
+    let diagnostics = said["diagnostics"].as_array().unwrap();
+    let repeated: Vec<&Value> = diagnostics
+        .iter()
+        .filter(|it| it["code"] == "validateNamespaceDistinguishibility")
+        .collect();
+    assert_eq!(repeated.len(), 1, "{said}");
+    let repeat = repeated[0];
+    assert_eq!(repeat["severity"], 1, "{said}");
+    assert_eq!(repeat["range"]["start"]["line"], 2, "{said}");
+    let message = repeat["message"].as_str().unwrap();
+    assert!(message.contains("`A`"), "{message}");
+    assert!(message.contains("first declared on line 2"), "{message}");
+    let related = &repeat["relatedInformation"][0]["location"];
+    assert_eq!(related["uri"], uri, "{said}");
+    assert_eq!(related["range"]["start"]["line"], 1, "{said}");
+    client.request(lsp_types::request::Shutdown::METHOD, json!(null));
+    client.notify(lsp_types::notification::Exit::METHOD, json!(null));
+    handle.join().unwrap();
+}
+
+/// A client draws the outline, and finds where the cursor is in it, by
+/// containment, so a symbol listed under another lies inside it. Taken as
+/// the parser placed each element, the cross feature an end owns in
+/// `end [1] port a : P;` was given more of the line than the end it is
+/// listed under.
+#[test]
+fn every_symbol_lies_inside_the_one_it_is_listed_under() {
+    let uri = "file:///ends.sysml";
+    let (mut client, handle) = opened(
+        uri,
+        "package Ends {\n    port def P;\n    interface def I {\n        end [1] port a : P;\n        end [0..*] port b : P;\n    }\n    connection def C {\n        end [1] part x : Ends::I;\n    }\n}\n",
+    );
+    let symbols = client.request(
+        lsp_types::request::DocumentSymbolRequest::METHOD,
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let at = |position: &Value| {
+        (
+            position["line"].as_u64().unwrap(),
+            position["character"].as_u64().unwrap(),
+        )
+    };
+    let within = |inner: &Value, outer: &Value| {
+        at(&outer["start"]) <= at(&inner["start"]) && at(&inner["end"]) <= at(&outer["end"])
+    };
+    fn walk(symbol: &Value, check: &dyn Fn(&Value, &Value) -> bool, seen: &mut usize) {
+        *seen += 1;
+        assert!(
+            check(&symbol["selectionRange"], &symbol["range"]),
+            "{} names itself outside its range: {symbol}",
+            symbol["name"]
+        );
+        for child in symbol["children"].as_array().into_iter().flatten() {
+            assert!(
+                check(&child["range"], &symbol["range"]),
+                "{} is listed under {} and lies outside it: {} not in {}",
+                child["name"],
+                symbol["name"],
+                child["range"],
+                symbol["range"]
+            );
+            walk(child, check, seen);
+        }
+    }
+    let mut seen = 0;
+    for symbol in symbols.as_array().unwrap() {
+        walk(symbol, &within, &mut seen);
+    }
+    // the ends themselves, and what they own, were all looked at
+    assert!(seen >= 7, "{symbols}");
+    client.stop(handle);
 }

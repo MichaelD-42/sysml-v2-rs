@@ -93,7 +93,7 @@ fn a_sibling_file_resolves_without_being_open() {
     assert_eq!(changes[hardware.as_str()].as_array().unwrap().len(), 1);
 
     // opening the sibling must not declare it twice: the file is read
-    // from its buffer now instead of from disk
+    // from its buffer instead of from disk
     let hardware_text = std::fs::read_to_string(root.join("model/hardware.sysml")).unwrap();
     client.notify(
         lsp_types::notification::DidOpenTextDocument::METHOD,
@@ -271,6 +271,23 @@ fn a_document_from_an_excluded_directory_is_read_with_the_files_beside_it() {
     let svg = folder["svg"].as_str().unwrap();
     assert!(svg.contains("<rect class=\"box\""), "{svg}");
     assert!(svg.contains(">Wheel<"), "{svg}");
+
+    // What the document brought in, it takes away when it closes: the
+    // files beside it must not go on being answered for until the server
+    // restarts.
+    let wheels = |client: &mut Client| {
+        let found = client.request(
+            lsp_types::request::WorkspaceSymbolRequest::METHOD,
+            json!({ "query": "Wheel" }),
+        );
+        found.as_array().unwrap().len()
+    };
+    assert_eq!(wheels(&mut client), 1);
+    client.notify(
+        lsp_types::notification::DidCloseTextDocument::METHOD,
+        json!({ "textDocument": { "uri": usages } }),
+    );
+    assert_eq!(wheels(&mut client), 0);
 
     client.request(lsp_types::request::Shutdown::METHOD, Value::Null);
     client.notify(lsp_types::notification::Exit::METHOD, json!({}));
@@ -501,9 +518,9 @@ fn a_file_written_after_startup_belongs_to_the_project() {
 #[test]
 fn an_internal_view_draws_the_element_in_front_of_you() {
     // `Part` names a definition in every other file of a project as
-    // readily as the one being looked at, and the drawing used to be of
-    // whichever the model happened to hold first -- which, with the
-    // standard library loaded, was never the reader's.
+    // readily as the one being looked at, so the drawing must not be of
+    // whichever the model happens to hold first -- which, with the
+    // standard library loaded, is never the reader's.
     let root = workspace("sysml-lsp-internal-view-test");
     std::fs::write(
         root.join("elsewhere.sysml"),
@@ -577,4 +594,94 @@ fn a_handover_this_server_cannot_read_is_said_rather_than_obeyed() {
     );
     assert!(symbols.is_array(), "{symbols}");
     client.stop(handle);
+}
+
+/// A buffer with no file under it -- a new file not saved yet, an
+/// `untitled:` one, a file deleted while it was open -- declares what it
+/// says as much as one on disk does. An open project file whose buffer
+/// still matched the disk must be resolved again when one arrives, or
+/// `part a : B;` would go on underlining `B` after `part def B;` was
+/// opened beside it, and hover on `B` would answer nothing, until `a` was
+/// edited. A buffer that differs from its file is not the only trigger;
+/// the answer cannot depend on that.
+#[test]
+fn a_buffer_with_no_file_under_it_is_what_the_project_resolves_against() {
+    let root = workspace("sysml-lsp-buffer-only-test");
+    let a = root.join("a.sysml");
+    std::fs::write(&a, "part a : B;\n").unwrap();
+    let (mut client, handle) = over(&root);
+    let a_uri = lsp_types::Url::from_file_path(&a).unwrap();
+    let open = |client: &mut Client, uri: &str, text: &str| {
+        client.notify(
+            lsp_types::notification::DidOpenTextDocument::METHOD,
+            json!({ "textDocument": {
+                "uri": uri, "languageId": "sysml", "version": 1, "text": text
+            }}),
+        );
+    };
+    open(&mut client, a_uri.as_str(), "part a : B;\n");
+    let found = client.diagnostics(1);
+    assert_eq!(
+        Client::messages(&found[a_uri.as_str()]),
+        ["unresolved reference `B`"]
+    );
+    let hover = |client: &mut Client| {
+        client.request(
+            lsp_types::request::HoverRequest::METHOD,
+            json!({
+                "textDocument": { "uri": a_uri },
+                "position": { "line": 0, "character": 9 }
+            }),
+        )
+    };
+
+    // not on disk: a file the editor has made and not yet written
+    let b_uri = lsp_types::Url::from_file_path(root.join("b.sysml")).unwrap();
+    open(&mut client, b_uri.as_str(), "part def B;\n");
+    let found = client.diagnostics(2);
+    assert!(found[a_uri.as_str()].is_empty(), "{found:?}");
+    assert!(!hover(&mut client).is_null(), "hover on `B` finds it");
+    client.notify(
+        lsp_types::notification::DidCloseTextDocument::METHOD,
+        json!({ "textDocument": { "uri": b_uri } }),
+    );
+    // the closed one cleared, and `a` without it
+    let found = client.diagnostics(2);
+    assert_eq!(
+        Client::messages(&found[a_uri.as_str()]),
+        ["unresolved reference `B`"]
+    );
+
+    // and one that is no file at all
+    open(&mut client, "untitled:Untitled-1", "part def B;\n");
+    let found = client.diagnostics(2);
+    assert!(found[a_uri.as_str()].is_empty(), "{found:?}");
+    assert!(!hover(&mut client).is_null(), "hover on `B` finds it");
+    client.notify(
+        lsp_types::notification::DidCloseTextDocument::METHOD,
+        json!({ "textDocument": { "uri": "untitled:Untitled-1" } }),
+    );
+    client.diagnostics(2);
+
+    // A new file saved and then closed is the file on disk from then on,
+    // though the project was read before it was written. With no watcher
+    // to say so, closing it is what says so.
+    open(&mut client, b_uri.as_str(), "part def B;\n");
+    client.diagnostics(2);
+    std::fs::write(root.join("b.sysml"), "part def B;\n").unwrap();
+    client.notify(
+        lsp_types::notification::DidSaveTextDocument::METHOD,
+        json!({ "textDocument": { "uri": b_uri } }),
+    );
+    client.notify(
+        lsp_types::notification::DidCloseTextDocument::METHOD,
+        json!({ "textDocument": { "uri": b_uri } }),
+    );
+    // `a` says what it said, so only the closed one is published: what
+    // `a` resolves against is asked by hovering on the name
+    let found = client.diagnostics(1);
+    assert!(found[b_uri.as_str()].is_empty(), "{found:?}");
+    assert!(!hover(&mut client).is_null(), "hover on `B` finds it");
+    client.stop(handle);
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -332,9 +332,11 @@ enum Command {
         library: Option<PathBuf>,
         /// The model being worked on, so a call that names no source of
         /// its own is about it and one that names a file is read against
-        /// the rest; `SYSML_PROJECT_PATH` says the same thing
+        /// the rest; `SYSML_PROJECT_PATH` says the same thing, as a path
+        /// list. Given more than once, the roots are one project: a
+        /// platform checked out beside the model is a second root
         #[arg(long)]
-        project: Option<PathBuf>,
+        project: Vec<PathBuf>,
     },
     /// Talk to a SysML v2 API & Services model server
     Api {
@@ -567,26 +569,31 @@ fn main() -> ExitCode {
             // same variable
             let library =
                 library.or_else(|| std::env::var_os("SYSML_LIBRARY_PATH").map(Into::into));
-            let project =
-                project.or_else(|| std::env::var_os("SYSML_PROJECT_PATH").map(Into::into));
+            let project: Vec<PathBuf> = match project.is_empty() {
+                true => std::env::var_os("SYSML_PROJECT_PATH")
+                    .map(|list| std::env::split_paths(&list).collect())
+                    .unwrap_or_default(),
+                false => project,
+            };
             // A project that is not a directory to read is refused here, at
             // startup, where the launcher reads stderr and the exit code.
             // Taken as given, it would start a server with nothing in its
             // project, and every call after would say to start the server
             // with `--project` -- the very thing it was started with.
-            if let Some(refused) = project.as_deref().and_then(sysml_cli::mcp::refuse_project) {
+            if let Some(refused) = project
+                .iter()
+                .find_map(|root| sysml_cli::mcp::refuse_project(root))
+            {
                 eprintln!("error: {refused}");
                 return ExitCode::FAILURE;
             }
+            let roots: Vec<&Path> = project.iter().map(PathBuf::as_path).collect();
             // there is nowhere to report a failure to write: the only
             // way this ends badly is the client going away mid-answer,
             // and the exit code is what its launcher reads
-            let mut server = match bare {
-                true => sysml_cli::mcp::Server::without_library(project.as_deref()),
-                false => {
-                    sysml_cli::mcp::Server::with_project(library.as_deref(), project.as_deref())
-                }
-            };
+            // `--no-library` wins over a library named as well
+            let library = library.as_deref().filter(|_| !bare);
+            let mut server = sysml_cli::mcp::Server::with_roots(library, &roots, !bare);
             sysml_cli::mcp::serve(
                 &mut server,
                 std::io::BufReader::new(std::io::stdin()),

@@ -4214,3 +4214,89 @@ package Loose {
         "{related}"
     );
 }
+
+/// A platform checked out beside the model is a second root: `--project`
+/// given again, or `SYSML_PROJECT_PATH` as a path list, as `PATH` is. The
+/// union is the project. A root inside another, or a file reached twice,
+/// is read once, or everything in it would be declared twice. Each root
+/// that is not a directory is refused at startup, by its path.
+#[test]
+fn several_roots_are_one_project() {
+    let dir = scratch("sysml-mcp-roots");
+    let (project, platform) = (dir.join("project"), dir.join("platform"));
+    std::fs::create_dir_all(project.join("sub")).unwrap();
+    std::fs::create_dir_all(&platform).unwrap();
+    std::fs::write(
+        platform.join("parts.sysml"),
+        "package Parts { part def Wheel; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("sub/car.sysml"),
+        "package Car { private import Parts::*; part w : Wheel; }\n",
+    )
+    .unwrap();
+    let run = |args: &[&str], list: Option<std::ffi::OsString>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sysml"));
+        command
+            .arg("mcp")
+            .args(args)
+            .env_remove("SYSML_PROJECT_PATH")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(list) = list {
+            command.env("SYSML_PROJECT_PATH", list);
+        }
+        let mut child = command.spawn().unwrap();
+        let line = format!("{}\n", call("check", json!({})));
+        let _ = child.stdin.take().unwrap().write_all(line.as_bytes());
+        child.wait_with_output().unwrap()
+    };
+    let checked = |out: std::process::Output| -> Value {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        answered(&serde_json::from_slice(&out.stdout).unwrap())
+    };
+    let (p, f, sub) = (
+        project.to_str().unwrap(),
+        platform.to_str().unwrap(),
+        project.join("sub"),
+    );
+
+    let answer = checked(run(
+        &[
+            "--project",
+            p,
+            "--project",
+            f,
+            "--project",
+            sub.to_str().unwrap(),
+        ],
+        None,
+    ));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["references"], 2, "{answer}");
+    assert_eq!(
+        answer["project"],
+        json!([p, f, sub.to_str().unwrap()]),
+        "{answer}"
+    );
+
+    let list = std::env::join_paths([&project, &platform]).unwrap();
+    let answer = checked(run(&[], Some(list)));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["references"], 2, "{answer}");
+
+    let missing = dir.join("missing");
+    let out = run(
+        &["--project", p, "--project", missing.to_str().unwrap()],
+        None,
+    );
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains(missing.to_str().unwrap()), "{said}");
+}

@@ -232,10 +232,21 @@ struct Composition {
 /// restates them in `alongside` -- not slow, but easy to get wrong: a file
 /// left out reads as a page of unresolved names.
 struct Project {
-    /// Where it was loaded from, for the answer to say.
-    root: String,
-    /// Every file under the root: its path, and the text last read.
+    /// Where it was loaded from, for the answer to say: one root, or a
+    /// platform beside the model as well.
+    roots: Vec<String>,
+    /// Every file under the roots, each once: its path, and the text last read.
     files: Vec<(String, String)>,
+}
+
+impl Project {
+    /// The root as given, or every root where there are several.
+    fn said(&self) -> Value {
+        match self.roots.as_slice() {
+            [one] => json!(one),
+            all => json!(all),
+        }
+    }
 }
 
 impl Server {
@@ -250,7 +261,7 @@ impl Server {
     /// A server that also holds the model being worked on, so a call
     /// that names no source of its own is about that model.
     pub fn with_project(library: Option<&Path>, project: Option<&Path>) -> Server {
-        Server::holding(library, project, true)
+        Server::with_roots(library, project.as_slice(), true)
     }
 
     /// A server with no standard library at all, which `sysml --no-library
@@ -260,12 +271,13 @@ impl Server {
     /// constraints are not put at all -- worth asking for on purpose rather
     /// than only by accident.
     pub fn without_library(project: Option<&Path>) -> Server {
-        Server::holding(None, project, false)
+        Server::with_roots(None, project.as_slice(), false)
     }
 
-    /// Both of those: `fallback` is whether the copy built into this
-    /// binary stands in for a library nobody named.
-    fn holding(library: Option<&Path>, project: Option<&Path>, fallback: bool) -> Server {
+    /// Both of those, over any number of project roots, which are one
+    /// project: `fallback` is whether the copy built into this binary
+    /// stands in for a library nobody named.
+    pub fn with_roots(library: Option<&Path>, roots: &[&Path], fallback: bool) -> Server {
         let mut base = Workspace::new();
         let mut loaded = None;
         if let Some(dir) = library {
@@ -310,8 +322,11 @@ impl Server {
                 .filter(|_| loaded.is_some() && !from_binary)
                 .map(Path::to_path_buf),
             library: loaded,
-            project: project.map(|root| Project {
-                root: root.display().to_string(),
+            project: (!roots.is_empty()).then(|| Project {
+                roots: roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect(),
                 files: Vec::new(),
             }),
             cache: Vec::new(),
@@ -333,11 +348,22 @@ impl Server {
             return;
         };
         let mut files = Vec::new();
-        for path in sysml_semantics::model_files(Path::new(&project.root)) {
+        // a root inside another reaches its files twice; read twice, every
+        // declaration in them would be made twice
+        let mut seen = HashSet::new();
+        for path in project
+            .roots
+            .iter()
+            .flat_map(|root| sysml_semantics::model_files(Path::new(root)))
+        {
+            let name = canonical(&path.to_string_lossy());
+            if !seen.insert(name.clone()) {
+                continue;
+            }
             // a file that cannot be read is one the answer is not about;
             // stderr is where an MCP server says so
             match std::fs::read_to_string(&path) {
-                Ok(text) => files.push((canonical(&path.to_string_lossy()), text)),
+                Ok(text) => files.push((name, text)),
                 Err(err) => eprintln!("warning: cannot read {}: {err}", path.display()),
             }
         }
@@ -593,9 +619,11 @@ impl Server {
     /// the same spelling `name` is matched by.
     fn located(&self, path: &str) -> std::path::PathBuf {
         if let Some(project) = &self.project {
-            let under = Path::new(&project.root).join(path);
-            if Path::new(path).is_relative() && under.exists() {
-                return under;
+            for root in &project.roots {
+                let under = Path::new(root).join(path);
+                if Path::new(path).is_relative() && under.exists() {
+                    return under;
+                }
             }
         }
         std::path::PathBuf::from(path)
@@ -722,7 +750,7 @@ impl Server {
             return Ok(json!({
                 "ok": false,
                 "library": self.library,
-                "project": self.project.as_ref().map(|it| it.root.clone()),
+                "project": self.project.as_ref().map(Project::said),
                 "parse_errors": errors,
             }));
         }
@@ -846,7 +874,7 @@ impl Server {
         Ok(json!({
             "ok": unresolved.is_empty() && violations.is_empty(),
             "library": self.library,
-            "project": self.project.as_ref().map(|it| it.root.clone()),
+            "project": self.project.as_ref().map(Project::said),
             "parse_errors": [],
             "resolved": stats.resolved,
             "references": stats.resolved + stats.unresolved,
@@ -2728,15 +2756,16 @@ impl Server {
             .flat_map(|it| &it.files)
             .filter_map(|(path, text)| Some((url::Url::from_file_path(path).ok()?, path, text)))
         {
-            let root = self.project.as_ref().map(|it| Path::new(&it.root));
-            let name = root
-                .and_then(|root| {
+            let roots = self.project.iter().flat_map(|it| &it.roots);
+            let name = roots
+                .filter_map(|root| {
                     let root = std::fs::canonicalize(root).ok()?;
                     Path::new(path)
                         .strip_prefix(root)
                         .ok()
                         .map(Path::to_path_buf)
                 })
+                .next()
                 .map_or(path.clone(), |rel| rel.to_string_lossy().replace('\\', "/"));
             listed.push(Listed {
                 uri: uri.to_string(),

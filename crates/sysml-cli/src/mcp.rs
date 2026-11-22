@@ -3372,15 +3372,27 @@ fn edges(ws: &Workspace, open: &[usize]) -> Vec<Edge> {
         };
         let kind = model.kind(elem).name();
         if let Some(V::Ref(requirement)) = model.maybe(elem, "satisfiedRequirement") {
+            // a `by` that reaches nothing satisfies nothing: its owner is
+            // not the satisfier, only the fallback for `satisfy r;`
+            let unresolved_by = || {
+                ws.element_ranges(elem).is_some_and(|(whole, _)| {
+                    ws.unresolved()
+                        .iter()
+                        .any(|u| u.file == file && whole.contains_range(u.range))
+                })
+            };
             let by = match model.maybe(elem, "satisfyingFeature") {
-                Some(V::Ref(by)) => *by,
-                _ => named_owner(model, elem),
+                Some(V::Ref(by)) => Some(*by),
+                _ if unresolved_by() => None,
+                _ => Some(named_owner(model, elem)),
             };
             let relation = match model.flag(elem, "isNegated") {
                 true => "does_not_satisfy",
                 false => "satisfies",
             };
-            add(by, relation, *requirement);
+            if let Some(by) = by {
+                add(by, relation, *requirement);
+            }
             said.insert(elem);
         }
         if let Some(V::RefList(requirements)) = model.maybe(elem, "verifiedRequirement") {

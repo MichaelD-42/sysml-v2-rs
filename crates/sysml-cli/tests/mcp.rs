@@ -4135,3 +4135,82 @@ fn generate_rust_answers_a_page_at_a_time() {
         .unwrap();
     assert_eq!(wrong["result"]["isError"], true);
 }
+
+/// `satisfy r by switch.keypad;` names its satisfier with a feature chain.
+/// The chain is an anonymous feature, so walking up to a named owner found
+/// the package, and the matrix said the package satisfies `r`.
+const CHAINED: &str = "\
+package Platform {
+    part platformSwitch { part keypad; }
+}
+package Chained {
+    private import Platform::platformSwitch;
+    part switch :> platformSwitch;
+    requirement <'R-1'> steps;
+    satisfy steps by switch.keypad;
+}
+";
+
+#[test]
+fn a_chained_satisfier_is_the_feature_the_chain_ends_at() {
+    let answers = session(&[
+        call("trace", json!({ "text": CHAINED })),
+        call("relations", json!({ "text": CHAINED, "element": "R-1" })),
+    ]);
+    let matrix = answered(&answers[0]);
+    let row = &matrix["requirements"][0];
+    assert_eq!(
+        row["satisfied_by"][0]["name"], "Platform::platformSwitch::keypad",
+        "{matrix}"
+    );
+    let related = answered(&answers[1]);
+    let incoming = links(&related, "incoming");
+    assert!(
+        incoming.contains(&"satisfies Platform::platformSwitch::keypad".to_string()),
+        "{related}"
+    );
+}
+
+/// A satisfier that does not resolve -- a platform model not loaded, so
+/// `switch.keypad` reaches nothing -- satisfies nothing. Credited to the
+/// nearest named owner instead, the matrix said the package satisfies `r`.
+/// A `satisfy` written without `by` is still its owner's.
+#[test]
+fn an_unresolved_satisfier_satisfies_nothing() {
+    let text = "\
+package Loose {
+    part switch :> Missing::platformSwitch;
+    requirement <'R-1'> steps;
+    requirement <'R-2'> quiet;
+    satisfy steps by switch.keypad;
+    part plant { satisfy quiet; }
+}
+";
+    let answers = session(&[
+        call("trace", json!({ "text": text })),
+        call("relations", json!({ "text": text, "element": "R-1" })),
+    ]);
+    let matrix = answered(&answers[0]);
+    let row = |name: &str| {
+        matrix["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("Loose::steps")["satisfied_by"], json!([]), "{matrix}");
+    assert_eq!(
+        row("Loose::quiet")["satisfied_by"][0]["name"],
+        "Loose::plant",
+        "{matrix}"
+    );
+    let related = answered(&answers[1]);
+    assert!(
+        !links(&related, "incoming")
+            .iter()
+            .any(|it| it.starts_with("satisfies")),
+        "{related}"
+    );
+}

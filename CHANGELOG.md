@@ -8,6 +8,28 @@ went to; a crate not named in an entry did not change in it.
 Dates are the day the tag was cut. Anything under **Unreleased** is on
 `main` and is not on crates.io yet.
 
+## Unreleased
+
+### A reserved word naming a usage, and a modifier after a tag
+
+`sysmlv2-syntax`
+
+- A usage named after a reserved word is reported too, where what
+  follows the word can only follow a name (`:`, `:>`, `:>>`, `=`, `;`,
+  `typed by`, `subsets`, `redefines` and the like): ``inout item frame :
+  L;`` says ``` `frame` is reserved; write `'frame'` to use it as a name
+  ```. It used to come out as an anonymous framed concern, and the item
+  was dropped without a word. `return part : Engine;` and
+  `succession first [0..1] a then [1] b;` still parse as before, since
+  the word there is followed by what a name is not.
+- A modifier written after a user-defined keyword is reported: the
+  standard puts `variation`, `abstract`, `ref`, the direction and
+  `variant` before the `#tags` (`UsagePrefix = UnextendedUsagePrefix
+  UsageExtensionKeyword*`), so ``#Electrical variation part`` says
+  ``` `variation` comes before a user-defined keyword: write it first
+  ```. The OMG Pilot Implementation refuses that order; this parser
+  took it.
+
 ## 2026-11-16
 
 Published: `sysmlv2-syntax` **0.1.4**, `sysmlv2-model` **0.1.3**,

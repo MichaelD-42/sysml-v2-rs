@@ -75,6 +75,7 @@ pub fn parse_dialect(text: &str, dialect: crate::Dialect) -> Parse {
         in_metadata_body: false,
         opens_metadata_body: false,
         declaring_effect: false,
+        tagged_member: false,
         stops_at_then: false,
         handed_body: false,
         connector_ends: false,
@@ -147,6 +148,9 @@ struct Parser<'t> {
     /// The declaration about to be read is the action a transition's `do`
     /// writes, which a `then` may follow straight after its name.
     declaring_effect: bool,
+    /// The member being read opened with a `#keyword`, before the
+    /// declaration's own modifiers, which must come before it.
+    tagged_member: bool,
     /// The declaration being read is such an effect, which ends where the
     /// transition's `then` begins.
     stops_at_then: bool,
@@ -450,10 +454,12 @@ impl Parser<'_> {
     fn member_inner(&mut self) {
         let cp = self.checkpoint();
         let mut seen_visibility = false;
+        self.tagged_member = false;
         // visibility and `#name` user-defined-keyword prefixes, in any order
         loop {
             if self.at(HASH) && self.nth_starts_qualified(1) {
                 self.opt_prefix_metadata();
+                self.tagged_member = true;
             } else if self.current().is_visibility_kw() {
                 if seen_visibility {
                     self.error_and_bump("a member has one visibility, and it is already given");
@@ -832,9 +838,20 @@ impl Parser<'_> {
         self.finish_node();
     }
 
+    /// A word the grammar puts before the user-defined keywords, written
+    /// after one: `#E variation part`, `#E variant part`.
+    fn word_after_tag(&mut self) {
+        let word = &self.text[self.current_range()];
+        let message = format!("`{word}` comes before a user-defined keyword: write it first");
+        self.error(message);
+    }
+
     /// `subject x : T;`, `return x;`, `variant part v;`, `render asTree;`
     fn kw_usage(&mut self, cp: Checkpoint) {
         self.start_node_at(cp, USAGE);
+        if std::mem::take(&mut self.tagged_member) {
+            self.word_after_tag();
+        }
         let led = self.current();
         self.bump();
         // `variant w;` names a usage the model already has: `VariantReference
@@ -855,11 +872,15 @@ impl Parser<'_> {
         // `return` and `variant`: the keyword comes first and the
         // user-defined keywords the model declares come after it, so
         // `actor #safetyEngineer a;` is a member of a requirement.
+        let tagged = self.at(HASH);
         self.opt_prefix_metadata();
         // `VariantUsageElement` is a full usage, so the kind comes before the
         // name: `variant part <'PC-2'> radar;`
         if led == VARIANT_KW {
             while self.current().is_modifier_kw() {
+                if tagged {
+                    self.word_after_tag();
+                }
                 self.bump();
             }
             if self.current().is_def_kind_kw() {
@@ -869,7 +890,15 @@ impl Parser<'_> {
         }
         self.opt_short_name();
         let before = self.pos;
-        self.opt_decl_name();
+        // a kind keyword here is the usage's kind: `return part : Engine;`
+        if self.current().is_keyword()
+            && !self.current().is_def_kind_kw()
+            && self.keyword_declared()
+        {
+            self.keyword_as_name();
+        } else {
+            self.opt_decl_name();
+        }
         self.named = self.pos != before;
         // `return part x;`, `variant part v;`: the keyword leads a
         // declaration its kind keyword comes after
@@ -924,9 +953,15 @@ impl Parser<'_> {
         let mut ended = false;
         let mut prefixed = false;
         let mut written: Vec<SyntaxKind> = Vec::new();
+        let mut tagged = std::mem::take(&mut self.tagged_member);
         loop {
             if self.current().is_modifier_kw() {
                 let here = self.current();
+                // `UsagePrefix = UnextendedUsagePrefix UsageExtensionKeyword*`, and
+                // KerML's `FeaturePrefix` puts its `PrefixMetadataMember`s last too
+                if tagged {
+                    self.word_after_tag();
+                }
                 ended |= here == END_KW;
                 prefixed = true;
                 let direction = |k: SyntaxKind| matches!(k, IN_KW | OUT_KW | INOUT_KW);
@@ -941,6 +976,7 @@ impl Parser<'_> {
                 written.push(here);
                 self.bump();
             } else if self.at(HASH) && self.nth_starts_qualified(1) {
+                tagged = true;
                 self.opt_prefix_metadata();
             } else {
                 break;
@@ -1018,9 +1054,13 @@ impl Parser<'_> {
         } else {
             // usages: only take a name the next token confirms, so that
             // `flow p1.torque to p2.torque;` keeps `p1.torque` an expression
-            self.declaring_effect = effect;
-            self.opt_decl_name();
-            self.declaring_effect = false;
+            if self.current().is_keyword() && self.keyword_declared() {
+                self.keyword_as_name();
+            } else {
+                self.declaring_effect = effect;
+                self.opt_decl_name();
+                self.declaring_effect = false;
+            }
         }
         // Only what connects may open on the features it connects --
         // `flow a.b to c.d`, `succession a then b`, `binding x = y`;
@@ -1907,6 +1947,29 @@ impl Parser<'_> {
         self.finish_node();
     }
 
+    /// Whether a keyword where a usage's name belongs was meant as one: the
+    /// token after it is one that only follows a declared name. Not `[`,
+    /// `(` or `{`, which open a usage's own clause after its keyword --
+    /// `succession first [0..1] a then b;`, `connection connect (a, b);`.
+    fn keyword_declared(&self) -> bool {
+        matches!(
+            self.nth(1),
+            COLON
+                | COLON_GT
+                | COLON_GT_GT
+                | COLON_COLON_GT
+                | EQ
+                | COLON_EQ
+                | SEMICOLON
+                | TYPED_KW
+                | DEFINED_KW
+                | SUBSETS_KW
+                | REDEFINES_KW
+                | REFERENCES_KW
+                | SPECIALIZES_KW
+        )
+    }
+
     /// A name is only consumed when the following token confirms this is a
     /// declaration (used for `return x;` vs `return x * 2;`).
     /// The name of a metadata usage, which only a `:`, a `typed by` or a
@@ -2450,7 +2513,6 @@ mod tests {
             "port def A\nport p;\n",
             "enum def E\nenum a;\n",
             "part def A part;\n",
-            "part part part;\n",
             "part def A abstract ref in out;\n",
         ] {
             let parse = parse(text);
@@ -2465,6 +2527,21 @@ mod tests {
             assert!(unended, "{text:?}: {said:?}");
             assert_eq!(parse.syntax().text().to_string(), text, "lossless violated");
         }
+        // a keyword before `;` is the name the declaration was given, so
+        // this is one declaration that says `part` twice and is named
+        // after a reserved word, not two
+        let said: Vec<String> = parse("part part part;\n")
+            .errors()
+            .iter()
+            .map(|it| it.message.clone())
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "this is already said of the declaration",
+                "`part` is reserved; write `'part'` to use it as a name"
+            ]
+        );
         // the next declaration is a sibling, not a member
         let parse = parse("part def A\npart a : A;\n");
         let top: Vec<SyntaxKind> = parse.syntax().children().map(|it| it.kind()).collect();
@@ -2964,6 +3041,77 @@ mod tests {
             let tree = format!("{:#?}", parse.syntax());
             assert!(tree.contains("NAME@"), "no name node for {text}:\n{tree}");
         }
+    }
+
+    /// A usage named after a reserved word loses its name the same way,
+    /// and worse: `inout item frame : L;` read `frame` as the start of a
+    /// framed concern, so the port came out with an anonymous concern and
+    /// no item, and nothing was said. Where the token after the word
+    /// confirms a declaration (`:`, `;`, a specialization), the word was
+    /// meant as the name.
+    #[test]
+    fn a_reserved_word_where_a_usage_is_named() {
+        for (text, word) in [
+            ("item def L; port def P { inout item frame : L; }", "frame"),
+            ("part def Q { part frame; }", "frame"),
+            ("part def Q { attribute action :> x; }", "action"),
+            ("part def Q { part end = y; }", "end"),
+            ("part def V { variant part frame; }", "frame"),
+            ("requirement r { subject frame : Q; }", "frame"),
+        ] {
+            let parse = parse(text);
+            assert_eq!(parse.syntax().text().to_string(), text, "lossless: {text}");
+            let said: Vec<&str> = parse.errors().iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(
+                said,
+                [format!(
+                    "`{word}` is reserved; write `'{word}'` to use it as a name"
+                )],
+                "for {text}"
+            );
+        }
+        check_ok("item def L; port def P { inout item 'frame' : L; }");
+    }
+
+    /// `UsagePrefix = UnextendedUsagePrefix UsageExtensionKeyword*`, and
+    /// KerML's `FeaturePrefix` ends in its `PrefixMetadataMember`s the same
+    /// way: a user-defined keyword comes after `variation`, `abstract`,
+    /// `ref`, the direction and the rest, never before them.
+    #[test]
+    fn a_modifier_after_a_user_defined_keyword() {
+        for (text, word) in [
+            (
+                "metadata def E; part def K; #E variation part km : K;",
+                "variation",
+            ),
+            (
+                "metadata def E; part def Q { #E abstract part p; }",
+                "abstract",
+            ),
+            ("metadata def E; port def P { #E in item x; }", "in"),
+            (
+                "metadata def E; part def V { #E variant part w; }",
+                "variant",
+            ),
+            (
+                "metadata def E; part def V { variant #E abstract part w; }",
+                "abstract",
+            ),
+        ] {
+            let parse = parse(text);
+            assert_eq!(parse.syntax().text().to_string(), text, "lossless: {text}");
+            let said: Vec<&str> = parse.errors().iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(
+                said,
+                [format!(
+                    "`{word}` comes before a user-defined keyword: write it first"
+                )],
+                "for {text}"
+            );
+        }
+        check_ok("metadata def E; part def K; variation #E part km : K;");
+        check_ok("metadata def E; part def V { variant #E part w; }");
+        check_ok("metadata def E; port def P { in #E item x; }");
     }
 
     /// And the same words where they are doing their own job in the very

@@ -111,7 +111,7 @@ impl Workspace {
     }
     /// The end features a type declares itself, in the order it wrote
     /// them -- `ownedEndFeature`.
-    fn own_ends(&self, elem: ElementId) -> Vec<ElementId> {
+    pub(crate) fn own_ends(&self, elem: ElementId) -> Vec<ElementId> {
         self.model
             .owned(elem)
             .iter()
@@ -187,6 +187,82 @@ impl Workspace {
             }
         }
     }
+    /// What a variant specializes: the variation it is a variant of.
+    ///
+    /// `checkUsageVariationDefinitionSpecialization` -- a variant of a
+    /// variation definition is typed by it -- and
+    /// `checkUsageVariationUsageSpecialization` -- a variant of a variation
+    /// usage subsets it. `enum def ColorKind :> Color { enum red { :>> val =
+    /// 0; } }` writes neither, and without them `red` is no `Color` and has no
+    /// `val` to redefine.
+    pub(crate) fn imply_variant_specializations(&mut self, ids: &[ElementId]) {
+        for &elem in ids {
+            if self.model.member_role(elem) != Some(sysml_model::Role::Variant) {
+                continue;
+            }
+            let Some(variation) = self.model.owner(elem) else {
+                continue;
+            };
+            let (kind, ends) = match self.model.kind(variation) {
+                it if it.is_a(ElementKind::Definition) => {
+                    (ElementKind::FeatureTyping, ("typedFeature", "type"))
+                }
+                it if it.is_a(ElementKind::Usage) => (
+                    ElementKind::Subsetting,
+                    ("subsettingFeature", "subsettedFeature"),
+                ),
+                _ => continue,
+            };
+            if reaches(&self.model, elem, variation) {
+                continue;
+            }
+            let implied = self.reified(
+                elem,
+                kind,
+                &[(ends.0, Value::Ref(elem)), (ends.1, Value::Ref(variation))],
+            );
+            self.model.set(implied, "isImplied", Value::Bool(true));
+            self.model.set(elem, "isImpliedIncluded", Value::Bool(true));
+            self.supertypes.clear();
+        }
+    }
+    /// What a required or assumed constraint subsets.
+    ///
+    /// `checkConstraintUsageRequirementConstraintSpecialization` -- a
+    /// constraint a requirement requires specializes
+    /// `RequirementCheck::constraints`, one it assumes
+    /// `RequirementCheck::assumptions`. `require viewpointSatisfactions { ... }`
+    /// subsets the feature it names and nothing that makes it a
+    /// subperformance of the requirement.
+    pub(crate) fn imply_requirement_constraints(&mut self, ids: &[ElementId]) {
+        for &elem in ids {
+            let base = match self.model.member_role(elem) {
+                Some(sysml_model::Role::Require) => "Requirements::RequirementCheck::constraints",
+                Some(sysml_model::Role::Assume) => "Requirements::RequirementCheck::assumptions",
+                _ => continue,
+            };
+            if !self.model.kind(elem).is_a(ElementKind::ConstraintUsage) {
+                continue;
+            }
+            let Some(base) = self.named_globally(base) else {
+                continue;
+            };
+            if elem == base || self.reaches(elem, base) {
+                continue;
+            }
+            let subsetting = self.reified(
+                elem,
+                ElementKind::Subsetting,
+                &[
+                    ("subsettingFeature", Value::Ref(elem)),
+                    ("subsettedFeature", Value::Ref(base)),
+                ],
+            );
+            self.model.set(subsetting, "isImplied", Value::Bool(true));
+            self.model.set(elem, "isImpliedIncluded", Value::Bool(true));
+            self.supertypes.clear();
+        }
+    }
     /// The subsetting an owned cross feature implies.
     ///
     /// "If this Feature is the ownedCrossFeature of an end Feature, then, for
@@ -238,7 +314,7 @@ impl Workspace {
     /// owningMembership is not a FeatureMembership". The notation writes it
     /// two ways, and both are read here: `member feature inCart;` inside the
     /// end, and `end inCart[0..1] feature cart : ShoppingCart;` in front.
-    fn owned_cross_feature(&self, elem: ElementId) -> Option<ElementId> {
+    pub(crate) fn owned_cross_feature(&self, elem: ElementId) -> Option<ElementId> {
         if !self.model.flag(elem, "isEnd") {
             return None;
         }

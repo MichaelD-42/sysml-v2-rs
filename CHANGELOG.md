@@ -10,6 +10,38 @@ Dates are the day the tag was cut. Anything under **Unreleased** is on
 
 ## Unreleased
 
+### A subsetted feature the subsetting one cannot reach
+
+`sysmlv2-syntax`, `sysmlv2-model`, `sysmlv2-semantics`
+
+- `validateSubsettingFeaturingTypes` runs, as the OMG Pilot
+  Implementation's `checkSubsetting` runs it: only on a subsetting the
+  model writes, and only where the subsetted feature has a featuring
+  type. `part e :> A::b::c;` inside a specialization of `A` is
+  reported, because `c` is featured by `b` and no featuring type of `e`
+  reaches `b`. `part e :> b.c;` is not reported. The rule reports
+  nothing on the OMG corpus.
+- `part x : A, B :>> y;` keeps both types. The second one used to be
+  read as the start of the redefinition and dropped.
+- The relationships the standard implies are added and marked implied:
+  - an enumerated value is typed by its enumeration;
+  - a variant subsets its variation usage;
+  - a `require` constraint subsets `RequirementCheck::constraints`, and
+    an `assume` constraint subsets `RequirementCheck::assumptions`;
+  - a transition's payload subsetting is marked implied.
+- The cross feature of a binary association's end is featured by the
+  other end's types.
+- `then` written after a flow starts at the step before the flow, as it
+  does in the Pilot.
+- A connector end's `references` is resolved where the connector is,
+  not inside the end.
+- `satisfy`, `assert`, `render` and `event` usages no longer answer to
+  the name of what they point at. So `satisfy A::spec by v` beside a
+  `**` import no longer makes `spec` ambiguous.
+- The generated metamodel keeps every property a property redefines,
+  not just the first one. `referencingFeature` redefines both
+  `owningFeature` and `subsettingFeature`.
+
 ### A reserved word naming a usage, and a modifier after a tag
 
 `sysmlv2-syntax`

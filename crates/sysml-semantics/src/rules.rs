@@ -313,7 +313,27 @@ const UNCLOSED: [(&str, &str, &str); 5] = [
 /// type specializes is the `general` end, and that is all there is to
 /// mend: `enum def F :> E;`, one enumeration extending another, went
 /// unreported.
-const MISREAD: [(&str, &str, &str); 2] = [
+///
+/// `validateSubsettingFeaturingTypes` is
+/// `subsettingFeature.canAccess(subsettedFeature)`, which holds the
+/// subsetted feature to being featured within a featuring type the
+/// subsetting feature reaches by walking up. Read as the metamodel states
+/// it, it is asked of every subsetting, the implied ones too, and half the
+/// corpus fails it. It is run here as the pilot's `checkSubsetting` runs
+/// it: only of a subsetting the model writes, only where the subsetted
+/// feature has a featuring type, and with `canAccess` recursing up through
+/// a featuring type that is itself a feature. `part e :> A::b::c;` beside
+/// `b` reaches nothing, and is reported; `part e :> b.c;` is not.
+const MISREAD: [(&str, &str, &str); 3] = [
+    (
+        "validateSubsettingFeaturingTypes",
+        "subsettingFeature.canAccess(subsettedFeature)",
+        "not isImplied and subsettingFeature <> null and subsettedFeature <> null and subsettedFeature.featuringType->notEmpty() implies\n\
+         (subsettingFeature.featuringType->isEmpty() and subsettedFeature.isFeaturedWithin(null) or\n\
+         subsettingFeature.featuringType->union(subsettingFeature.featuringType->closure(t |\n\
+             if t.oclIsKindOf(Feature) then t.oclAsType(Feature).featuringType else Set{} endif))\n\
+           ->exists(t | subsettedFeature.isFeaturedWithin(t)))",
+    ),
     (
         "validateDefinitionVariationSpecialization",
         "ownedSpecialization.specific",
@@ -371,21 +391,6 @@ fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
 /// one of them. The pilot implementation runs none of these four and
 /// records an issue of its own, SYSML21-306.
 ///
-/// `validateSubsettingFeaturingTypes` is
-/// `subsettingFeature.canAccess(subsettedFeature)`, and `canAccess` holds
-/// the subsetted feature to being featured within one of the featuring
-/// types the subsetting one reaches -- walking *up*, never down. Read as
-/// the metamodel states it, many of the corpus's subsettings are
-/// rejected.
-///
-/// The pilot does run it, and does two things the metamodel does not
-/// state: it asks only where the subsetted feature has a featuring type,
-/// which exempts many outright, and `TypeUtil.isCompatible` answers one
-/// step more widely. Neither is what the rest turn on. They turn
-/// on direction: `accept a : A` gives a transition an `accepted` featured
-/// by the transition and a payload featured by the trigger it owns, and no
-/// upward walk from one reaches the other.
-///
 /// `validateRedefinitionFeaturingTypes` says in words that the redefining
 /// feature "must have at least one featuringType that is not also a
 /// featuringType of the redefinedFeature", and in OCL that the two sets
@@ -419,7 +424,7 @@ fn closed(name: &str, ocl: &'static str) -> std::borrow::Cow<'static, str> {
 /// Running any of these would report a violation of a sound model, so what
 /// they are is said instead. The two the OCL subset cannot parse are
 /// pinned in `ocl.rs` alongside.
-const MISWRITTEN: [(&str, &str); 6] = [
+const MISWRITTEN: [(&str, &str); 5] = [
     (
         "validateMultiplicityRangeBoundResultTypes",
         "a bound written as a name comes to whatever that name is typed by, and the notation \
@@ -431,12 +436,6 @@ const MISWRITTEN: [(&str, &str); 6] = [
         "the specification's own operator table maps `|` to `DataFunctions::'|'`, which returns \
          a data value rather than a boolean; the pilot implementation infers the boolean the \
          specification does not state",
-    ),
-    (
-        "validateSubsettingFeaturingTypes",
-        "`canAccess` holds a subsetted feature to being featured within what the subsetting one \
-         reaches, and the corpus features what it subsets further down; eight thousand \
-         subsettings are rejected, the library's own association ends among them",
     ),
     (
         "validateRedefinitionFeaturingTypes",
@@ -1505,6 +1504,26 @@ impl Scope<'_> {
             Some(Value::RefList(chain)) => chain.first().copied(),
             _ => None,
         };
+        // `checkFeatureOwnedCrossFeatureTypeFeaturing`: the cross feature a
+        // binary association's end owns is featured by the other end's types.
+        // shortcut: an N-ary association's cross features are featured by a
+        // cartesian product the pilot builds and this does not; they fall to
+        // the owning end below, as before.
+        let other_end = inside
+            .filter(|&end| written.is_empty() && self.ws.owned_cross_feature(end) == Some(elem))
+            .and_then(|end| {
+                let ends = self.ws.own_ends(model.owner(end)?);
+                (ends.len() == 2).then(|| ends.into_iter().find(|&it| it != end))?
+            });
+        if let Some(other) = other_end {
+            if let Val::Set(types) = self.property(other, "type") {
+                into.extend(types.into_iter().filter_map(|it| match it {
+                    Val::Elem(it) => Some(it),
+                    _ => None,
+                }));
+            }
+            return;
+        }
         match (written.is_empty(), owns_it_as_a_feature, inside) {
             (false, _, _) => into.extend(written),
             (true, true, _) => into.extend(owner),
@@ -2561,6 +2580,33 @@ impl Scope<'_> {
             }
             seen.push(current);
             queue.extend(self.ws.supertypes(current));
+            // What name resolution reified has no syntax for `supertypes` to
+            // read: a flow end written `from x.pub` reference-subsets `x`, and
+            // only the relationship it owns says so.
+            let model = self.ws.model();
+            let owned: Vec<ElementId> = model
+                .owned(current)
+                .iter()
+                .copied()
+                .filter(|&it| model.kind(it).is_a(ElementKind::Specialization))
+                .filter_map(|it| {
+                    [
+                        "redefinedFeature",
+                        "referencedFeature",
+                        "subsettedFeature",
+                        "type",
+                        "superclassifier",
+                        "general",
+                    ]
+                    .iter()
+                    .find_map(|named| model.maybe(it, named).and_then(Value::as_id))
+                })
+                .collect();
+            queue.extend(owned);
+            // a chain is one of the values of the feature it ends in
+            if let Some(Value::RefList(chain)) = model.maybe(current, "chainingFeature") {
+                queue.extend(chain.last().copied());
+            }
         }
         false
     }
@@ -2705,7 +2751,7 @@ fn redefined_property(kind: ElementKind, name: &str) -> Option<&'static str> {
         .chain(kind.ancestors().iter().copied())
         .flat_map(|it| it.own_features())
         .find(|meta| meta.name == name)
-        .and_then(|meta| meta.redefines)
+        .and_then(|meta| meta.redefines.first().copied())
 }
 
 /// The property of `kind` that redefines `name`, where one does.
@@ -2725,7 +2771,7 @@ fn redefining(kind: ElementKind, name: &str) -> Option<&'static str> {
     // Redefinition chains -- `referencedFeature` redefines
     // `subsettedFeature`, which redefines `general` -- so the walk keeps
     // going, and the deepest name is the one the model holds.
-    while let Some(next) = of_kind().find(|meta| meta.redefines == Some(wanted)) {
+    while let Some(next) = of_kind().find(|meta| meta.redefines.contains(&wanted)) {
         wanted = next.name;
         found = Some(next.name);
     }
@@ -4256,6 +4302,231 @@ mod tests {
             ws.judge("connectorEnds->isEmpty()", subclassification),
             None
         );
+    }
+
+    /// `validateSubsettingFeaturingTypes`, as the pilot implementation runs
+    /// it: a subsetted feature with a featuring type is one the subsetting
+    /// feature, or what features it, can reach. `A::b::c` names the `c` of
+    /// every `b`, featured by `b`, which no `D` is; `b.c` is the chain a
+    /// `D` reaches through its own `b`.
+    #[test]
+    fn a_subsetted_feature_is_one_the_subsetting_feature_can_reach() {
+        let mut ws = Workspace::new();
+        let file = ws.add_file(
+            "test.sysml",
+            "package P {\n\
+             \tpart def A { part b { part c; } }\n\
+             \tpart def D :> A { part e :> A::b::c; }\n\
+             \tpart def F :> A { part e :> b.c; }\n\
+             \tpart def G { part e :> A::b; }\n\
+             }\n",
+        );
+        ws.resolve_all();
+        let checked = ws.check_rules(&[file]);
+        let reported: Vec<String> = checked
+            .violations
+            .iter()
+            .filter(|it| it.rule == "validateSubsettingFeaturingTypes")
+            .map(|it| {
+                let subsetting = ws.model().get(it.element, "subsettingFeature");
+                match subsetting {
+                    Some(Value::Ref(feature)) => ws.qualified_name_of(*feature),
+                    other => format!("{other:?}"),
+                }
+            })
+            .collect();
+        // `G` is no `A`, so its `e` cannot reach the `b` of one either
+        assert_eq!(reported, ["P::D::e", "P::G::e"], "{checked:?}");
+        assert!(checked.held.contains(&"validateSubsettingFeaturingTypes"));
+    }
+
+    /// What the standard implies is not asked whether it may be: the pilot
+    /// checks the subsettings a model writes, and a transition's accepted
+    /// payload subsets the trigger's without anything writing it.
+    #[test]
+    fn an_implied_subsetting_is_not_asked_whether_it_reaches() {
+        let mut ws = Workspace::new();
+        let file = ws.add_file(
+            "test.sysml",
+            "attribute def S;\n\
+             state def M { state a; state b; transition t first a accept s : S then b; }\n",
+        );
+        ws.resolve_all();
+        let checked = ws.check_rules(&[file]);
+        assert!(
+            checked
+                .violations
+                .iter()
+                .all(|it| it.rule != "validateSubsettingFeaturingTypes"),
+            "{checked:?}"
+        );
+    }
+
+    /// A flow end written `from x.pub` reference-subsets `x`, which only the
+    /// relationship it owns says, and a chain is one of the values of the
+    /// feature it ends in: both are what a feature specializes.
+    #[test]
+    fn what_resolution_reified_is_specialized_too() {
+        let mut ws = Workspace::new();
+        let file = ws.add_file(
+            "test.sysml",
+            "package T {\n\
+             \titem def Pub;\n\
+             \tport def P { out item pub : Pub; }\n\
+             \tpart def D { port m : P; }\n\
+             \tpart ctx {\n\
+             \t\tpart d : D; part e : D;\n\
+             \t\tinterface i connect (x ::> d.m, y ::> e.m) {\n\
+             \t\t\tflow of Pub from x.pub to y.pub;\n\
+             \t\t\tflow of Pub from d.m.pub to e.m.pub;\n\
+             \t\t}\n\
+             \t}\n\
+             }\n",
+        );
+        ws.resolve_all();
+        let checked = ws.check_rules(&[file]);
+        assert!(
+            checked
+                .violations
+                .iter()
+                .all(|it| it.rule != "validateSubsettingFeaturingTypes"),
+            "{checked:?}"
+        );
+        assert!(
+            checked.held.contains(&"validateSubsettingFeaturingTypes"),
+            "{:?}",
+            checked
+                .partly
+                .iter()
+                .find(|it| it.0 == "validateSubsettingFeaturingTypes")
+        );
+    }
+
+    fn at(ws: &Workspace, qualified: &str) -> ElementId {
+        ws.model()
+            .ids()
+            .find(|&id| ws.qualified_name_of(id) == qualified)
+            .unwrap_or_else(|| panic!("{qualified} is declared"))
+    }
+
+    /// `checkUsageVariationDefinitionSpecialization` and
+    /// `checkUsageVariationUsageSpecialization`: an enumerated value is one
+    /// of its enumeration, and a variant of a variation usage subsets it.
+    #[test]
+    fn a_variant_specializes_its_variation() {
+        let (mut ws, red) = about(
+            "package E {\n\
+             \tattribute def Color;\n\
+             \tenum def ColorKind :> Color { enum red; }\n\
+             \tpart def P;\n\
+             \tvariation part v : P { variant part w; }\n\
+             }\n",
+            "red",
+        );
+        let kind = at(&ws, "E::ColorKind");
+        assert!(ws.supertypes(red).contains(&kind));
+        let (w, v) = (at(&ws, "E::v::w"), at(&ws, "E::v"));
+        assert!(ws.supertypes(w).contains(&v));
+    }
+
+    /// `checkConstraintUsageRequirementConstraintSpecialization`: what a
+    /// requirement requires is one of its `constraints`, what it assumes one
+    /// of its `assumptions`.
+    #[test]
+    fn a_required_constraint_is_one_of_the_requirements_constraints() {
+        let (mut ws, _) = about(
+            "package Requirements {\n\
+             \trequirement def RequirementCheck { constraint assumptions; constraint constraints; }\n\
+             }\n\
+             package R {\n\
+             \tconstraint c;\n\
+             \trequirement def Q { require c; assume constraint a; }\n\
+             }\n",
+            "Q",
+        );
+        let constraints = at(&ws, "Requirements::RequirementCheck::constraints");
+        let assumptions = at(&ws, "Requirements::RequirementCheck::assumptions");
+        let required = at(&ws, "R::Q::c");
+        let assumed = at(&ws, "R::Q::a");
+        assert!(ws.supertypes(required).contains(&constraints));
+        assert!(ws.supertypes(assumed).contains(&assumptions));
+    }
+
+    /// The source of `then` after a flow is the step before the flow, as the
+    /// pilot implementation's `getPreviousFeature` passes over a connector.
+    #[test]
+    fn a_then_after_a_flow_runs_from_the_step_before_it() {
+        let mut ws = Workspace::new();
+        ws.add_file(
+            "test.sysml",
+            "package A {\n\
+             \titem def Image;\n\
+             \taction def Shoot { in image : Image; }\n\
+             \taction def Focus { out image : Image; }\n\
+             \taction def T {\n\
+             \t\taction focus : Focus { out item image; }\n\
+             \t\tflow from focus.image to shoot.image;\n\
+             \t\tthen action shoot : Shoot { in item; }\n\
+             \t}\n\
+             }\n",
+        );
+        ws.resolve_all();
+        let focus = at(&ws, "A::T::focus");
+        let model = ws.model();
+        let succession = model
+            .owned(at(&ws, "A::T"))
+            .iter()
+            .copied()
+            .find(|&it| model.kind(it) == ElementKind::SuccessionAsUsage)
+            .expect("`then` writes a succession");
+        assert_eq!(
+            model.maybe(succession, "relatedFeature"),
+            Some(&Value::RefList(vec![focus, at(&ws, "A::T::shoot")]))
+        );
+    }
+
+    /// `satisfy A::spec by v` has no naming feature, so it answers to no name,
+    /// and a recursive import of what holds it brings in no second `spec`.
+    #[test]
+    fn a_satisfy_answers_to_no_name() {
+        let mut ws = Workspace::new();
+        ws.add_file(
+            "test.sysml",
+            "package A { requirement spec; }\n\
+             package B { part v { satisfy A::spec by v; } }\n\
+             package C { public import A::*; public import B::**; }\n",
+        );
+        ws.resolve_all();
+        let c = at(&ws, "C");
+        let found = ws.resolve_from(c, &["C".to_string(), "spec".to_string()]);
+        assert_eq!(found, Some(at(&ws, "A::spec")));
+    }
+
+    /// What a declared end refers to is named where its connector is: the
+    /// `thisOcc` beside the connector, not the one the end's type has.
+    #[test]
+    fn an_end_refers_to_what_is_named_beside_its_connector() {
+        let mut ws = Workspace::new();
+        ws.add_file(
+            "test.kerml",
+            "package O {\n\
+             \tclassifier Occ { feature thisOcc; feature thatOcc; }\n\
+             \tassoc H { end feature shorter : Occ; end feature longer : Occ; }\n\
+             \tclassifier T {\n\
+             \t\tfeature thisOcc; feature thatOcc;\n\
+             \t\tconnector : H from shorter references thisOcc to longer references thatOcc;\n\
+             \t}\n\
+             }\n",
+        );
+        ws.resolve_all();
+        let model = ws.model();
+        let referenced: Vec<String> = model
+            .ids()
+            .filter(|&it| model.kind(it) == ElementKind::ReferenceSubsetting)
+            .filter_map(|it| model.maybe(it, "referencedFeature").and_then(Value::as_id))
+            .map(|it| ws.qualified_name_of(it))
+            .collect();
+        assert_eq!(referenced, ["O::T::thisOcc", "O::T::thatOcc"]);
     }
 
     /// A control node written at the top of a file is wrong in two ways

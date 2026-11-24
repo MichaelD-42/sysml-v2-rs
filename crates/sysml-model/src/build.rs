@@ -458,6 +458,10 @@ fn build_node(
                 model.add_owned(accepted, subsetting);
                 model.set(subsetting, "subsettingFeature", Value::Ref(accepted));
                 model.set(subsetting, "subsettedFeature", Value::Ref(payload));
+                // `checkTransitionUsagePayloadSpecialization` implies it; nothing
+                // writes it
+                model.set(subsetting, "isImplied", Value::Bool(true));
+                model.set(accepted, "isImpliedIncluded", Value::Bool(true));
             }
         }
         reify_guard(model, node, id, built);

@@ -32,12 +32,14 @@ struct Feature {
     ty: FeatureTy,
     many: bool,
     derived: bool,
-    /// The property this one redefines, where it redefines one.
+    /// The properties this one redefines.
     ///
     /// `Subsetting::subsettedFeature` redefines `Specialization::general`
     /// and a model holds only the redefining name, so a constraint
-    /// written of the general one has to be told where to look.
-    redefines: Option<String>,
+    /// written of the general one has to be told where to look. Three
+    /// redefine two: `ReferenceSubsetting::referencingFeature` is both the
+    /// `owningFeature` and the `subsettingFeature` of the subsetting.
+    redefines: Vec<String>,
     /// What the metamodel says the property is where a model says
     /// nothing, for the boolean flags that carry one. `<defaultValue
     /// xmi:type="uml:LiteralBoolean"/>` with no value is `false`, which
@@ -430,11 +432,12 @@ fn parse_feature(attr: &roxmltree::Node, ids: &BTreeMap<String, String>) -> Feat
     // read first.
     let redefines = attr
         .children()
-        .find(|c| c.has_tag_name("redefinedProperty"))
-        .and_then(|c| c.attribute((XMI, "idref")))
-        .and_then(|id| id.rsplit('-').next())
+        .filter(|c| c.has_tag_name("redefinedProperty"))
+        .filter_map(|c| c.attribute((XMI, "idref")))
+        .filter_map(|id| id.rsplit('-').next())
+        .filter(|redefined| *redefined != name)
         .map(str::to_string)
-        .filter(|redefined| redefined != name);
+        .collect();
     Feature {
         default,
         name: name.to_string(),
@@ -714,7 +717,7 @@ fn generate(
             writeln!(
                 w,
                 "                FeatureMeta {{ name: \"{}\", ty: {ty}, many: {}, \
-                 derived: {}, default: {:?}, redefines: {:?} }},",
+                 derived: {}, default: {:?}, redefines: &{:?} }},",
                 f.name, f.many, f.derived, f.default, f.redefines
             )
             .unwrap();
@@ -793,10 +796,10 @@ fn generate(
     .unwrap();
     writeln!(
         w,
-        "    /// The property this one redefines, where it redefines one:\n\
-         \x20   /// a model holds the redefining name, and a constraint may be\n\
-         \x20   /// written of the one it redefines.\n\
-         \x20   pub redefines: Option<&'static str>,"
+        "    /// The properties this one redefines: a model holds the\n\
+         \x20   /// redefining name, and a constraint may be written of one it\n\
+         \x20   /// redefines.\n\
+         \x20   pub redefines: &'static [&'static str],"
     )
     .unwrap();
     writeln!(w, "}}").unwrap();

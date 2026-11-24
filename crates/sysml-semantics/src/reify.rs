@@ -527,11 +527,20 @@ impl Workspace {
             {
                 continue;
             }
+            // A connector is passed over, as the pilot implementation's
+            // `getPreviousFeature` does, unless it is a message with no ends
+            // of its own: `flow from focus.image to shoot.image; then action
+            // shoot` runs from `focus`. Read as running from where the flow
+            // went, it ran from `Shoot::image`, the definition's feature and
+            // no step of this body at all.
             if kind.is_a(ElementKind::ConnectorAsUsage) {
-                // the one before this went somewhere, and that is where
-                // this one starts
-                if let Some(Value::RefList(related)) = self.model.maybe(member, "relatedFeature") {
-                    return related.last().copied();
+                let ends = self
+                    .model
+                    .owned(member)
+                    .iter()
+                    .any(|&it| self.model.flag(it, "isEnd"));
+                if kind.is_a(ElementKind::FlowUsage) && !ends {
+                    return Some(member);
                 }
                 continue;
             }

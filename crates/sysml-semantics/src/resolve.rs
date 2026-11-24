@@ -130,6 +130,8 @@ impl Workspace {
         self.imply_end_redefinitions(&ids);
         self.imply_end_participation(&ids);
         self.imply_cross_subsettings(&ids);
+        self.imply_variant_specializations(&ids);
+        self.imply_requirement_constraints(&ids);
     }
     /// `ids` and everything under them. Resolving an element reifies
     /// what its text implies -- a transition's ends, a typing -- as
@@ -418,9 +420,21 @@ impl Workspace {
                     // feature may be declared inside it, and the
                     // featuring is written inside it too, so the name is
                     // read from there before it is read from around.
+                    // `connector :HappensDuring from [1] shorterOccurrence
+                    // references thisOccurrence` -- what an end refers to is
+                    // named where the connector is, as `connect a to b` names
+                    // it. Read from the end, the `thisOccurrence` an end's type
+                    // reaches came first and hid the one declared beside it.
+                    let connector = self
+                        .model
+                        .owner(id)
+                        .filter(|&it| self.model.kind(it).is_a(ElementKind::Connector))
+                        .filter(|_| {
+                            part_kind == SyntaxKind::REFERENCES && self.model.flag(id, "isEnd")
+                        });
                     let found = match part_kind {
                         SyntaxKind::FEATURED_KW => self.resolve_inside(id, &t.segments),
-                        _ => None,
+                        _ => connector.and_then(|it| self.resolve_from(it, &t.segments)),
                     };
                     let redefining = std::mem::replace(
                         &mut self.redefining,

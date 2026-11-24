@@ -1665,11 +1665,11 @@ impl Parser<'_> {
             && (self.nth_is_name(1) || self.nth(1) == TILDE)
             // only the symbols: `subsets step, usage subsets M::items`
             // continues the list and then opens another clause, which a
-            // keyword here would have read as a declaration of `usage`
-            && !matches!(
-                self.nth(2),
-                COLON | COLON_GT | COLON_GT_GT | COLON_COLON_GT | COLON_EQ | DEFAULT_KW
-            )
+            // keyword here would have read as a declaration of `usage`.
+            // A specialization after the name continues it too: `: A, B :>> y`
+            // types by both and then redefines, as `TypedBy` and the
+            // `FeatureSpecialization`s after it are written.
+            && !matches!(self.nth(2), COLON | COLON_EQ | DEFAULT_KW)
     }
 
     /// `: T, U` / `typed by T` / `defined by T`
@@ -3355,6 +3355,42 @@ mod tests {
     }
 
     /// The last usage in `text`, by the kinds of its children.
+    /// `TypedBy = ':' FeatureType ( ',' FeatureType )*`, and what follows a
+    /// list may be another specialization written with a symbol. `ref m :
+    /// MessageTransfer, MessageAction :>> trigger` is the standard library's
+    /// own: the second type was left a stray name and the feature was typed
+    /// by the first alone.
+    #[test]
+    fn a_list_followed_by_a_specialization_keeps_every_name() {
+        for (text, kind) in [
+            ("part x : A, B :>> y;", TYPING),
+            ("part x : A, B :> y;", TYPING),
+            ("part x : A, B ::> y;", TYPING),
+            ("part x :> a, b :>> y;", SUBSETTING),
+            ("part x :>> a, b :> y;", REDEFINITION),
+        ] {
+            let parse = check_ok(text);
+            let list = parse
+                .syntax()
+                .descendants()
+                .find(|it| it.kind() == kind)
+                .unwrap();
+            let names = list.children().filter(|it| it.kind() == TYPE_REF).count();
+            assert_eq!(names, 2, "{text}");
+        }
+        // and a name with a type of its own starts the next declaration
+        let parse = check_ok("action a { in x : X, y : Y; }");
+        let typing = parse
+            .syntax()
+            .descendants()
+            .find(|it| it.kind() == TYPING)
+            .unwrap();
+        assert_eq!(
+            typing.children().filter(|it| it.kind() == TYPE_REF).count(),
+            1
+        );
+    }
+
     fn last_usage_shape(parse: &Parse) -> Vec<SyntaxKind> {
         let usage = parse
             .syntax()

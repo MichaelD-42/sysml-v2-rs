@@ -861,7 +861,29 @@ impl Workspace {
         // `perform providePower.generateTorque;` subsets the performed
         // feature, so the usage answers to `generateTorque` -- the same
         // target `supertypes_of` already inherits members through.
-        if let Some(segments) = adapter_target_segments(node) {
+        //
+        // Only the adapters the standard names after their target: a perform
+        // (exhibit and include are performs), a required, assumed, verified or
+        // framed constraint, and a variant. `satisfy vehicleSpecification by
+        // vehicle_b` has no `namingFeature`, and answering to
+        // `vehicleSpecification` it hid the requirement of that name from a
+        // `**` import of everything beside it.
+        let lead = node
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| !t.kind().is_trivia())
+            .map(|t| t.kind());
+        let named_after_target = !matches!(
+            lead,
+            Some(
+                SyntaxKind::SATISFY_KW
+                    | SyntaxKind::ASSERT_KW
+                    | SyntaxKind::NOT_KW
+                    | SyntaxKind::RENDER_KW
+                    | SyntaxKind::EVENT_KW
+            )
+        );
+        if let Some(segments) = adapter_target_segments(node).filter(|_| named_after_target) {
             return segments.last().cloned();
         }
         let leads_with_return = node
